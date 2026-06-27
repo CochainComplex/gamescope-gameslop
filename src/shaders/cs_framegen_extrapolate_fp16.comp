@@ -14,10 +14,9 @@ layout(
 layout(push_constant, scalar)
 uniform framegen_params_t {
     // See cs_framegen_extrapolate.comp for the full description. Uploaded as
-    // fp32; the arithmetic below runs in fp16 (packed math on RDNA: double ALU
-    // rate, half the register pressure). The generated frame is a transient
-    // in-between, so fp16 precision is ample for both PQ (10-bit stored) and
-    // scRGB (16F stored) targets; scRGB HDR magnitudes stay well within fp16 range.
+    // fp32; the arithmetic below runs in fp16 when Vulkan reports support.
+    // The generated frame is a transient in-between, so fp16 precision is ample
+    // for non-float targets. Float scRGB targets stay on the fp32 shader.
     float u_strength;
     float u_suppressLo;
     float u_suppressHi;
