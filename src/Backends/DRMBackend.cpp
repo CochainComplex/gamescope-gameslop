@@ -4361,6 +4361,11 @@ namespace gamescope
 			return g_bSupportsAsyncFlips;
 		}
 
+		virtual bool SupportsFramegen() const override
+		{
+			return true;
+		}
+
 		virtual bool UsesVulkanSwapchain() const override
 		{
 			return false;
