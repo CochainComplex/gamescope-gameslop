@@ -142,4 +142,4 @@ extern bool g_bNoTouchPointerEmulation;
 
 extern uint32_t g_preferVendorID;
 extern uint32_t g_preferDeviceID;
-
+extern bool g_bDebugDualGpuRoute;
