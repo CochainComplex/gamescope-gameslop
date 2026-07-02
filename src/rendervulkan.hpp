@@ -598,6 +598,7 @@ struct VulkanOutput_t
 	VkFence acquireFence;
 
 	uint32_t nOutImage; // swapchain index in nested mode, or ping/pong between two RTs
+	uint32_t nLastOutImage = 0; // last composited output-image index (the ring advance may skip framegen-history slots, so this is not always nOutImage-1)
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImages;
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImagesPartialOverlay;
 	gamescope::OwningRc<CVulkanTexture> temporaryHackyBlankImage;
@@ -615,8 +616,11 @@ struct VulkanOutput_t
 	gamescope::OwningRc<CVulkanTexture> nisScalerImage;
 	gamescope::OwningRc<CVulkanTexture> nisUsmImage;
 
-	// Experimental frame generation
-	std::array<gamescope::OwningRc<CVulkanTexture>, 3> framegenOutputImages;
+	// Experimental frame generation. Generated frames scan out directly from
+	// this pool (never the outputImages ring). Sized to 2*multiplier so the
+	// (multiplier-1) in-flight generated frames plus any still being scanned
+	// out never collide. Allocated lazily by framegen_ensure_resources.
+	std::vector<gamescope::OwningRc<CVulkanTexture>> framegenOutputImages;
 };
 
 
@@ -632,6 +636,10 @@ enum ShaderType {
 	SHADER_TYPE_SGSR,
 	SHADER_TYPE_FRAMEGEN_BLEND,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE,
+	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_FP16,
+	SHADER_TYPE_FRAMEGEN_MOTION_LUMA,
+	SHADER_TYPE_FRAMEGEN_MOTION_MATCH,
+	SHADER_TYPE_FRAMEGEN_MOTION_WARP,
 
 	SHADER_TYPE_COUNT
 };
@@ -855,8 +863,26 @@ public:
 	void wait(uint64_t sequence, bool reset = true);
 	void waitIdle(bool reset = true);
 	bool hasCompleted(uint64_t sequence);
+
+	// Frame generation routes its GPU work through these so it can run on a
+	// dedicated same-family queue (with its own timeline) when the hardware
+	// exposes one, keeping a slow generation from ever sitting in front of the
+	// next composite on the in-order realtime queue. When no second queue is
+	// available they transparently forward to the shared composite path.
+	bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
+	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo );
+	bool hasCompletedFramegen( uint64_t sequence );
+	void waitFramegen( uint64_t sequence );
+	void framegenGarbageCollect();
+
 	void garbageCollect();
-	VkDescriptorSet descriptorSet( CVulkanCmdBuffer *pCmdBuffer );
+	// bFramegen dispatches draw from a separate descriptor-set ring so a
+	// generation batch that is still pending on the framegen queue can never have
+	// its in-use sets host-updated by the realtime composite path. That ring is
+	// not stamped (its completion lives on the framegen timeline); the framegen
+	// oversubscription guard admits at most one batch in flight, so it never
+	// wraps onto pending work. The shared ring is stamped per submission.
+	VkDescriptorSet descriptorSet( CVulkanCmdBuffer *pCmdBuffer, bool bFramegen = false );
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
@@ -962,6 +988,13 @@ protected:
 	std::array<uint64_t, k_uMaxConcurrentSubmits * 3> m_descriptorSetSeqNos{};
 	uint32_t m_currentDescriptorSet = 0;
 
+	// Separate ring for framegen dispatches (see descriptorSet()). Allocated only
+	// when framegen is enabled; empty otherwise, so the composite path is
+	// unchanged. Sized well above the worst-case single in-flight batch.
+	static constexpr uint32_t k_uFramegenDescriptorSets = 16;
+	std::vector<VkDescriptorSet> m_framegenDescriptorSets;
+	uint32_t m_currentFramegenDescriptorSet = 0;
+
 	VkBuffer m_uploadBuffer;
 	VkDeviceMemory m_uploadBufferMemory;
 	void *m_uploadBufferData;
@@ -971,6 +1004,17 @@ protected:
 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
+
+	// Optional dedicated frame-generation queue (same compute family, second
+	// queue index) with its own timeline semaphore and command-buffer recycling,
+	// so a slow generation never blocks the next composite on the in-order
+	// realtime queue. Enabled only when the family exposes >= 2 queues.
+	bool m_bHasFramegenQueue = false;
+	uint32_t m_queueCount = 1;
+	VkQueue m_framegenQueue = VK_NULL_HANDLE;
+	std::shared_ptr<VulkanTimelineSemaphore_t> m_framegenTimeline;
+	std::atomic<uint64_t> m_framegenSeqNo = { 0 };
+	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingFramegenCmdBufs;
 
 private:
 	std::vector<VkExtensionProperties> m_supportedExts;
@@ -1019,7 +1063,11 @@ public:
 	void clearState();
 	template<class PushData, class... Args>
 	void uploadConstants(Args&&... args);
+	template<class PushData, class... Args>
+	void pushConstants(Args&&... args);
 	void bindPipeline(VkPipeline pipeline);
+	// Route this command buffer's dispatches onto the framegen descriptor ring.
+	void markFramegen() { m_bFramegen = true; }
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
 	void copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions);
@@ -1071,6 +1119,7 @@ private:
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
 
 	uint32_t m_renderBufferOffset = 0;
+	bool m_bFramegen = false;
 };
 
 uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );
