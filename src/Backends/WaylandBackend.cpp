@@ -699,6 +699,7 @@ namespace gamescope
         virtual bool SupportsPlaneHardwareCursor() const override;
 
         virtual bool SupportsTearing() const override;
+        virtual bool SupportsFramegen() const override { return true; }
         virtual bool UsesVulkanSwapchain() const override;
         virtual bool SupportsIndependentRefresh() const override { return true; }
 
