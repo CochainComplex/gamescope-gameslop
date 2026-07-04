@@ -1148,6 +1148,7 @@ namespace gamescope
                 compositeLayer.scale.y = 1.0;
                 compositeLayer.opacity = 1.0;
                 compositeLayer.zpos = g_zposBase;
+                compositeLayer.eAlphaBlendingMode = ALPHA_BLENDING_MODE_NONE;
 
                 compositeLayer.tex = pGeneratedFrame;
                 compositeLayer.applyColorMgmt = false;
@@ -1215,6 +1216,7 @@ namespace gamescope
                 compositeLayer.scale.y = 1.0;
                 compositeLayer.opacity = 1.0;
                 compositeLayer.zpos = g_zposBase;
+                compositeLayer.eAlphaBlendingMode = ALPHA_BLENDING_MODE_NONE;
 
                 // Bidir framegen (B3): when this composite queued its real frame
                 // behind interpolation slots, flip the queue front in its place
