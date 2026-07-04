@@ -6,6 +6,7 @@
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <cstdint>
 
 #include "gamescope_shared.h"
 
@@ -161,6 +162,9 @@ enum class GamescopeFramegenMode : uint32_t
 
 extern bool g_bExperimentalFramegen;
 extern bool g_bFramegenDebug;
+extern uint32_t g_uFramegenDebugEvery;
 extern int g_nFramegenMultiplier;
 extern GamescopeFramegenMode g_eFramegenMode;
 extern float g_flFramegenStrength;
+
+bool FramegenDebugShouldLog( uint64_t &counter );
