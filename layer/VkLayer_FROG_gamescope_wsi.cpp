@@ -54,6 +54,37 @@ namespace GamescopeWSILayer {
     return std::ranges::any_of(vec, std::bind_front(std::equal_to{}, lookupValue));
   }
 
+  // Query whether a physical device can actually enable
+  // VK_EXT_swapchain_maintenance1. Some drivers may expose the extension name but
+  // reject vkCreateDevice when the feature is forced on, so require both the
+  // extension and the feature bit before injecting it. This keeps the layer from
+  // blocking NVIDIA-render / AMD-present cross-GPU clients.
+  static bool deviceSupportsSwapchainMaintenance1(
+      const vkroots::VkPhysicalDeviceDispatch &dispatch,
+      VkPhysicalDevice physicalDevice) {
+    uint32_t count = 0;
+    if (dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr) != VK_SUCCESS || count == 0)
+      return false;
+    std::vector<VkExtensionProperties> props(count);
+    if (dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, props.data()) != VK_SUCCESS)
+      return false;
+    const bool bHasExtension = std::ranges::any_of(props, [](const VkExtensionProperties &prop) {
+      return std::string_view(prop.extensionName) == VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+    });
+    if (!bHasExtension)
+      return false;
+
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance1Features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+      .pNext = &maintenance1Features,
+    };
+    dispatch.GetPhysicalDeviceFeatures2(physicalDevice, &features2);
+    return maintenance1Features.swapchainMaintenance1 == VK_TRUE;
+  }
+
   // The globals queue carries the limiter, which only writes an atomic, so
   // any swapchain on the surface may dispatch it.
   static int waylandPumpEvents(wl_display *display, wl_event_queue *queue, wl_event_queue *globalsQueue) {
@@ -718,6 +749,7 @@ namespace GamescopeWSILayer {
     std::unique_ptr<std::atomic<bool>> retired = std::make_unique<std::atomic<bool>>(false);
     bool presentTimingEnabled = false;
     PresentTimingQueue timingQueue;
+    bool hasSwapchainMaintenance1 = false;
 
     std::unique_ptr<std::mutex> presentTimingMutex = std::make_unique<std::mutex>();
     std::vector<VkPastPresentationTimingGOOGLE> pastPresentTimings;
@@ -1001,10 +1033,19 @@ namespace GamescopeWSILayer {
       const bool driverPresentTiming = hasExtension(driverExtensions, VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
       ChainRemoval<VkPhysicalDevicePresentTimingFeaturesEXT> timingFeatures(&deviceCreateInfo, !driverPresentTiming);
 
+      // Only enable + force VK_EXT_swapchain_maintenance1 when the driver actually
+      // supports it. On drivers that don't (e.g. NVIDIA), forcing it made
+      // vkCreateDevice fail outright. gamescope does present pacing/FIFO
+      // compositor-side (via the gamescope_swapchain protocol), so the only thing
+      // lost without maintenance1 is an app switching present mode at runtime,
+      // which gamescope overrides to MAILBOX anyway.
+      const bool bSupportsSwapchainMaintenance1 =
+        deviceSupportsSwapchainMaintenance1(pDispatch, physicalDevice);
+
       std::vector<const char *> extensions(pCreateInfo->ppEnabledExtensionNames, pCreateInfo->ppEnabledExtensionNames + pCreateInfo->enabledExtensionCount);
       if (!driverPresentTiming)
         std::erase_if(extensions, [](const char *extension) { return std::string_view(extension) == VK_EXT_PRESENT_TIMING_EXTENSION_NAME; });
-      if (!contains(extensions, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
+      if (bSupportsSwapchainMaintenance1 && !contains(extensions, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
         extensions.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
       deviceCreateInfo.ppEnabledExtensionNames = extensions.data();
       deviceCreateInfo.enabledExtensionCount   = uint32_t(extensions.size());
@@ -1012,6 +1053,8 @@ namespace GamescopeWSILayer {
       vkroots::ChainPatcher<VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT>
         maintenance1Patcher(&deviceCreateInfo, [&](VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *pMaintenance1)
       {
+        if (!bSupportsSwapchainMaintenance1)
+          return false;
         fprintf(stderr, "[Gamescope WSI] Forcing on VK_EXT_swapchain_maintenance1.\n");
         pMaintenance1->swapchainMaintenance1 = VK_TRUE;
         return true;
@@ -1572,11 +1615,20 @@ namespace GamescopeWSILayer {
       if (!canBypass)
         swapchainInfo.surface = gamescopeSurface->fallbackSurface;
 
+      // Only inject the VK_EXT_swapchain_maintenance1 present-mode struct when the
+      // device actually supports the extension (see CreateDevice) -- otherwise it
+      // is an invalid struct on the chain. The base present mode is forced to
+      // MAILBOX unconditionally below regardless.
+      const bool bSupportsSwapchainMaintenance1 =
+        deviceSupportsSwapchainMaintenance1(*pDispatch.pPhysicalDeviceDispatch, pDispatch.PhysicalDevice);
+
       // We yolo to 3 min images always in Gamescope WSI, regardless of the underlying implementation.
       // Anyway, deal with present modes passed in...
       vkroots::ChainPatcher<VkSwapchainPresentModesCreateInfoEXT>
         presentModePatcher(&swapchainInfo, [&](VkSwapchainPresentModesCreateInfoEXT *pPresentModesCreateInfo)
       {
+        if (!bSupportsSwapchainMaintenance1)
+          return false;
         // Always send MAILBOX as the mode to the driver, as we implement FIFO ourselves -- using the
         // Gamescope swapchain protocol.
         static constexpr std::array<VkPresentModeKHR, 1> s_MailboxMode = {{
@@ -1688,6 +1740,7 @@ namespace GamescopeWSILayer {
           .isHdrColorspace     = hdrColorspace,
           .presentTimingEnabled = !!(pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT) &&
             gamescope_swapchain_factory_v2_get_version(gamescopeSurface->waylandObjects.gamescopeSwapchainFactory.get()) >= 2,
+          .hasSwapchainMaintenance1 = bSupportsSwapchainMaintenance1,
         });
         if (!gamescopeSwapchain) {
           gamescope_swapchain_destroy(gamescopeSwapchainObject);
@@ -2021,6 +2074,19 @@ namespace GamescopeWSILayer {
       if (pPresentModeInfo)
         oOriginalPresentModeInfo = *pPresentModeInfo;
 
+      // Only attach the maintenance1 present-mode struct if the swapchains' device
+      // supports the extension (mirrors CreateSwapchainKHR / CreateDevice). The
+      // driver present mode is already forced to MAILBOX at swapchain creation, so
+      // skipping this on unsupported drivers changes nothing but avoids putting an
+      // invalid struct on the present chain.
+      bool bSupportsSwapchainMaintenance1 = false;
+      for (uint32_t i = 0; i < presentInfo.swapchainCount; i++) {
+        if (auto gamescopeSwapchain = gamescopeSwapchains.find(presentInfo.pSwapchains[i])) {
+          bSupportsSwapchainMaintenance1 = gamescopeSwapchain->hasSwapchainMaintenance1;
+          break;
+        }
+      }
+
       ChainRemoval<VkSwapchainPresentModeInfoEXT> removeModes(&presentInfo);
       std::vector<VkPresentModeKHR> driverModes;
       bool allLayer = true;
@@ -2038,7 +2104,7 @@ namespace GamescopeWSILayer {
       };
       // Without an explicit mode for a non-layer swapchain, leave its creation
       // mode in effect. Layer swapchains were already created as MAILBOX.
-      if (allLayer || oOriginalPresentModeInfo)
+      if (bSupportsSwapchainMaintenance1 && (allLayer || oOriginalPresentModeInfo))
         presentInfo.pNext = &driverModeInfo;
 
       // After the pump, so the state reflects events received this frame.
