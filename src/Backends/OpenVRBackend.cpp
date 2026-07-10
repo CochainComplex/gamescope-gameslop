@@ -1946,6 +1946,7 @@ namespace gamescope
             compositeLayer.scale.y = 1.0;
             compositeLayer.opacity = 1.0;
             compositeLayer.zpos = g_zposBase;
+            compositeLayer.eAlphaBlendingMode = ALPHA_BLENDING_MODE_NONE;
 
             compositeLayer.tex = pCompositeTarget != nullptr ? pCompositeTarget : vulkan_get_last_output_image( false, false );
             compositeLayer.applyColorMgmt = false;
