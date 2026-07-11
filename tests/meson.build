@@ -41,3 +41,11 @@ if get_option('enable_gamescope_wsi_layer')
 	test('present_timing', present_timing_layer_tests, args: ['[present_timing]'])
 	test('present_timing_layer', present_timing_layer_tests, args: ['[present_timing_layer]'])
 endif
+
+test_framegen = executable(
+	'test_framegen',
+	['test_framegen.cpp'],
+	include_directories: [srcdir],
+	cpp_args: gamescope_cpp_args,
+)
+test('framegen', test_framegen)
