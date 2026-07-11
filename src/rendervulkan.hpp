@@ -1012,6 +1012,10 @@ public:
 	// oversubscription guard admits at most one batch in flight, so it never
 	// wraps onto pending work. The shared ring is stamped per submission.
 	VkDescriptorSet descriptorSet( CVulkanCmdBuffer *pCmdBuffer, bool bFramegen = false );
+	uint32_t framegenDescriptorSetCapacity() const
+	{
+		return static_cast<uint32_t>( m_framegenDescriptorSets.size() );
+	}
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
@@ -1036,6 +1040,7 @@ public:
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
 	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
+	inline bool supportsStorageImageExtendedFormats() { return m_bSupportsStorageImageExtendedFormats; }
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
@@ -1107,6 +1112,7 @@ protected:
 	bool m_bSupportsFp16 = false;
 	uint32_t m_uVendorID = 0;
 	bool m_bSupportsShaderFloat16 = false;
+	bool m_bSupportsStorageImageExtendedFormats = false;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bInitialized = false;
@@ -1128,12 +1134,14 @@ protected:
 
 	// Separate ring for framegen dispatches (see descriptorSet()). Allocated only
 	// when framegen is enabled; empty otherwise, so the composite path is
-	// unchanged. Sized above the worst-case single in-flight batch (24
+	// unchanged. Sized above the worst-case single in-flight batch (25
 	// dispatches: luma pair + 2 pyramid + 2x [match + 2 refines] + 2 FB checks
-	// (forward + bidir reverse) + 4 stats probe (clear + accumulate + 2 trust
-	// applies) + 2 net refinements + 2 net training tiles + up to 2 optimizer
-	// steps (init + step on the first online batch) + 3 warps).
+	// (forward + bidir reverse) + 5 stats passes (clear + accumulate + finalize +
+	// 2 field applies) + 2 net refinements + 2 net training tiles + up to 2
+	// optimizer steps (init + step on the first online batch) + 3 warps).
+	static constexpr uint32_t k_uFramegenMaxDispatchesPerBatch = 25;
 	static constexpr uint32_t k_uFramegenDescriptorSets = 30;
+	static_assert( k_uFramegenDescriptorSets >= k_uFramegenMaxDispatchesPerBatch );
 	std::vector<VkDescriptorSet> m_framegenDescriptorSets;
 	uint32_t m_currentFramegenDescriptorSet = 0;
 
@@ -1239,7 +1247,11 @@ public:
 	void pushConstants(Args&&... args);
 	void bindPipeline(VkPipeline pipeline);
 	// Route this command buffer's dispatches onto the framegen descriptor ring.
-	void markFramegen() { m_bFramegen = true; }
+	void markFramegen()
+	{
+		m_bFramegen = true;
+		m_uFramegenDispatchCount = 0;
+	}
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
 	void copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions);
@@ -1304,6 +1316,7 @@ private:
 	uint32_t m_renderBufferOffset = 0;
 	uint32_t m_renderBufferSize = 0;
 	bool m_bFramegen = false;
+	uint32_t m_uFramegenDispatchCount = 0;
 };
 
 uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );
