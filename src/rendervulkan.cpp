@@ -5130,17 +5130,18 @@ struct FramegenMotionAccelPush_t
 	float historyValid;
 	float guidedReconstruction;
 	float reservoirValid;
-	float pad1, pad2;
+	float shadingValid;
+	float pad2;
 
 	FramegenMotionAccelPush_t( float flStrength, float flLo, float flHi, float flScale,
 		float flAgreeLo, float flAgreeHi, float flAccelMax, bool bHistoryValid,
-		bool bGuidedReconstruction, bool bReservoirValid )
+		bool bGuidedReconstruction, bool bReservoirValid, bool bShadingValid )
 		: strength( flStrength ), suppressLo( flLo ), suppressHi( flHi ), lowResScale( flScale )
 		, agreeLo( flAgreeLo ), agreeHi( flAgreeHi ), accelMax( flAccelMax )
 		, historyValid( bHistoryValid ? 1.0f : 0.0f )
 		, guidedReconstruction( bGuidedReconstruction ? 1.0f : 0.0f )
 		, reservoirValid( bReservoirValid ? 1.0f : 0.0f )
-		, pad1( 0.0f ), pad2( 0.0f )
+		, shadingValid( bShadingValid ? 1.0f : 0.0f ), pad2( 0.0f )
 	{
 	}
 };
@@ -5243,10 +5244,11 @@ struct FramegenMotionNetTrainPush_t
 	uint32_t seed;
 	uint32_t sliceBase;
 	float mode;
-	uint32_t sceneCutGuard;
+	uint32_t flags;
 
-	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard )
-		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f ), sceneCutGuard( bSceneCutGuard ? 1u : 0u )
+	FramegenMotionNetTrainPush_t( uint32_t uSeed, uint32_t uSliceBase, bool bSceneCutGuard, bool bShadingHistoryValid )
+		: seed( uSeed ), sliceBase( uSliceBase ), mode( 0.0f )
+		, flags( ( bSceneCutGuard ? 1u : 0u ) | ( bShadingHistoryValid ? 2u : 0u ) )
 	{
 	}
 };
@@ -5325,6 +5327,10 @@ struct FramegenMotionResources_t
 	// visible staging it is copied from once per (re)allocation.
 	gamescope::OwningRc<CVulkanTexture> mvFieldNet;
 	gamescope::OwningRc<CVulkanTexture> mvFieldRevNet;
+	// Fourth CNN head: a zero-neutral focus mask for persistent non-geometric
+	// color change. Kept at field resolution and sampled only by Extreme's
+	// existing full-resolution warp, so it adds no output-resolution pass.
+	gamescope::OwningRc<CVulkanTexture> netShadingFocus;
 	gamescope::OwningRc<CVulkanTexture> netWeightsGpu;
 	gamescope::OwningRc<CVulkanTexture> netWeightsUpload;
 	bool bNetWeightsUploaded = false;
@@ -6407,12 +6413,13 @@ static void framegen_bind_blend( CVulkanCmdBuffer *pCmdBuffer, const gamescope::
 // ---- Learned field refinement (Stage C) --------------------------------------
 // A tiny convolutional net (12->16->16->4, 3x3 kernels, ~4.6k parameters)
 // refines the causal checked motion field once per real frame: a bounded flow
-// residual (at most +-2 field texels, tanh-limited in the shader) plus an
-// additive confidence recalibration. Bidir also refines the reverse field.
+// residual (at most +-2 field texels, tanh-limited in the shader), additive
+// confidence recalibration, and a zero-neutral shading-persistence focus.
+// Bidir also refines the reverse field but never consumes the causal focus.
 // It predicts corrections on top of the
 // Stage-B field — a zero-initialized head IS Stage B, so the failure floor is
-// the current behavior — and it only ever touches the field, never pixels, so
-// the HDR rules are untouchable by construction. B4 closes the safety loop:
+// the current behavior. The fourth head never predicts pixels; Extreme uses it
+// to gate a separately bounded analytic color trend. B4 closes the field safety loop:
 // the stats probe grades the REFINED field, so a net that mispredicts is
 // clamped by the same-batch trust factor and shows up in the adapt log lines.
 // Trained offline, self-supervised, on tensors captured by the recorder below
@@ -6433,12 +6440,13 @@ static const char *framegen_net_weights_path()
 // layer count, then per-layer (c_in, c_out, k) dims, then all fp32 weights in
 // [c_out][ky][kx][c_in] order (c_in contiguous, for the shader's vec4 dots)
 // followed by the biases, layer by layer — the exact flat order the shader
-// indexes. The version field tracks feature/training semantics. V2 changes the
-// confidence gate and loss without changing tensor layout, so V1 is accepted
-// explicitly as a bounded migration prior; incompatible future layouts must
-// fail validation rather than run with silently mismatched channels.
+// indexes. The version field tracks feature/training semantics. V3 activates
+// the formerly reserved fourth output as a shading-persistence focus gate.
+// Older blobs keep the same tensor layout and are accepted only after that
+// unconstrained legacy row is explicitly zeroed; incompatible future layouts
+// must fail validation rather than run with silently mismatched channels.
 static constexpr uint32_t k_uFramegenNetMagic = 0x52465347u; // 'GSFR'
-static constexpr uint32_t k_uFramegenNetVersion = 2u;
+static constexpr uint32_t k_uFramegenNetVersion = 3u;
 static constexpr uint32_t k_uFramegenNetLayerDims[ 3 ][ 2 ] = { { 12u, 16u }, { 16u, 16u }, { 16u, 4u } };
 static constexpr uint32_t k_uFramegenNetFloats = 4644;
 static constexpr uint32_t k_uFramegenNetTexW = 2048; // shader indexes (idx & 2047, idx >> 11)
@@ -6525,7 +6533,7 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 	uint32_t uHeader[ 3 ] = {};
 	bool bOk = fread( uHeader, sizeof( uHeader ), 1, pFile ) == 1
 		&& uHeader[ 0 ] == k_uFramegenNetMagic
-		&& ( uHeader[ 1 ] == 1u || uHeader[ 1 ] == k_uFramegenNetVersion )
+		&& uHeader[ 1 ] >= 1u && uHeader[ 1 ] <= k_uFramegenNetVersion
 		&& uHeader[ 2 ] == 3u;
 	for ( uint32_t l = 0; bOk && l < 3; l++ )
 	{
@@ -6541,6 +6549,13 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 		bOk = fread( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();
 		for ( size_t i = 0; bOk && i < weights.size(); i++ )
 			bOk = std::isfinite( weights[ i ] );
+		if ( bOk && uHeader[ 1 ] < 3u )
+		{
+			// V1/V2 never defined output channel four. Do not trust arbitrary
+			// finite bytes from a third-party blob as a color-correction gate.
+			std::fill( weights.begin() + 4496u, weights.begin() + 4640u, 0.0f );
+			weights[ 4643u ] = 0.0f;
+		}
 	}
 	fclose( pFile );
 
@@ -6551,7 +6566,7 @@ static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &we
 	}
 	else if ( uHeader[ 1 ] < k_uFramegenNetVersion )
 	{
-		vk_log.infof( "framegen: net weights '%s' use legacy v%u training semantics; accepting as a bounded prior under v%u corrected-flow gating",
+		vk_log.infof( "framegen: net weights '%s' use legacy v%u training semantics; accepting as a bounded prior under v%u with the formerly-reserved shading head zeroed",
 			pszPath, uHeader[ 1 ], k_uFramegenNetVersion );
 	}
 	return bOk;
@@ -6811,6 +6826,22 @@ static bool framegen_reservoir_enabled( GamescopeFramegenQuality eQuality )
 	static const bool s_bEnabled = []()
 	{
 		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RESERVOIR" );
+		return pszEnv == nullptr || env_to_bool( pszEnv );
+	}();
+	return s_bEnabled;
+}
+
+// Extreme-only learned non-geometric color trend. The switch isolates the
+// final correction for live A/B while leaving the field net and every queue /
+// descriptor / timing decision identical.
+static bool framegen_shading_enabled( GamescopeFramegenQuality eQuality )
+{
+	if ( eQuality != GamescopeFramegenQuality::Extreme )
+		return false;
+
+	static const bool s_bEnabled = []()
+	{
+		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_SHADING" );
 		return pszEnv == nullptr || env_to_bool( pszEnv );
 	}();
 	return s_bEnabled;
@@ -7186,7 +7217,7 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH, bool bRefineReverse )
 {
 	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.netWeightsGpu == nullptr
-		|| g_framegenMotion.mvFieldRevChk == nullptr
+		|| g_framegenMotion.mvFieldRevChk == nullptr || g_framegenMotion.netShadingFocus == nullptr
 		|| ( bRefineReverse && g_framegenMotion.mvFieldRevNet == nullptr ) )
 		return;
 
@@ -7201,6 +7232,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	const uint32_t pg = 8; // = the shader's output tile
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET ) );
 	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldNet );
+	pCmdBuffer->bindTarget2( g_framegenMotion.netShadingFocus );
 	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaPrev, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaCur, false );
 	framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvField, true );
@@ -7212,6 +7244,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	if ( bRefineReverse )
 	{
 		pCmdBuffer->bindTarget( g_framegenMotion.mvFieldRevNet );
+		pCmdBuffer->bindTarget2( g_framegenMotion.netShadingFocus );
 		framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaCur, false );
 		framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaPrev, false );
 		framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvFieldRevChk, true );
@@ -7224,6 +7257,26 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 	g_framegenMotion.bNetActive = true;
 }
 
+static bool framegen_motion_history_valid( GamescopeFramegenQuality eQuality )
+{
+	return eQuality >= GamescopeFramegenQuality::Ultra
+		&& g_framegenMotion.mvFieldHistory != nullptr
+		&& g_framegenMotion.uMotionHistoryFrameId != 0
+		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId;
+}
+
+static int framegen_luma_reservoir_read_index()
+{
+	for ( uint32_t i = 0; i < 2; i++ )
+	{
+		if ( g_framegenMotion.uLumaReservoirFrameId[i] != 0
+			&& g_framegenMotion.uLumaReservoirFrameId[i] + 2u == g_framegenHistory.currentFrameId
+			&& g_framegenMotion.lumaReservoir[i] != nullptr )
+			return (int)i;
+	}
+	return -1;
+}
+
 // In-situ learning step (C2), recorded after the inference dispatches: two
 // gradient passes (one per field direction, each workgroup a hashed training
 // tile writing its slice row) and one optimizer pass folding the slices into
@@ -7233,7 +7286,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 // and the one-batch-in-flight rule serializes everything across batches.
 // Training reads the RAW fields: the net never trains on its own output.
 // Returns true when this batch also carries a profile-dump copy.
-static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, bool bSceneCutGuard )
+static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFramegenQuality eQuality, bool bSceneCutGuard )
 {
 	FramegenMotionResources_t &m = g_framegenMotion;
 	if ( m.netState == nullptr || m.netGradSlices == nullptr || m.netWeightsPrior == nullptr
@@ -7271,6 +7324,17 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, bool bScene
 	g_ulFramegenNetProgress++;
 	const uint32_t uHalf = k_uFramegenNetTrainTiles / 2;
 	const uint32_t uSeed = m.uNetTrainStep * 0x9E3779B9u + 0x61C88647u;
+	const int nReservoirRead = framegen_luma_reservoir_read_index();
+	const bool bShadingHistoryValid = eQuality == GamescopeFramegenQuality::Extreme
+		&& framegen_shading_enabled( eQuality )
+		&& bSceneCutGuard
+		&& framegen_motion_history_valid( eQuality ) && nReservoirRead >= 0;
+	const gamescope::Rc<CVulkanTexture> pOlderLuma = bShadingHistoryValid
+		? gamescope::Rc<CVulkanTexture>( m.lumaReservoir[nReservoirRead] )
+		: gamescope::Rc<CVulkanTexture>( m.lumaPrev );
+	const gamescope::Rc<CVulkanTexture> pOlderField = bShadingHistoryValid
+		? gamescope::Rc<CVulkanTexture>( m.mvFieldHistory )
+		: gamescope::Rc<CVulkanTexture>( m.mvField );
 
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN ) );
 	pCmdBuffer->bindTarget( m.netGradSlices );
@@ -7280,7 +7344,9 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, bool bScene
 	framegen_motion_bind_sampler( pCmdBuffer, 2, m.mvField, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 3, m.mvFieldRevChk, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 4, m.netState, true );
-	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u, bSceneCutGuard );
+	framegen_motion_bind_sampler( pCmdBuffer, 5, pOlderLuma, false );
+	framegen_motion_bind_sampler( pCmdBuffer, 6, pOlderField, false );
+	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed, 0u, bSceneCutGuard, bShadingHistoryValid );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	pCmdBuffer->bindTarget( m.netGradSlices );
@@ -7290,7 +7356,12 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, bool bScene
 	framegen_motion_bind_sampler( pCmdBuffer, 2, m.mvFieldRevChk, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 3, m.mvField, true );
 	framegen_motion_bind_sampler( pCmdBuffer, 4, m.netState, true );
-	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf, bSceneCutGuard );
+	// Reverse-field tiles continue training the shared flow/confidence heads,
+	// but cannot supervise a causal future-color trend. Bind valid fallbacks and
+	// write an exact zero gradient for head four.
+	framegen_motion_bind_sampler( pCmdBuffer, 5, m.lumaPrev, false );
+	framegen_motion_bind_sampler( pCmdBuffer, 6, m.mvField, false );
+	pCmdBuffer->pushConstants<FramegenMotionNetTrainPush_t>( uSeed ^ 0x55555555u, uHalf, bSceneCutGuard, false );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
 	bindOpt();
@@ -7541,11 +7612,14 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		// motion path: the raw checked fields keep working untouched.
 		g_framegenMotion.mvFieldNet = nullptr;
 		g_framegenMotion.mvFieldRevNet = nullptr;
+		g_framegenMotion.netShadingFocus = nullptr;
 		g_framegenMotion.bNetAllocTried = false;
 		if ( bAllocated && framegen_net_requested( eQuality ) )
 		{
 			g_framegenMotion.bNetAllocTried = true;
 			bool bNetOk = framegen_create_intermediate( &g_framegenMotion.mvFieldNet, lowW, lowH, uFieldFormat );
+			if ( bNetOk )
+				bNetOk = framegen_create_intermediate( &g_framegenMotion.netShadingFocus, lowW, lowH, uFieldFormat );
 			if ( bNetOk && bBidir )
 				bNetOk = framegen_create_intermediate( &g_framegenMotion.mvFieldRevNet, lowW, lowH, uFieldFormat );
 			// The weight texture pair is resolution-independent; created once.
@@ -7635,6 +7709,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			{
 				g_framegenMotion.mvFieldNet = nullptr;
 				g_framegenMotion.mvFieldRevNet = nullptr;
+				g_framegenMotion.netShadingFocus = nullptr;
 				g_framegenMotion.netWeightsGpu = nullptr;
 				g_framegenMotion.netWeightsUpload = nullptr;
 				vk_log.errorf( "framegen: net intermediate allocation failed, learned refinement disabled" );
@@ -7820,24 +7895,14 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	float flStrength, GamescopeFramegenQuality eQuality )
 {
 	const uint32_t pg = 8;
-	const bool bHistoryValid = eQuality >= GamescopeFramegenQuality::Ultra
-		&& g_framegenMotion.mvFieldHistory != nullptr
-		&& g_framegenMotion.uMotionHistoryFrameId != 0
-		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId;
+	const bool bHistoryValid = framegen_motion_history_valid( eQuality );
 	const bool bGuided = eQuality == GamescopeFramegenQuality::Extreme;
-	int nReservoirRead = -1;
-	for ( uint32_t i = 0; i < 2; i++ )
-	{
-		if ( g_framegenMotion.uLumaReservoirFrameId[i] != 0
-			&& g_framegenMotion.uLumaReservoirFrameId[i] + 2u == g_framegenHistory.currentFrameId )
-		{
-			nReservoirRead = (int)i;
-			break;
-		}
-	}
+	const int nReservoirRead = framegen_luma_reservoir_read_index();
 	const bool bReservoirValid = bGuided && bHistoryValid
-		&& nReservoirRead >= 0
-		&& g_framegenMotion.lumaReservoir[nReservoirRead] != nullptr;
+		&& nReservoirRead >= 0;
+	const bool bShadingValid = bGuided && bHistoryValid
+		&& framegen_shading_enabled( eQuality )
+		&& g_framegenMotion.bNetActive && g_framegenMotion.netShadingFocus != nullptr;
 	// Extreme uses the accelerated shader even during the first interval: its
 	// full-resolution field reconstruction does not need temporal history.
 	const bool bAccelPipeline = bHistoryValid || bGuided;
@@ -7872,10 +7937,16 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 		pCmdBuffer->setTextureSrgb( 4, false );
 		pCmdBuffer->setSamplerUnnormalized( 4, false );
 		pCmdBuffer->setSamplerNearest( 4, false );
+		// The focus texture is always valid when the net dispatch ran. During a
+		// warm-up or non-net Extreme batch, bind a harmless sampled fallback and
+		// keep the shader branch disabled through the push constant.
+		framegen_motion_bind_sampler( pCmdBuffer, 5, bShadingValid
+			? gamescope::Rc<CVulkanTexture>( g_framegenMotion.netShadingFocus )
+			: gamescope::Rc<CVulkanTexture>( g_framegenMotion.lumaCur ), false );
 		pCmdBuffer->pushConstants<FramegenMotionAccelPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
 			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi,
-			1.0f, bHistoryValid, bGuided, bReservoirValid );
+			1.0f, bHistoryValid, bGuided, bReservoirValid, bShadingValid );
 	}
 	else
 	{
@@ -8015,7 +8086,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// the optimizer publishes only for the next batch. When adaptation is
 	// explicitly disabled, training retains its previous unguarded behavior.
 	const bool bNetStateReadback = g_framegenMotion.bNetActive && framegen_net_online_enabled()
-		&& framegen_record_net_train( pCmdBuffer.get(), bAdaptProbe );
+		&& framegen_record_net_train( pCmdBuffer.get(), eff.quality, bAdaptProbe );
 	if ( bMotion )
 	{
 		// Each warp reads the shared motion field(s) and history; keep per-slot.
@@ -8562,6 +8633,13 @@ void vulkan_framegen_benchmark()
 					framegen_record_net( cmd, g_framegenMotion.width, g_framegenMotion.height, vulkan_framegen_bidir_active() );
 				} );
 				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "motion net refine (per real)", msNet );
+				if ( framegen_net_online_enabled() )
+				{
+					double msNetTrain = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+						framegen_record_net_train( cmd, g_eFramegenQuality, false );
+					} );
+					printf( "%-8s  %-26s  %10.3f\n", res.pszName, "online net train (per real)", msNetTrain );
+				}
 			}
 
 			double msMotionWarp = timePass( [&]( CVulkanCmdBuffer *cmd ) {
@@ -8659,6 +8737,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			if ( framegen_net_requested( g_eFramegenQuality ) )
 			{
 				vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
+				if ( g_eFramegenQuality == GamescopeFramegenQuality::Extreme )
+					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables for A/B)",
+						framegen_shading_enabled( g_eFramegenQuality ) ? "enabled" : "disabled" );
 				if ( framegen_net_online_enabled() )
 					vk_log.infof( "framegen: in-situ learning active (C2) — the net keeps training on the framegen GPU against every real frame (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
 						framegen_net_online_lr(), k_uFramegenNetTrainTiles, framegen_net_online_every(),
