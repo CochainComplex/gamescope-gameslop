@@ -136,6 +136,7 @@ src = [
   'wlserver.cpp',
   'vblankmanager.cpp',
   'rendervulkan.cpp',
+  'framegen/atomic_file.cpp',
   'framegen/device.cpp',
   'log.cpp',
   'ime.cpp',

@@ -44,7 +44,7 @@ endif
 
 test_framegen = executable(
 	'test_framegen',
-	['test_framegen.cpp'],
+	['test_framegen.cpp', srcdir / 'framegen/atomic_file.cpp'],
 	include_directories: [srcdir],
 	cpp_args: gamescope_cpp_args,
 )
