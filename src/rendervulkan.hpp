@@ -912,6 +912,16 @@ constexpr T align(T what, U to) {
 return (what + to - 1) & ~(to - 1);
 }
 
+inline void cache_timeline_completion( std::atomic<uint64_t> &cached, uint64_t observed )
+{
+	uint64_t current = cached.load( std::memory_order_relaxed );
+	while ( current < observed
+		&& !cached.compare_exchange_weak( current, observed,
+			std::memory_order_relaxed, std::memory_order_relaxed ) )
+	{
+	}
+}
+
 class CVulkanDevice;
 
 [[noreturn]] void vulkan_check_fatal( VkResult result, const char *expression );
@@ -1022,11 +1032,12 @@ public:
 	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
-	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size)
+	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
 	{
 		assert(size <= upload_buffer_size);
+		assert(alignment != 0 && (alignment & (alignment - 1)) == 0);
 
-		m_uploadBufferOffset = align(m_uploadBufferOffset, 16);
+		m_uploadBufferOffset = align(m_uploadBufferOffset, alignment);
 		if (m_uploadBufferOffset + size > upload_buffer_size)
 		{
 			fprintf(stderr, "Exceeded uploadBufferData\n");
@@ -1038,6 +1049,11 @@ public:
 		uint8_t *ptr = ((uint8_t*)m_uploadBufferData) + uOffset;
 		m_uploadBufferOffset += size;
 		return std::make_pair( ptr, uOffset );
+	}
+
+	inline std::pair<void *, uint32_t> uploadUniformBufferData(uint32_t size)
+	{
+		return uploadBufferData(size, m_uniformBufferOffsetAlignment);
 	}
 
 	#define VK_FUNC(x) PFN_vk##x x = nullptr;
@@ -1060,6 +1076,7 @@ protected:
 	bool createShaders();
 	bool createScratchResources();
 	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable);
+	void compileFramegenPipelines();
 	void compileAllPipelines(std::stop_token st);
 
 	VkDevice m_device = nullptr;
@@ -1118,11 +1135,17 @@ protected:
 	VkDeviceMemory m_uploadBufferMemory;
 	void *m_uploadBufferData;
 	uint32_t m_uploadBufferOffset = 0;
+	uint32_t m_uniformBufferOffsetAlignment = 16;
 
 	VkSemaphore m_scratchTimelineSemaphore;
 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
+	// Vulkan timeline values are monotonic. Cache the newest value observed by
+	// the CPU so repeated readiness checks for an older submission do not enter
+	// the driver again. Relaxed ordering is sufficient: Vulkan semaphores, not
+	// these counters, provide resource visibility.
+	std::atomic<uint64_t> m_submissionCompletedSeqNo = { 0 };
 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
-	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
+	std::vector<std::pair<uint64_t, std::unique_ptr<CVulkanCmdBuffer>>> m_pendingCmdBufs;
 
 	// Optional dedicated frame-generation queue (same compute family, second
 	// queue index) with its own timeline semaphore and command-buffer recycling,
@@ -1133,7 +1156,8 @@ protected:
 	VkQueue m_framegenQueue = VK_NULL_HANDLE;
 	std::shared_ptr<VulkanTimelineSemaphore_t> m_framegenTimeline;
 	std::atomic<uint64_t> m_framegenSeqNo = { 0 };
-	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingFramegenCmdBufs;
+	std::atomic<uint64_t> m_framegenCompletedSeqNo = { 0 };
+	std::vector<std::pair<uint64_t, std::unique_ptr<CVulkanCmdBuffer>>> m_pendingFramegenCmdBufs;
 
 	// Timestamp query-pool ring for live framegen GPU-time measurement. Ring depth
 	// covers the worst-case in-flight batches; available on dedicated and shared
@@ -1149,7 +1173,7 @@ protected:
 	// seqNo -> { query ring slot, ladder rung, generated count } so the readback
 	// can attribute the measured cost to the exact batch shape.
 	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; };
-	std::map<uint64_t, FramegenQueryAssoc_t> m_framegenQuerySlotBySeqNo;
+	std::vector<std::pair<uint64_t, FramegenQueryAssoc_t>> m_framegenQuerySlotBySeqNo;
 	uint64_t m_aFramegenRungCostNs[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint32_t m_aFramegenRungSamples[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint64_t m_ulFramegenLastRawGpuTimeNs = 0;
@@ -1236,6 +1260,15 @@ public:
 	const std::vector<uint32_t> &GetUsedDescriptorSets() const { return m_usedDescriptorSets; }
 
 private:
+	struct TrackedTextureState
+	{
+		CVulkanTexture *pTexture;
+		TextureState state;
+	};
+
+	std::pair<TextureState *, bool> trackTexture( CVulkanTexture *image );
+	TextureState *findTextureState( CVulkanTexture *image );
+
 	VkCommandBuffer m_cmdBuffer;
 	CVulkanDevice *m_device;
 
@@ -1246,7 +1279,8 @@ private:
 	std::vector<gamescope::Rc<CVulkanTexture>> m_textureRefs;
 	std::vector<std::shared_ptr<gamescope::CReleaseTimelinePoint>> m_releasePoints;
 	std::vector<uint32_t> m_usedDescriptorSets;
-	std::unordered_map<CVulkanTexture *, TextureState> m_textureState;
+	std::vector<TrackedTextureState> m_textureState;
+	std::vector<VkImageMemoryBarrier> m_imageBarriers;
 
 	// Draw State
 	std::array<CVulkanTexture *, VKR_SAMPLER_SLOTS> m_boundTextures;
@@ -1262,6 +1296,7 @@ private:
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
 
 	uint32_t m_renderBufferOffset = 0;
+	uint32_t m_renderBufferSize = 0;
 	bool m_bFramegen = false;
 };
 
