@@ -34,6 +34,7 @@
 #include "Utils/Process.h"
 #include "Utils/TempFiles.h"
 #include "Utils/Version.h"
+#include "framegen/numeric.hpp"
 
 #include "backends.h"
 #include "refresh_rate.h"
@@ -903,7 +904,7 @@ int main(int argc, char **argv)
 					}
 				} else if (strcmp(opt_name, "framegen-strength") == 0) {
 					g_flFramegenStrength = parse_float( optarg, opt_name );
-					if ( !std::isfinite( g_flFramegenStrength )
+					if ( !gamescope::framegen::is_finite_binary32( g_flFramegenStrength )
 						|| g_flFramegenStrength < 0.0f || g_flFramegenStrength > 1.0f )
 					{
 						fprintf( stderr, "gamescope: --framegen-strength must be between 0.0 and 1.0\n" );
