@@ -1873,6 +1873,7 @@ import_commit (
 
 	if ( pOwnedTexture == nullptr ) {
 		// Failed to create Vulkan texture from Wayland buffer for some reason.
+		xwm_log.errorf( "import_commit: buffer import failed (%dx%d), dropping commit", buf->width, buf->height );
 		return nullptr;
 	}
 
