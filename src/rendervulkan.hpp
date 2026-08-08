@@ -855,6 +855,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdDraw) \
 	VK_FUNC(CmdEndRendering) \
 	VK_FUNC(CmdPipelineBarrier) \
+	VK_FUNC(CmdPipelineBarrier2) \
 	VK_FUNC(CmdPushConstants) \
 	VK_FUNC(CmdResetQueryPool) \
 	VK_FUNC(CmdWriteTimestamp) \
@@ -1043,6 +1044,7 @@ public:
 	inline bool supportsFp16() {return m_bSupportsFp16;}
 	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
 	inline bool supportsStorageImageExtendedFormats() { return m_bSupportsStorageImageExtendedFormats; }
+	inline bool supportsSync2() { return m_bSupportsSync2; }
 	inline uint32_t maxComputeSharedMemorySize() const { return m_uMaxComputeSharedMemorySize; }
 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
@@ -1116,6 +1118,7 @@ protected:
 	uint32_t m_uVendorID = 0;
 	bool m_bSupportsShaderFloat16 = false;
 	bool m_bSupportsStorageImageExtendedFormats = false;
+	bool m_bSupportsSync2 = false;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bSupportsGlobalPriority = false;
@@ -1204,6 +1207,9 @@ private:
 
 struct TextureState
 {
+	VkPipelineStageFlags2 lastStage;
+	VkAccessFlags2 lastAccess;
+	bool bLastWasWrite;
 	bool discarded : 1;
 	bool dirty : 1;
 	bool needsPresentLayout : 1;
@@ -1212,6 +1218,9 @@ struct TextureState
 
 	TextureState()
 	{
+		lastStage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+		lastAccess = 0;
+		bLastWasWrite = false;
 		discarded = false;
 		dirty = false;
 		needsPresentLayout = false;
@@ -1283,6 +1292,14 @@ public:
 	const std::vector<uint32_t> &GetUsedDescriptorSets() const { return m_usedDescriptorSets; }
 
 private:
+	struct ImageUse
+	{
+		CVulkanTexture *pTexture;
+		VkPipelineStageFlags2 stage;
+		VkAccessFlags2 access;
+		bool bWrite;
+	};
+
 	struct TrackedTextureState
 	{
 		CVulkanTexture *pTexture;
@@ -1291,6 +1308,10 @@ private:
 
 	std::pair<TextureState *, bool> trackTexture( CVulkanTexture *image );
 	TextureState *findTextureState( CVulkanTexture *image );
+	void addImageUse( CVulkanTexture *image, VkPipelineStageFlags2 stage, VkAccessFlags2 access, bool bWrite );
+	void emitExternalAcquireBarriers();
+	void emitSync2Barriers();
+	void emitPreDispatchBarriers();
 
 	VkCommandBuffer m_cmdBuffer;
 	CVulkanDevice *m_device;
@@ -1304,6 +1325,8 @@ private:
 	std::vector<uint32_t> m_usedDescriptorSets;
 	std::vector<TrackedTextureState> m_textureState;
 	std::vector<VkImageMemoryBarrier> m_imageBarriers;
+	std::vector<ImageUse> m_imageUses;
+	std::vector<VkImageMemoryBarrier2> m_imageBarriers2;
 
 	// Draw State
 	std::array<CVulkanTexture *, VKR_SAMPLER_SLOTS> m_boundTextures;
