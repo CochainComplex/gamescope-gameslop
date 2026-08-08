@@ -152,6 +152,25 @@ namespace gamescope
         }
     };
 
+    enum class FramegenPresentKind_t : uint8_t
+    {
+        Real,
+        Generated,
+        DelayedReal,
+    };
+
+    // Correlates one compositor-selected presentation with backend feedback.
+    // This remains a plain value type so backends can carry it in existing hot-path storage.
+    struct FramegenPresentTag_t
+    {
+        uint64_t ulPresentToken;
+        uint64_t ulRealFrameId;
+        uint64_t ulSlotId;
+        uint64_t ulCompositeSeqNo;
+        uint64_t ulTargetFlipNs;
+        FramegenPresentKind_t eKind;
+    };
+
     struct BackendPresentFeedback
     {
     public:
