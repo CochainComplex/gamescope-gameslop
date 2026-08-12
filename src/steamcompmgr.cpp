@@ -3513,9 +3513,11 @@ paint_all( global_focus_t *pFocus, bool async )
 		}
 	}
 
-	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
+	if ( pConnector )
 	{
-		return;
+		vulkan_framegen_begin_present( &frameInfo );
+		if ( pConnector->Present( &frameInfo, async ) != 0 )
+			return;
 	}
 
 	// A torn frame can be replaced before the next vblank pass reports it.
@@ -10269,6 +10271,7 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
+		vulkan_framegen_drain_present_feedback();
 
 		bool vblank = false;
 		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )
