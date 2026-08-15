@@ -4386,6 +4386,11 @@ namespace gamescope
 			return true;
 		}
 
+		virtual bool OwnsKMSPresentTiming() const override
+		{
+			return true;
+		}
+
 		virtual bool UsesVulkanSwapchain() const override
 		{
 			return false;
