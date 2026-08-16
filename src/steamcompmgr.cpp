@@ -2551,6 +2551,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 		layer->pCommitTexture = &commit->vulkanTex;
 	layer->pStagedCopyCount = &s_StagedCopyCountByWindow[ commit->win_seq ];
 	layer->acquireReadyTimeNs = commit->present_time;
+	layer->ulCommitID = commit->commitID;
 
 	layer->eAlphaBlendingMode = base.eAlphaBlendingMode;
 	layer->blackBorder = true;
@@ -2625,6 +2626,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 		layer->pCommitTexture = &lastCommit->vulkanTex;
 	layer->pStagedCopyCount = &s_StagedCopyCountByWindow[ lastCommit->win_seq ];
 	layer->acquireReadyTimeNs = lastCommit->present_time;
+	layer->ulCommitID = lastCommit->commitID;
 
 	if ( flags & PaintWindowFlag::NoScale )
 	{
@@ -7870,6 +7872,11 @@ steamcompmgr_exit(void)
 
 	g_VirtualConnectorFocuses.clear();
 
+	// Framegen holds output-ring images and pending generated presents whose
+	// textures own backend FBs; release them (and join the profile writer)
+	// while the backend is still alive.
+	vulkan_framegen_shutdown();
+
     gamescope::IBackend::Set( nullptr );
 
     wlserver_lock();
@@ -10062,6 +10069,11 @@ static void relay_mangoapp_control()
 // CLOCK_MONOTONIC. The callback runs on this thread inside PollEvents (no
 // atomics needed), and the flag persists until the arbiter acts on it.
 static bool g_bFramegenCommitDeadline = false;
+// Set when the compositor paints a generated frame from the early-commit path.
+// That path submits an atomic commit and blocks until its page flip, so this
+// stays true across the blocking present and is consumed on the next arbiter
+// pass to attribute a real frame that had to wait behind the reservation.
+static bool g_bFramegenEarlyGeneratedInFlight = false;
 // The absolute time the timer is currently armed for. Disarming a timerfd does
 // not retract a fire already delivered to the epoll, so a superseded slot's
 // fire can slip past its DisarmTimer and re-set the deadline flag on the next
@@ -11026,8 +11038,16 @@ steamcompmgr_main(int argc, char **argv)
 				// the fixed-refresh timer, in-flight, or retry conditions.
 				if ( ulFixedCommitDeadlineNs != 0u )
 				{
+					// The early generated commit below blocks until its page
+					// flip, so a real frame that becomes ready in the meantime
+					// is only seen here on the following pass. Count it: it was
+					// held back by the reservation the generated commit made.
+					const bool bEarlyGeneratedWasInFlight =
+						std::exchange( g_bFramegenEarlyGeneratedInFlight, false );
 					if ( hasRepaint )
 					{
+						if ( bEarlyGeneratedWasInFlight )
+							vulkan_framegen_metrics_note_real_wait();
 						// Test this before all generated-commit state: queued real
 						// work has absolute priority and reaches the normal paint path.
 						g_bFramegenCommitDeadline = false;
@@ -11050,7 +11070,13 @@ steamcompmgr_main(int argc, char **argv)
 						if ( gamescope::framegen::can_start_early_generated_commit(
 								g_bFramegenCommitDeadline, false,
 								bPresentInFlight )
-							&& vulkan_framegen_generated_frame_due() )
+							&& vulkan_framegen_generated_frame_due()
+							// Real-arrival cutoff: if the learned cadence puts
+							// the next real client frame inside the commit-lead
+							// window, don't reserve KMS state ahead of it — the
+							// normal vblank path presents it without the extra
+							// vblank of latency.
+							&& !vulkan_framegen_real_arrival_blocks_early_commit() )
 						{
 							g_bFramegenCommitDeadline = false;
 							const bool bReady = vulkan_framegen_generated_frame_ready();
@@ -11059,6 +11085,7 @@ steamcompmgr_main(int argc, char **argv)
 							if ( bReady && ( !bOverlayOnly || bLateOverlayComposite || nFramegenDeferredOverlay < k_nFramegenMaxDeferredOverlay ) )
 							{
 								bShouldPaint = true;
+								g_bFramegenEarlyGeneratedInFlight = true;
 								if ( bOverlayOnly && !bLateOverlayComposite )
 								{
 									bFramegenDeferOverlay = true;
