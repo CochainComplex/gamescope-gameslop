@@ -255,6 +255,11 @@ namespace gamescope
 		}
 	}
 
+	void CVBlankTimer::MarkPresentation( uint64_t ulNanos )
+	{
+		MarkVBlank( VBlankAtOrBefore( GetLastVBlank(), mHzToRefreshCycle( GetRefresh() ), ulNanos ), true );
+	}
+
 	bool CVBlankTimer::WasCompositing() const
 	{
 		return m_bCurrentlyCompositing;
