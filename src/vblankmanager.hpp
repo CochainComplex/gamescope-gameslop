@@ -16,6 +16,16 @@ namespace gamescope
         uint64_t ulWakeupTime = 0;
     };
 
+    // The latest point at or before ulNanos of the vblank grid through
+    // ulAnchor with period ulInterval (non-zero); ulAnchor itself when
+    // ulNanos is not after it, so the grid never moves back.
+    inline uint64_t VBlankAtOrBefore( uint64_t ulAnchor, uint64_t ulInterval, uint64_t ulNanos )
+    {
+        if ( ulNanos <= ulAnchor )
+            return ulAnchor;
+        return ulAnchor + ( ulNanos - ulAnchor ) / ulInterval * ulInterval;
+    }
+
     class CVBlankTimer : public ITimerWaitable
     {
     public:
@@ -46,6 +56,10 @@ namespace gamescope
 
         std::optional<VBlankTime> ProcessVBlank();
         void MarkVBlank( uint64_t ulNanos, bool bReArmTimer );
+        // For a presentation time that is not a vblank: advance the clock
+        // along its own grid to its latest vblank at or before ulNanos,
+        // keeping its phase. Not safe against a concurrent vblank writer.
+        void MarkPresentation( uint64_t ulNanos );
 
         bool WasCompositing() const;
         void UpdateWasCompositing( bool bCompositing );

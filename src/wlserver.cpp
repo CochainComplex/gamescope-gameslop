@@ -2496,7 +2496,7 @@ void wlserver_run(void)
 	if ( pipe2( g_wlserverNudgePipe, O_CLOEXEC | O_NONBLOCK ) != 0 )
 	{
 		wl_log.errorf_errno( "wlserver: pipe2 failed" );
-		exit( 1 );
+		gamescope_exit( 1 );
 	}
 
 	struct pollfd pollfds[2] = {
@@ -2553,6 +2553,11 @@ void wlserver_run(void)
 			}
 		}
 	}
+
+	// An error broke the loop: make steamcompmgr leave its loop too, so it
+	// releases the mutex below and the shutdown watchdog bounds the rest.
+	if ( !g_bShutdownWLServer )
+		ShutdownGamescope();
 
 	wlserver.bWaylandServerRunning = false;
 	wlserver.bWaylandServerRunning.notify_all();
