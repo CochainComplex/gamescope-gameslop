@@ -508,7 +508,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	screenshotImageFlags.bMappable = true;
 	screenshotImageFlags.bTransferDst = true;
 	screenshotImageFlags.bStorage = true;
-	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12)
+	if (is_dmabuf)
 	{
 		screenshotImageFlags.bExportable = true;
 		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
