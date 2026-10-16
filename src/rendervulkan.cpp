@@ -3862,7 +3862,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	m_format = imageInfo.format;
 
-	if ( flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+	// Preflight mapped capture exports without changing legacy scanout owners.
+	if ( flags.bMappable && !flags.bFlippable && flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
 		!supportsNonModifierExport( imageInfo ) )
 	{
 		vk_log.errorf( "dma-buf export is unsupported for DRM format 0x%" PRIX32 " with tiling %d", drmFormat, tiling );

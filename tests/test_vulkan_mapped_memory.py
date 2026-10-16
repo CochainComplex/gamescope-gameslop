@@ -22,7 +22,7 @@ def check_nv12_contracts(source, header, directory):
     create_flags = next(line for line in init.splitlines() if "imageInfo.flags = flags.imageCreateFlags(" in line)
     capability = between(source, "static VkResult getExternalImageFormatProps(",
                          "\nstatic VkImageViewType VulkanImageTypeToViewType(")
-    guard = between(init, "\tif ( flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&",
+    guard = between(init, "\tif ( flags.bMappable && !flags.bFlippable && flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&",
                     "\n\tres = g_device.vk.CreateImage(")
     external = between(init, "\tif ( pDMA != nullptr || flags.bExportable )",
                        "\n\tm_width = width;")
@@ -140,8 +140,9 @@ public:
     }
 };
 #include "nv12_capability.inc"
-static bool export_guard(bool exportable,bool imported,VkImageTiling tiling) {
-    const auto flags=CVulkanTexture::createFlags::LinearCapture(exportable);
+static bool export_guard(bool exportable,bool imported,VkImageTiling tiling,bool mapped=true,bool flippable=false) {
+    auto flags=CVulkanTexture::createFlags::LinearCapture(exportable);
+    flags.bMappable=mapped;flags.bFlippable=flippable;
     const void* pDMA=imported ? &flags : nullptr;
     const uint32_t drmFormat=DRM_FORMAT_NV12;
     VkImageCreateInfo imageInfo{};
@@ -229,6 +230,10 @@ int main() {
     assert(export_guard(false,false,VK_IMAGE_TILING_LINEAR));
     assert(export_guard(true,true,VK_IMAGE_TILING_LINEAR));
     assert(export_guard(true,false,VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT));
+    // The capture guard must not reject legacy nonmapped or scanout exports.
+    assert(export_guard(true,false,VK_IMAGE_TILING_LINEAR,false,false));
+    assert(export_guard(true,false,VK_IMAGE_TILING_LINEAR,true,true));
+    assert(export_guard(true,false,VK_IMAGE_TILING_LINEAR,false,true));
     g_device.query_result=VK_SUCCESS;
     g_device.external_features=VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
     g_device.compatible=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;

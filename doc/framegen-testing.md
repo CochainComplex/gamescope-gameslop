@@ -165,6 +165,9 @@ for the actual capture format, usage and image flags; otherwise its mapped
 MemFd option remains available. A consumer requiring unsupported DMA-BUF caps
 should fail negotiation rather than receive an invalid export or a mislabeled
 MemFd buffer.
+Mapped capture allocations check this support before image creation. Legacy
+flippable allocations, including nested cursor exports, need separate backend
+validation; a capture pass does not certify those paths.
 
 Run the existing nested SDL smoke cases as well as nested Wayland captures:
 they exercise different device-extension and presentation paths. Native DRM,
