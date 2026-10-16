@@ -28,9 +28,12 @@ def check_nv12_contracts(source, header, directory):
                        "\n\tm_width = width;")
     pool = between(source, "static gamescope::Rc<CVulkanTexture> acquire_pooled_texture(",
                    "\ngamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(")
+    output_factory = between(source, "static bool framegen_create_output_texture(",
+                             "\n// Base-mode generated frames:")
     for name, body in (("views", views), ("create_flags", flags), ("usage", usage),
                        ("flags", create_flags), ("capability", capability), ("guard", guard),
-                       ("external", external), ("pool", pool)):
+                       ("external", external), ("pool", pool),
+                       ("output_factory", output_factory)):
         (directory / f"nv12_{name}.inc").write_text(body)
     fixture = r'''
 #include <vulkan/vulkan.h>
@@ -43,7 +46,10 @@ def check_nv12_contracts(source, header, directory):
 constexpr uint32_t DRM_FORMAT_NV12 = 1, RGB = 2;
 constexpr uint64_t DRM_FORMAT_MOD_INVALID = ~uint64_t{0};
 using EStreamColorspace = int;
-namespace gamescope { template<class T> using Rc = T*; }
+namespace gamescope {
+template<class T> using Rc = T*;
+template<class T> using OwningRc = T*;
+}
 static VkFormat DRMFormatToVulkan(uint32_t format, bool srgb) {
     return format == DRM_FORMAT_NV12 ? VK_FORMAT_G8_B8R8_2PLANE_420_UNORM : srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
 }
@@ -117,7 +123,7 @@ public:
     unsigned refs=0;
     int color=0;
     static inline bool failInit=false;
-    bool BInit(uint32_t width,uint32_t height,uint32_t,uint32_t drm,createFlags f,void*,uint32_t contentW,uint32_t contentH) {
+    bool BInit(uint32_t width,uint32_t height,uint32_t,uint32_t drm,createFlags f,void* = nullptr,uint32_t contentW = 0,uint32_t contentH = 0) {
         w=width; h=height; cw=contentW; ch=contentH; format=drm; requested=f; return !failInit;
     }
     uint32_t width() const { return w; } uint32_t height() const { return h; }
@@ -161,7 +167,30 @@ struct Slot {
     CVulkanTexture* operator->() const { return p; }
 };
 #include "nv12_pool.inc"
+static bool native_output=false, cursor_split=false, color_probe=false;
+static bool framegen_owns_output_ring() { return native_output; }
+static bool framegen_cursor_split_enabled() { return cursor_split; }
+static bool framegen_color_probe_requested() { return color_probe; }
+#include "nv12_output_factory.inc"
 int main() {
+    for (bool native : {false,true}) for (bool cursor : {false,true}) for (bool probe : {false,true}) {
+        native_output=native;cursor_split=cursor;color_probe=probe;
+        CVulkanTexture* output=nullptr;
+        assert(framegen_create_output_texture(&output,640,480,RGB));
+        const auto& flags=output->requested;
+        assert(output->width()==640 && output->height()==480 && output->drmFormat()==RGB);
+        // Only scanout-owned outputs may take the output/PRESENT path. Nested
+        // intermediates remain sampleable with either cursor/probe setting.
+        assert(flags.bOutputImage==native && flags.bFlippable==native);
+        assert(flags.bSampled==(native ? cursor : true));
+        assert(flags.bStorage && flags.bFramegenShared && flags.bTransferSrc==probe);
+        assert(!flags.bTransferDst && !flags.bMappable && !flags.bLinear && !flags.bColorAttachment);
+        const VkImageUsageFlags expected=VK_IMAGE_USAGE_STORAGE_BIT
+            | (flags.bSampled ? VkImageUsageFlags(VK_IMAGE_USAGE_SAMPLED_BIT) : 0u)
+            | (probe ? VkImageUsageFlags(VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0u);
+        assert(flags.imageUsage()==expected);
+        delete output;
+    }
     for (bool sampled : {false,true}) for (bool storage : {false,true}) {
         CVulkanTexture texture; texture.format=DRM_FORMAT_NV12;
         CVulkanTexture::createFlags f; f.bSampled=sampled; f.bStorage=storage;
