@@ -18,7 +18,10 @@ class Terminated(BaseException):
 @contextmanager
 def termination_signals():
     """Turn normal process termination into an exception so receipts get flushed."""
+    terminating = False
     def interrupted(signum, _frame):
+        nonlocal terminating
+        terminating = True
         # Let receipt/cache cleanup finish even if termination is requested again.
         for sig in previous:
             signal.signal(sig, signal.SIG_IGN)
@@ -32,8 +35,11 @@ def termination_signals():
     try:
         yield
     finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+        # A supervisor may translate Terminated into RuntimeError. Do not re-arm
+        # an outer handler before the campaign has persisted its terminal state.
+        if not terminating:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 def digest(path):
