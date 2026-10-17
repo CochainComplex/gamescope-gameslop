@@ -10650,6 +10650,9 @@ steamcompmgr_main(int argc, char **argv)
 #endif
 		}
 
+		// Framegen dormancy, after the remake above and before anything paints.
+		vulkan_framegen_update_dormancy();
+
 		if ( vblank )
 		{
 			int nRealRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;

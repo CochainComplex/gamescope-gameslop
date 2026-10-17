@@ -8,6 +8,41 @@
 namespace gamescope::framegen
 {
 
+// Why configured framegen is dormant at runtime: it then behaves exactly as if
+// it were not configured. Priority (highest first) follows declaration order.
+// "None" is an X11 macro, hence NotDormant (logged as "none").
+enum class FramegenDormantReason : uint8_t
+{
+	NotDormant,
+	OutputRotation,
+	MultiOutput,
+	RingAllocation,
+};
+
+[[nodiscard]] constexpr FramegenDormantReason framegen_dormant_reason(
+	uint32_t outputRotation, bool singleOutput, bool ringAllocationFailed )
+{
+	if ( outputRotation != 0u )
+		return FramegenDormantReason::OutputRotation;
+	if ( !singleOutput )
+		return FramegenDormantReason::MultiOutput;
+	if ( ringAllocationFailed )
+		return FramegenDormantReason::RingAllocation;
+	return FramegenDormantReason::NotDormant;
+}
+
+[[nodiscard]] constexpr const char *framegen_dormant_reason_name( FramegenDormantReason reason )
+{
+	switch ( reason )
+	{
+		case FramegenDormantReason::NotDormant: return "none";
+		case FramegenDormantReason::OutputRotation: return "output_rotation";
+		case FramegenDormantReason::MultiOutput: return "multi_output";
+		case FramegenDormantReason::RingAllocation: return "ring_allocation";
+	}
+	return "none";
+}
+
 struct EffectiveConfig
 {
 	GamescopeFramegenMode mode;

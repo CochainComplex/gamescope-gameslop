@@ -521,6 +521,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
+// Compositor thread, once per main-loop iteration before painting: enters or
+// leaves framegen dormancy (rotation, multiple outputs, ring allocation failure).
+void vulkan_framegen_update_dormancy();
 // Reads a GAMESCOPE_FRAMEGEN_* on/off switch; an invalid value keeps bDefault
 // and is logged once per name.
 bool framegen_bool_setting( const char *pszName, bool bDefault );

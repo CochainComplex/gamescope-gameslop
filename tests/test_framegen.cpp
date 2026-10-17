@@ -66,6 +66,34 @@ static void test_fps_limit_policy()
 	CHECK( ResolveFPSLimit( 30, -1, true ) == 30 );
 }
 
+static void test_dormancy_policy()
+{
+	using gamescope::framegen::FramegenDormantReason;
+	using gamescope::framegen::framegen_dormant_reason;
+	using gamescope::framegen::framegen_dormant_reason_name;
+	using enum FramegenDormantReason;
+
+	// Columns: single/no failure, single/failure, multi/no failure, multi/failure.
+	constexpr FramegenDormantReason expected[4][4] = {
+		{ NotDormant, RingAllocation, MultiOutput, MultiOutput },
+		{ OutputRotation, OutputRotation, OutputRotation, OutputRotation },
+		{ OutputRotation, OutputRotation, OutputRotation, OutputRotation },
+		{ OutputRotation, OutputRotation, OutputRotation, OutputRotation },
+	};
+	for ( uint32_t rotation = 0; rotation < 4; rotation++ )
+	{
+		for ( uint32_t flags = 0; flags < 4; flags++ )
+			CHECK( framegen_dormant_reason( rotation, !( flags & 2u ), flags & 1u )
+				== expected[rotation][flags] );
+	}
+	static_assert( framegen_dormant_reason( 0u, true, false ) == NotDormant );
+	static_assert( framegen_dormant_reason( 1u, false, true ) == OutputRotation );
+	CHECK( std::string_view( framegen_dormant_reason_name( NotDormant ) ) == "none" );
+	CHECK( std::string_view( framegen_dormant_reason_name( OutputRotation ) ) == "output_rotation" );
+	CHECK( std::string_view( framegen_dormant_reason_name( MultiOutput ) ) == "multi_output" );
+	CHECK( std::string_view( framegen_dormant_reason_name( RingAllocation ) ) == "ring_allocation" );
+}
+
 static void test_degradation_policy()
 {
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 1 ) == 8u );
@@ -1311,6 +1339,7 @@ static void test_fault_injection_grammar()
 int main()
 {
 	test_fps_limit_policy();
+	test_dormancy_policy();
 	test_degradation_policy();
 	test_learned_net_layout();
 	test_names();
