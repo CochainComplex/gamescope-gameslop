@@ -7069,6 +7069,8 @@ struct DisplayFeedback_t
 	gamescope::FramegenPresentTag_t tag = {};
 	uint64_t ulActualFlipNs = 0;
 	uint64_t ulBackendSequence = 0;
+	// Debug only: callback arrival, not the flip timestamp or mailbox drain time.
+	uint64_t ulDebugArrivalNs = 0;
 	bool bPresented = false;
 	bool bTimestampValid = false;
 };
@@ -7085,6 +7087,77 @@ struct DisplayFeedbackMailbox_t
 	size_t nCount = 0;
 };
 static DisplayFeedbackMailbox_t g_displayFeedbackMailbox;
+
+// Compositor-thread diagnostics only. No queries, waits or clocks are added
+// when --framegen-debug is off. Completion is observed at the existing wait's
+// return: an upper bound on GPU completion, not a calibrated GPU timestamp.
+struct FramegenProvisionalDebug_t
+{
+	uint64_t realId = 0, now = 0, rawTarget = 0, wake = 0, start = 0, cost = 0;
+	uint32_t samples = 0;
+	bool plannerAdmit = false;
+	bool submitted = false;
+};
+struct FramegenCorrectionDebug_t
+{
+	uint64_t id = 0, realId = 0, epoch = 0, target = 0, rawTarget = 0;
+	uint64_t window = 0;
+	uint64_t rawWake = 0, wake = 0, arrival = 0, now = 0;
+	uint64_t compositeSeq = 0, waitBegin = 0, compositeDone = 0;
+	uint64_t start = 0, budget = 0, cost = 0, interval = 0;
+	uint32_t samples = 0;
+	FramegenProvisionalDebug_t provisional;
+	const char *action = "planner_skip";
+};
+static FramegenProvisionalDebug_t g_framegenProvisionalDebug;
+static std::vector<FramegenCorrectionDebug_t> g_framegenCorrectionDebug;
+static uint64_t g_ulCorrectionDebugCounter = 0;
+static uint64_t g_ulDebugCompositeSeq = 0, g_ulDebugCompositeWaitBegin = 0,
+	g_ulDebugCompositeDone = 0;
+
+static void framegen_correction_debug_log( const FramegenCorrectionDebug_t &d,
+	const char *outcome, const char *end )
+{
+	vk_log.infof( "LADDER_CORRECTION v=1 id=%" PRIu64 " window=%" PRIu64 " real_id=%" PRIu64
+		" epoch=%" PRIu64 " target_ns=%" PRIu64 " raw_target_ns=%" PRIu64
+		" raw_wake_ns=%" PRIu64 " wake_ns=%" PRIu64 " arrival_ns=%" PRIu64
+		" decision_ns=%" PRIu64 " composite_seq=%" PRIu64
+		" composite_wait_begin_ns=%" PRIu64 " composite_done_ns=%" PRIu64
+		" start_ns=%" PRIu64 " budget_ns=%" PRIu64 " cost_ns=%" PRIu64
+		" samples=%u interval_ns=%" PRIu64 " p_now_ns=%" PRIu64
+		" p_raw_target_ns=%" PRIu64 " p_wake_ns=%" PRIu64
+		" p_start_ns=%" PRIu64 " p_cost_ns=%" PRIu64 " p_samples=%u p_admit=%d p_submitted=%d"
+		" action=%s outcome=%s end=%s",
+		d.id, d.window, d.realId, d.epoch, d.target, d.rawTarget, d.rawWake, d.wake,
+		d.arrival, d.now, d.compositeSeq, d.waitBegin, d.compositeDone,
+		d.start, d.budget, d.cost, d.samples, d.interval,
+		d.provisional.now, d.provisional.rawTarget, d.provisional.wake,
+		d.provisional.start, d.provisional.cost, d.provisional.samples,
+		d.provisional.plannerAdmit ? 1 : 0, d.provisional.submitted ? 1 : 0,
+		d.action, outcome, end );
+}
+
+// Same physical slot despite small grid re-estimates (the H1 LDBG convention).
+// "generated" means successfully submitted, as in the existing rescue gate;
+// it does not assert GPU completion or a displayed flip.
+static void framegen_correction_debug_resolve( uint64_t now,
+	uint64_t generatedRawTarget = 0, uint64_t epoch = 0,
+	const char *end = nullptr )
+{
+	std::erase_if( g_framegenCorrectionDebug, [&]( const auto &d ) {
+		const uint64_t delta = generatedRawTarget > d.rawTarget
+			? generatedRawTarget - d.rawTarget : d.rawTarget - generatedRawTarget;
+		const bool generated = generatedRawTarget != 0u && epoch == d.epoch
+			&& delta < d.interval / 2u;
+		const bool expired = now >= std::max( d.rawWake, d.wake );
+		if ( !generated && !expired && end == nullptr )
+			return false;
+		framegen_correction_debug_log( d,
+			generated ? "generated" : expired ? "lost" : "censored",
+			generated ? "submit" : expired ? "wake_passed" : end );
+		return true;
+	} );
+}
 
 static constexpr uint64_t k_ulFramegenMetricsWindowNs = 5'000'000'000ull;
 
@@ -7822,6 +7895,7 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 {
 	if ( !framegen_present_tracking_enabled() )
 		return;
+	const uint64_t ulDebugArrivalNs = g_bFramegenDebug ? get_time_in_nanos() : 0u;
 	std::scoped_lock lock( g_displayFeedbackMailbox.mutex );
 	if ( g_displayFeedbackMailbox.nCount == k_nDisplayFeedbackMailboxCapacity )
 	{
@@ -7836,6 +7910,7 @@ void vulkan_framegen_publish_present_feedback( const gamescope::FramegenPresentT
 		.tag = tag,
 		.ulActualFlipNs = ulActualFlipNs,
 		.ulBackendSequence = ulBackendSequence,
+		.ulDebugArrivalNs = ulDebugArrivalNs,
 		.bPresented = bPresented,
 		.bTimestampValid = bTimestampValid,
 	};
@@ -8452,7 +8527,8 @@ static uint64_t framegen_predicted_interval_ns()
 }
 
 static bool framegen_refill_idle();
-static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan = false );
+static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan = false,
+	uint64_t ulFeedbackArrivalNs = 0 );
 static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
 static void framegen_clear_vrr_midpoint_state( bool bClearPending );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
@@ -9007,6 +9083,11 @@ static void framegen_release_completed_read_pins()
 
 void vulkan_framegen_invalidate_history( const char *reason )
 {
+	if ( g_bFramegenDebug )
+	{
+		framegen_correction_debug_resolve( get_time_in_nanos(), 0, 0, "history_invalidated" );
+		g_framegenProvisionalDebug = {};
+	}
 	// Completed generation no longer needs its zero-copy input pins. Release
 	// them before the early-out and before dropping logical history; an active
 	// batch deliberately keeps its pins until its timeline point signals.
@@ -9276,6 +9357,8 @@ void vulkan_framegen_flush_profile()
 
 void vulkan_framegen_shutdown()
 {
+	if ( g_bFramegenDebug )
+		framegen_correction_debug_resolve( get_time_in_nanos(), 0, 0, "shutdown" );
 	// Persist learning first, even if framegen was turned off live. This is the
 	// authoritative exit flush (gamescope exits without atexit handlers), and it
 	// is CPU-only, so the shutdown watchdog firing during the unbounded drains
@@ -13684,6 +13767,18 @@ struct FramegenCausalRungSelection_t
 	bool bDeadlineMissSkip = false;
 };
 
+static FramegenCausalRungSelection_t framegen_sample_causal_rung( uint32_t nRung )
+{
+	FramegenCausalRungSelection_t sample;
+	sample.eff = framegen_effective_config( nRung );
+	sample.workClass = framegen_causal_work_class( sample.eff );
+	const uint32_t nCostKey = gamescope::framegen::deadline_work_class_cost_key(
+		sample.workClass );
+	sample.ulCostNs = g_device.framegenRungCostNs( nRung, nCostKey );
+	sample.uSamples = g_device.framegenRungSampleCount( nRung, nCostKey );
+	return sample;
+}
+
 static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs,
 	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline,
@@ -13700,17 +13795,6 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const uint64_t ulStartEstimateNs = plan.provisional
 		? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
 
-	const auto sampleRung = [&]( uint32_t nRung )
-	{
-		FramegenCausalRungSelection_t sample;
-		sample.eff = framegen_effective_config( nRung );
-		sample.workClass = framegen_causal_work_class( sample.eff );
-		const uint32_t nCostKey = gamescope::framegen::deadline_work_class_cost_key(
-			sample.workClass );
-		sample.ulCostNs = g_device.framegenRungCostNs( nRung, nCostKey );
-		sample.uSamples = g_device.framegenRungSampleCount( nRung, nCostKey );
-		return sample;
-	};
 	const auto sampleFitsAt = [&]( const FramegenCausalRungSelection_t &sample,
 		uint64_t ulWakeNs )
 	{
@@ -13727,7 +13811,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const uint32_t nCurrentRung = g_framegenHistory.nDegradeSteps;
 	const bool bPriorDeadlineMiss = g_framegenHistory.bCausalDeadlineMissed;
 	g_framegenHistory.bCausalDeadlineMissed = false;
-	result = sampleRung( nCurrentRung );
+	result = framegen_sample_causal_rung( nCurrentRung );
 	bool bDegradeForPriorMiss = bPriorDeadlineMiss;
 	if ( ulNativeSlotBudgetNs != 0u )
 	{
@@ -13780,7 +13864,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				CVulkanDevice::kFramegenLadderSlots> rungCosts = {};
 			for ( uint32_t nRung = 0u; nRung < nCurrentRung; nRung++ )
 			{
-				const FramegenCausalRungSelection_t sample = sampleRung( nRung );
+				const FramegenCausalRungSelection_t sample = framegen_sample_causal_rung( nRung );
 				rungCosts[ nRung ] = { sample.ulCostNs, sample.uSamples };
 			}
 			const gamescope::framegen::LadderRecoveryTarget_t recoveryTarget =
@@ -13809,7 +13893,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				framegen_log_ladder_recovery(
 					nMaxCausalDegradeSteps, nCurrentRung,
 					uEvidenceDecisions );
-				FramegenCausalRungSelection_t richer = sampleRung(
+				FramegenCausalRungSelection_t richer = framegen_sample_causal_rung(
 					recoveryTarget.rung );
 				richer.bAdmit = true;
 				richer.bCommittedRung = true;
@@ -13859,7 +13943,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	for ( uint32_t nRung = nCurrentRung + 1u;
 		nRung <= nMaxCausalDegradeSteps; nRung++ )
 	{
-		FramegenCausalRungSelection_t candidate = sampleRung( nRung );
+		FramegenCausalRungSelection_t candidate = framegen_sample_causal_rung( nRung );
 		const bool bMature = candidate.ulCostNs != 0u
 			&& candidate.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
 		if ( sampleFits( candidate ) )
@@ -13890,6 +13974,11 @@ static void framegen_record_causal_anchor( uint64_t ulRealFrameId,
 	uint64_t ulSourceReadyNs, uint64_t ulProvisionalTargetNs,
 	uint64_t ulVblankIntervalNs, bool bSourceTimestampsReliable )
 {
+	if ( g_bFramegenDebug )
+	{
+		framegen_correction_debug_resolve( get_time_in_nanos(), 0, 0, "new_anchor" );
+		g_framegenProvisionalDebug = {};
+	}
 	const uint64_t ulDisplayChainGeneration =
 		g_framegenPresentState.displayTiming.generation;
 	const bool bGridChanged = g_framegenHistory.ulDeadlineGridEpoch == 0u
@@ -13949,7 +14038,8 @@ static bool framegen_nested_slot_submittable( uint64_t ulSlotVBlankNs, uint64_t 
 // Default fixed-refresh causal path: ask the pure planner for exactly one
 // unused display-grid slot, apply its per-slot budget to the measured work
 // class, then pass its exact phase and target through the common submit path.
-static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan )
+static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan,
+	uint64_t ulFeedbackArrivalNs )
 {
 	if ( !vulkan_framegen_is_enabled() || !framegen_causal_deadline_enabled()
 		|| vulkan_framegen_vrr_hybrid_active() || vulkan_framegen_bidir_active()
@@ -14015,8 +14105,74 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 				.dedicatedQueue = true,
 				.skipAtOrPastNextReal = bCorrectionReplan && !bNativeKmsTiming,
 			} );
+	std::optional<FramegenCorrectionDebug_t> debug;
+	if ( g_bFramegenDebug && !bNativeKmsTiming && plan.targetNs != 0u )
+	{
+		const uint64_t index = gamescope::framegen::grid_index_at_or_after(
+			plainGrid, plan.targetNs );
+		const uint32_t rung = g_framegenHistory.nDegradeSteps;
+		const uint32_t key = gamescope::framegen::deadline_work_class_cost_key(
+			framegen_causal_work_class( framegen_effective_config( rung ) ) );
+		const uint64_t cost = g_device.framegenRungCostNs( rung, key );
+		const uint32_t samples = g_device.framegenRungSampleCount( rung, key );
+		if ( plan.provisional && g_framegenProvisionalDebug.realId == 0u )
+			g_framegenProvisionalDebug = {
+				.realId = g_framegenHistory.causalAnchor.realFrameId,
+				.now = now, .rawTarget = rawGrid.target( index ), .wake = plan.wakeNs,
+				.start = g_framegenHistory.causalAnchor.provisional_start_estimate(),
+				.cost = cost, .samples = samples, .plannerAdmit = plan.admit,
+			};
+		if ( bCorrectionReplan && FramegenDebugShouldLog( g_ulCorrectionDebugCounter ) )
+		{
+			debug.emplace();
+			debug->id = g_ulCorrectionDebugCounter;
+			debug->window = g_framegenMetrics.nClosedWindows + 1u;
+			debug->realId = g_framegenHistory.causalAnchor.realFrameId;
+			debug->epoch = g_framegenHistory.ulDeadlineGridEpoch;
+			debug->target = plan.targetNs;
+			debug->rawTarget = rawGrid.target( index );
+			debug->rawWake = rawGrid.wake( index );
+			debug->wake = plan.wakeNs;
+			debug->arrival = ulFeedbackArrivalNs;
+			debug->now = now;
+			debug->compositeSeq = ulCompositeSeqNo;
+			if ( g_ulDebugCompositeSeq == ulCompositeSeqNo )
+			{
+				debug->waitBegin = g_ulDebugCompositeWaitBegin;
+				debug->compositeDone = g_ulDebugCompositeDone;
+			}
+			debug->start = plan.provisional
+				? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
+			const uint64_t start = std::max( now, debug->start );
+			debug->budget = plan.wakeNs > start
+				? gamescope::framegen::deadline_budget_ns( plan.wakeNs - start ) : 0u;
+			debug->cost = cost;
+			debug->samples = samples;
+			debug->interval = ulVblankIntervalNs;
+			if ( g_framegenProvisionalDebug.realId == debug->realId )
+				debug->provisional = g_framegenProvisionalDebug;
+		}
+	}
+	const auto debugFinish = [&]( const char *action, bool generated = false ) {
+		if ( !g_bFramegenDebug )
+			return;
+		if ( debug )
+		{
+			debug->action = action;
+			g_framegenCorrectionDebug.push_back( *debug );
+		}
+		// Resolve only after admission/submission, so final log I/O cannot eat
+		// the budget between this decision's clock sample and its submit.
+		if ( generated && debug )
+			framegen_correction_debug_resolve( now, debug->rawTarget, debug->epoch );
+		else if ( !generated )
+			framegen_correction_debug_resolve( now );
+	};
 	if ( !plan.admit )
 	{
+		debugFinish( plan.skipReason == gamescope::framegen::DeadlineSkipReason_t::MissedWake
+			? "missed_wake" : plan.skipReason == gamescope::framegen::DeadlineSkipReason_t::NextRealSafelyDue
+			? "next_real_due" : "planner_skip" );
 		if ( plan.skipReason
 			== gamescope::framegen::DeadlineSkipReason_t::NextRealSafelyDue )
 			framegen_metrics_note_admission_skip();
@@ -14025,7 +14181,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	const uint64_t ulStartEstimateNs = plan.provisional
 		? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
 	if ( std::max( now, ulStartEstimateNs ) >= plan.wakeNs )
+	{
+		debugFinish( "start_bound" );
 		return false;
+	}
 
 	const uint64_t ulGridIndex = gamescope::framegen::grid_index_at_or_after(
 		plainGrid, plan.targetNs );
@@ -14035,7 +14194,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	// that can no longer be submitted before that wake is skipped, never slid;
 	// the next planning call (tick or drain) takes the following slot.
 	if ( oTargetVBlankNs && !framegen_nested_slot_submittable( *oTargetVBlankNs, now ) )
+	{
+		debugFinish( "raw_wake_expired" );
 		return false;
+	}
 	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
 	const gamescope::framegen::FixedRefreshCommitPlan_t commitPlan =
 		gridCommitPlan.earlyCommit
@@ -14059,11 +14221,23 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	const uint64_t ulShortfallSlotBudgetNs =
 		gamescope::framegen::causal_shortfall_slot_budget_ns(
 			bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );
+	const char *pszDebugSkip = "capacity_or_prior_miss";
+	if ( debug )
+	{
+		const auto action = gamescope::framegen::causal_shortfall_action(
+			g_framegenHistory.bCausalDeadlineMissed, debug->cost, debug->samples,
+			debug->budget, ulShortfallSlotBudgetNs, g_framegenHistory.nDegradeHold );
+		if ( action == gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly )
+			pszDebugSkip = "phase_only";
+		else if ( action == gamescope::framegen::CausalShortfallAction_t::SkipHeld )
+			pszDebugSkip = "held";
+	}
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
 		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,
 		ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );
 	if ( !rung.bAdmit )
 	{
+		debugFinish( pszDebugSkip );
 		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
 		const uint64_t ulRemainingNs = plan.wakeNs > ulDecisionStartNs
 			? plan.wakeNs - ulDecisionStartNs : 0u;
@@ -14115,7 +14289,23 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 		rung.eff, ulCompositeSeqNo, nMaxCausalDegradeSteps, false, nullptr,
 		plan.targetNs, true );
 	if ( !bSubmitted )
+	{
+		debugFinish( "submit_failed" );
 		return false;
+	}
+	if ( g_bFramegenDebug && plan.provisional && oTargetVBlankNs
+		&& g_framegenProvisionalDebug.realId == g_framegenHistory.causalAnchor.realFrameId )
+	{
+		const uint64_t target = g_framegenProvisionalDebug.rawTarget;
+		const uint64_t delta = target > *oTargetVBlankNs
+			? target - *oTargetVBlankNs : *oTargetVBlankNs - target;
+		if ( delta < ulVblankIntervalNs / 2u )
+			g_framegenProvisionalDebug.submitted = true;
+	}
+	debugFinish( rung.bCommittedRung ? "admit_changed_rung" : "admit", true );
+	if ( g_bFramegenDebug && oTargetVBlankNs )
+		framegen_correction_debug_resolve( now, *oTargetVBlankNs,
+			g_framegenHistory.ulDeadlineGridEpoch );
 
 	g_framegenHistory.ulLastPlannedTargetNs = plan.targetNs;
 	if ( !rung.bCommittedRung && g_framegenHistory.nDegradeHold > 0u )
@@ -14164,22 +14354,38 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 	{
 		const size_t nBefore = g_framegenHistory.pending.size();
 		const uint64_t ulNowNs = get_time_in_nanos();
-		// A provisional slot is discarded only while a corrected replacement can
-		// still be submitted for its opportunity. Later, its pixels are kept: the
-		// replan could only be skipped, and the repeat replacing them is the larger
-		// error (|residual| vs. one slot spacing). Native slots: unchanged.
+		// Keep submitted nested pixels unless a measured corrected replacement
+		// fits both its raw opportunity and its biased admission deadline. This
+		// check samples the current rung without advancing any ladder state.
 		std::erase_if( g_framegenHistory.pending,
 			[&]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-				return !entry.bReal
-					&& gamescope::framegen::discard_pending_provisional_slot(
+				if ( entry.bReal
+					|| !gamescope::framegen::discard_pending_provisional_slot(
 						correction, entry.ulAnchorRealFrameId,
-						entry.bProvisional )
-					&& !( entry.oTargetVBlankNs
-						&& !gamescope::framegen::fixed_grid_slot_submittable(
-							*entry.oTargetVBlankNs,
-							framegen_nested_slot_wake_ns( *entry.oTargetVBlankNs ),
-							g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs,
-							g_framegenHistory.ulDeadlineGridIntervalNs, ulArrivalGuardNs ) );
+						entry.bProvisional ) )
+					return false;
+				if ( !entry.oTargetVBlankNs )
+					return true;
+				const uint64_t ulRawWakeNs = framegen_nested_slot_wake_ns( *entry.oTargetVBlankNs );
+				if ( !gamescope::framegen::fixed_grid_slot_submittable(
+					*entry.oTargetVBlankNs, ulRawWakeNs,
+					g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs,
+					g_framegenHistory.ulDeadlineGridIntervalNs, ulArrivalGuardNs ) )
+					return false;
+				const uint64_t ulReplacementWakeNs = gamescope::framegen::apply_present_bias_ns(
+					ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs );
+				const FramegenCausalRungSelection_t replacement = framegen_sample_causal_rung(
+					g_framegenHistory.nDegradeSteps );
+				const bool bDiscard = gamescope::framegen::discard_pending_provisional_slot(
+					correction, entry.ulAnchorRealFrameId, entry.bProvisional,
+					replacement.ulCostNs, replacement.uSamples, ulReplacementWakeNs, ulNowNs );
+				if ( !bDiscard && g_bFramegenDebug )
+					vk_log.infof( "LADDER_RETAIN real_id=%" PRIu64 " raw_target_ns=%" PRIu64
+						" raw_wake_ns=%" PRIu64 " wake_ns=%" PRIu64 " decision_ns=%" PRIu64
+						" cost_ns=%" PRIu64 " samples=%u",
+						entry.ulAnchorRealFrameId, *entry.oTargetVBlankNs, ulRawWakeNs,
+						ulReplacementWakeNs, ulNowNs, replacement.ulCostNs, replacement.uSamples );
+				return bDiscard && g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
 			} );
 		const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
 		// The discarded target was computed from the wrong grid phase and is not
@@ -14202,7 +14408,8 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 	// interval; phase >= 1 coincides with the next expected real frame (nested
 	// only) and is left to the repeat tick.
 	if ( g_framegenHistory.pending.empty() )
-		framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo, true );
+		framegen_causal_submit( g_framegenHistory.lastCompositeSeqNo, true,
+			feedback.ulDebugArrivalNs );
 }
 
 // VRR hybrid slot. Plan exactly ONE generated frame at the content
@@ -16761,7 +16968,16 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 void vulkan_wait( uint64_t ulSeqNo, bool bReset )
 {
-	return g_device.wait( ulSeqNo, bReset );
+	const bool bDebugComposite = g_bFramegenDebug
+		&& ulSeqNo == g_framegenHistory.lastCompositeSeqNo;
+	if ( bDebugComposite )
+	{
+		g_ulDebugCompositeSeq = ulSeqNo;
+		g_ulDebugCompositeWaitBegin = get_time_in_nanos();
+	}
+	g_device.wait( ulSeqNo, bReset );
+	if ( bDebugComposite )
+		g_ulDebugCompositeDone = get_time_in_nanos();
 }
 
 bool vulkan_has_drm_props()

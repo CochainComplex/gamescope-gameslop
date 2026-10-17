@@ -1478,6 +1478,19 @@ struct BidirPlanStep_t
 	return costNs <= jitterBudgetNs;
 }
 
+// Nested correction must have budget for a measured replacement before discarding
+// submitted pixels. The raw wake alone does not cover the biased admission
+// deadline. A cold replacement is not evidence that discarding is safe.
+[[nodiscard]] constexpr bool discard_pending_provisional_slot(
+	const AnchorCorrection_t &correction, uint64_t slotRealFrameId,
+	bool slotProvisional, uint64_t replacementCostNs,
+	uint32_t replacementSamples, uint64_t replacementWakeNs, uint64_t nowNs )
+{
+	return discard_pending_provisional_slot( correction, slotRealFrameId, slotProvisional )
+		&& replacementCostNs != 0u && replacementSamples >= k_uDeadlineMinSamples
+		&& deadline_cost_fits( replacementCostNs, replacementWakeNs, nowNs, 0u );
+}
+
 [[nodiscard]] constexpr bool commit_reservation_only_shortfall(
 	uint64_t costNs, uint64_t commitDeadlineNs, uint64_t plainWakeNs,
 	uint64_t nowNs, uint64_t startEstimateNs )
