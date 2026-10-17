@@ -54,6 +54,7 @@
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
+#include "framegen/hud_history.hpp"
 #include "framegen/gpu_diagnostics.hpp"
 #include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
@@ -185,13 +186,13 @@ static uint32_t framegen_hud_level()
 	return s_uLevel;
 }
 
+// tests/framegen_deadline.cpp pins this body: the style goes through
+// framegen_setting (log-once) and the tested settings.hpp helpers only.
 static bool framegen_hud_cga()
 {
-	// Quiet and Mallsoft share the shader's muted palette; only CGA differs.
-	static const bool enabled = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD_STYLE",
-		gamescope::framegen::FramegenHudStyle::Quiet,
-		gamescope::framegen::parse_hud_style_setting, "quiet" )
-		== gamescope::framegen::FramegenHudStyle::Cga;
+	static const bool enabled = gamescope::framegen::framegen_hud_style_cga( framegen_setting(
+		"GAMESCOPE_FRAMEGEN_HUD_STYLE", gamescope::framegen::k_eFramegenHudStyleDefault,
+		gamescope::framegen::parse_hud_style_setting, gamescope::framegen::k_pszFramegenHudStyleDefault ) );
 	return enabled;
 }
 
@@ -15246,14 +15247,12 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 // output-space history: motion estimation, generated frames and online
 // training see it. Not redesigned here (bidir flips its history images);
 // documented, and said once so a quality capture can be judged.
-static void framegen_note_hud_in_history( const char *pszReason )
+static void framegen_note_hud_in_history( bool bHudFreeRealFrame, const char *pszReason )
 {
-	static bool s_bLogged = false;
-	if ( s_bLogged )
-		return;
-	s_bLogged = true;
-	vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
-		pszReason != nullptr ? pszReason : "the HUD-free split conditions were not met" );
+	static gamescope::framegen::FramegenHudInHistoryNote s_note;
+	if ( const char *pszLog = s_note.take( bHudFreeRealFrame, framegen_hud_level() != 0u, pszReason ) )
+		vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
+			pszLog );
 }
 
 // bCursorFreeRealFrame: output-space mode only — pRealFrame carries no cursor,
@@ -15693,8 +15692,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		g_framegenHistory.bCursorFreeCurrent = bCursorFreeRealFrame;
 		g_framegenHistory.bHudFreePrevious = g_framegenHistory.bHudFreeCurrent;
 		g_framegenHistory.bHudFreeCurrent = bHudFreeRealFrame;
-		if ( !bHudFreeRealFrame && framegen_hud_level() != 0u )
-			framegen_note_hud_in_history( pszHudInHistoryReason );
+		framegen_note_hud_in_history( bHudFreeRealFrame, pszHudInHistoryReason );
 	}
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 
@@ -16111,6 +16109,26 @@ static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo
 		g_device.noteStagingSubmission( ulSeqNo, nQuerySlot );
 }
 
+// The live inputs gamescope::framegen::framegen_hud_in_history_reason asks for,
+// one at a time. tests/framegen_deadline.cpp pins this mapping.
+static bool framegen_hud_history_check( gamescope::framegen::FramegenHudHistoryCheck eCheck )
+{
+	switch ( eCheck )
+	{
+		case gamescope::framegen::FramegenHudHistoryCheck::FramegenEnabled:
+			return vulkan_framegen_is_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::OwnsOutputRing:
+			return framegen_owns_output_ring();
+		case gamescope::framegen::FramegenHudHistoryCheck::CursorSplitEnabled:
+			return framegen_cursor_split_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::BidirActive:
+			return vulkan_framegen_bidir_active();
+		case gamescope::framegen::FramegenHudHistoryCheck::ColorProbeRecording:
+			return framegen_color_record_dir() != nullptr;
+	}
+	return false;
+}
+
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud, const struct FrameInfo_t *pHudFrameInfo )
 {
 	if (!pOutputOverride && increment) {
@@ -16347,37 +16365,29 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// bHudFreeHistory says so to the present side. The present side then draws
 	// the live HUD onto generated frames (framegen_cursor_present_composite),
 	// so the HUD does not strobe at the real-frame rate.
-	const bool bHudSplitCandidate = bCursorSplitCandidate && framegen_hud_level() != 0u;
+	//
+	// The decisions live in framegen/hud_history.hpp (unit-tested there); this
+	// block only gathers the facts, and tests/framegen_deadline.cpp pins it.
+	// framegen_hud_level() is a cached setting, first read at device init.
+	gamescope::framegen::FramegenHudHistoryState hudHistory;
+	hudHistory.splitCandidate = bCursorSplitCandidate;
+	hudHistory.hudOn = framegen_hud_level() != 0u;
+	hudHistory.cursorSplit = bCursorSplit;
+	hudHistory.compositeImage = compositeImage != nullptr;
+	hudHistory.transferSrc = compositeImage != nullptr && compositeImage->transferSrc();
 	gamescope::Rc<CVulkanTexture> pHudFreeHistoryImage;
-	if ( bHudSplitCandidate && !bCursorSplit && compositeImage != nullptr
-		&& compositeImage->transferSrc() )
+	if ( gamescope::framegen::framegen_hud_history_copy_wanted( hudHistory ) )
 	{
 		pHudFreeHistoryImage = framegen_acquire_cursor_history_image(
 			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
 	}
-	const bool bHudFreeHistory = bHudSplitCandidate
-		&& ( bCursorSplit || pHudFreeHistoryImage != nullptr );
+	hudHistory.hudFreeImage = pHudFreeHistoryImage != nullptr;
+	const bool bHudFreeHistory = gamescope::framegen::framegen_hud_free_history( hudHistory );
 	// Why the HUD stays in this frame's history: the first reason that holds,
 	// for framegen_record_real_frame's one-time note. Side composites never
 	// reach it, and base-layer scenes or repaints are not output-space history.
-	const char *pszHudInHistoryReason = nullptr;
-	if ( !bHudFreeHistory && vulkan_framegen_is_enabled() && framegen_hud_level() != 0u )
-	{
-		if ( !framegen_owns_output_ring() )
-			pszHudInHistoryReason = "a Vulkan-swapchain backend (nested SDL) has no compositor-owned output ring";
-		else if ( !framegen_cursor_split_enabled() )
-			pszHudInHistoryReason = "GAMESCOPE_FRAMEGEN_CURSOR=0 disables the split";
-		else if ( vulkan_framegen_bidir_active() )
-			pszHudInHistoryReason = "bidirectional interpolation flips its history images";
-		else if ( framegen_color_record_dir() != nullptr )
-			pszHudInHistoryReason = "the colour probe is recording";
-		else if ( bHudSplitCandidate && compositeImage != nullptr && !compositeImage->transferSrc() )
-			pszHudInHistoryReason = "the output image lacks transferSrc";
-		else if ( bHudSplitCandidate )
-			pszHudInHistoryReason = "the owned history pool was busy";
-		else
-			pszHudInHistoryReason = "the HUD-free split conditions were not met";
-	}
+	const char *pszHudInHistoryReason = gamescope::framegen::framegen_hud_in_history_reason(
+		hudHistory, framegen_hud_history_check );
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 	// Off the real-frame critical path: the staging copy goes out as its own

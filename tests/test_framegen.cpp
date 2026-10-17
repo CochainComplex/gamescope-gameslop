@@ -603,6 +603,27 @@ static void test_numeric_settings_contract()
 	CHECK( parse_hud_style_setting( "MallSoft" ) == FramegenHudStyle::Mallsoft );
 	for ( const char *pszInvalid : { "cg", "cgaa", " cga", "cga ", "ega", "1", "quiet\n", "mall soft" } )
 		CHECK( !parse_hud_style_setting( pszInvalid ).has_value() );
+
+	// What framegen_hud_cga() ends up with for a raw environment value: unset
+	// and invalid keep Quiet, and only CGA selects the CGA palette.
+	CHECK( k_eFramegenHudStyleDefault == FramegenHudStyle::Quiet );
+	CHECK( std::string_view{ k_pszFramegenHudStyleDefault } == "quiet" );
+	CHECK( parse_hud_style_setting( k_pszFramegenHudStyleDefault ) == k_eFramegenHudStyleDefault );
+	CHECK( resolve_hud_style_setting( nullptr ) == FramegenHudStyle::Quiet );
+	CHECK( resolve_hud_style_setting( "" ) == FramegenHudStyle::Quiet );
+	CHECK( resolve_hud_style_setting( "quiet" ) == FramegenHudStyle::Quiet );
+	CHECK( resolve_hud_style_setting( "MALLSOFT" ) == FramegenHudStyle::Mallsoft );
+	CHECK( resolve_hud_style_setting( "cga" ) == FramegenHudStyle::Cga );
+	CHECK( resolve_hud_style_setting( "cGa" ) == FramegenHudStyle::Cga );
+	for ( const char *pszInvalid : { "cg", "cgaa", " cga", "ega", "2", "on" } )
+		CHECK( resolve_hud_style_setting( pszInvalid ) == FramegenHudStyle::Quiet );
+	CHECK( framegen_hud_style_cga( FramegenHudStyle::Cga ) );
+	CHECK( !framegen_hud_style_cga( FramegenHudStyle::Quiet ) );
+	CHECK( !framegen_hud_style_cga( FramegenHudStyle::Mallsoft ) );
+	CHECK( framegen_hud_style_cga( resolve_hud_style_setting( "CGA" ) ) );
+	CHECK( !framegen_hud_style_cga( resolve_hud_style_setting( "mallsoft" ) ) );
+	CHECK( !framegen_hud_style_cga( resolve_hud_style_setting( nullptr ) ) );
+	CHECK( !framegen_hud_style_cga( resolve_hud_style_setting( "cga-ish" ) ) );
 }
 
 static void test_adaptation_policy()

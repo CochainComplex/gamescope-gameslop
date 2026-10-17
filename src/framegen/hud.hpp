@@ -542,6 +542,10 @@ inline constexpr uint32_t k_uFramegenHudOutlineBelowPercent = 10u;
 {
 	return cga || ( opacity <= 100u && opacity < k_uFramegenHudOutlineBelowPercent );
 }
+// How far the outline pixels blend toward black (the shader's mix weight):
+// nearly opaque, so the outline survives any scene behind it.
+inline constexpr float k_flFramegenHudOutlineBlend = 0.98f;
+static_assert( k_flFramegenHudOutlineBlend > 0.0f && k_flFramegenHudOutlineBlend <= 1.0f );
 
 // Attribute bit lives in each existing packed character byte; font remains ASCII.
 // A colon separates label/value within each pipe-delimited field. Diagnostic
