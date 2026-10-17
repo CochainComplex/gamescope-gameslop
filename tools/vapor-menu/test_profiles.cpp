@@ -152,5 +152,46 @@ int main(int argc, char **argv) {
     assert(rejects([&]{overridden.draft.validate(overridden.context);}));
     overridden.context.orientation="normal"; overridden.context.outputs="PerWindow";
     assert(rejects([&]{overridden.draft.validate(overridden.context);}));
+    // Every editable menu row: LEFT/RIGHT goes through Store::editRow, changes
+    // the draft, and the opposite direction restores it.
+    {
+        const std::map<int,std::string> expected{
+            {2,"pipeline"},{3,"multiplier"},{4,"mode"},{5,"framegen"},{6,"online"},{7,"bidir"},
+            {8,"net_profile"},{9,"hud"},{10,"corner"},{14,"style"},{15,"hud_opacity"},{16,"hud_scale"}};
+        assert(vapor::menuRowKeys==expected);
+        vapor::Store rows;
+        rows.context=vapor::Context{};
+        rows.draft=vapor::Profile{};
+        // Two valid learned files, so the learned-profile row has somewhere to go.
+        std::ofstream(root/"other.bin",std::ios::binary).write(
+            reinterpret_cast<const char *>(weights->data()),weights->size());
+        rows.draft.set("net_profile",(root/"other.bin").string());
+        for (auto &[row,key] : vapor::menuRowKeys) {
+            const auto before=rows.draft.values.at(key);
+            rows.dirty=false;
+            rows.editRow(row,1);
+            assert(rows.draft.values.at(key)!=before && rows.dirty);
+            rows.editRow(row,-1);
+            assert(rows.draft.values.at(key)==before);
+        }
+        for (int row : {0,1,11,12,13,17,18}) {
+            const auto values=rows.draft.values;
+            rows.dirty=false; rows.editRow(row,1);
+            assert(rows.draft.values==values && !rows.dirty);
+        }
+        // HUD appearance rows are inactive while the HUD is off.
+        rows.draft.set("hud","0");
+        for (int row : {10,15,16}) {
+            const auto &key=vapor::menuRowKeys.at(row);
+            const auto before=rows.draft.values.at(key);
+            assert(rows.draft.disabledReason(key)=="Enable the HUD first");
+            rows.editRow(row,1);
+            assert(rows.draft.values.at(key)==before && rows.status=="Enable the HUD first");
+        }
+        assert(rows.draft.disabledReason("style").empty()); // Menu style stays editable.
+        rows.draft.set("hud","1"); rows.draft.set("framegen","off");
+        assert(rows.draft.disabledReason("hud_opacity")=="Enable frame generation first");
+        assert(rows.draft.disabledReason("hud_scale")=="Enable frame generation first");
+    }
     std::cout << "Profile persistence, validation, draft ownership and weight isolation PASS\n";
 }

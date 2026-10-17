@@ -34,6 +34,14 @@ inline const std::map<std::string, std::vector<std::string>> choices{
     {"hud_opacity", {"auto", "0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"}},
     {"hud_scale", {"auto", "1", "2", "3", "4", "5", "6"}},
 };
+// Menu rows (index into main.cpp's labels) whose LEFT/RIGHT edits one profile
+// key. Every other focusable row is an action, the preset selector (1) or the
+// unavailable NPU switch (17). Store::editRow is the only edit dispatch.
+inline const std::map<int, std::string> menuRowKeys{
+    {2, "pipeline"}, {3, "multiplier"}, {4, "mode"}, {5, "framegen"},
+    {6, "online"}, {7, "bidir"}, {8, "net_profile"}, {9, "hud"}, {10, "corner"},
+    {14, "style"}, {15, "hud_opacity"}, {16, "hud_scale"},
+};
 inline bool identifier(const std::string &s) {
     return !s.empty() && s.size()<=64 && s!="." && s!=".." &&
         std::all_of(s.begin(),s.end(),[](unsigned char c) {
@@ -115,7 +123,8 @@ struct Profile {
         if ((key=="online" || key=="net_profile") && !usesNet())
             return "Learned profiles need a learned motion pipeline";
         if (key=="bidir") return values.at("bidir")=="on" ? "" : bidirReason(context);
-        if (key=="corner" && values.at("hud")=="0") return "Enable the HUD first";
+        if ((key=="corner" || key=="hud_opacity" || key=="hud_scale") && values.at("hud")=="0")
+            return "Enable the HUD first";
         return "";
     }
     void validate(const Context &context={}) const {
@@ -263,6 +272,20 @@ struct Store {
             draft.set("bidir","off");
             status="Bidir disabled / "+draft.bidirReason(context);
         }
+    }
+    // One menu row's LEFT/RIGHT. Rows without a profile key do nothing here.
+    void editRow(int row, int delta) {
+        auto entry=menuRowKeys.find(row);
+        if (entry==menuRowKeys.end()) return;
+        const auto &key=entry->second;
+        if (key=="net_profile") { cycleLearned(delta); return; }
+        if (key=="style") {
+            // Menu appearance too: always editable, no dependency fix-ups.
+            draft.cycle(key,delta); dirty=true;
+            status="Menu preview / save; HUD on next launch";
+            return;
+        }
+        edit(key,delta);
     }
     void refreshLearned() {
         learnedPaths={draft.values.at("net_profile")};

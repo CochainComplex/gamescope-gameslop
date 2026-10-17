@@ -88,6 +88,9 @@ and the short research references there.
 **HUD BG Opacity** controls the background independently of the lettering: Auto
 uses 14% for Quiet/Mallsoft and 36% for CGA; explicit values range from 0%
 (clear) to 100% (solid) in 10% steps. **HUD Text Size** offers Auto or 1–6×.
+Both rows, like HUD Position, are inactive while the HUD is off. CGA lettering
+always has a black pixel outline; Quiet/Mallsoft lettering gets the same outline
+at 0% (below 10% backing), so a clear HUD stays readable over bright scenes.
 Save Preset remembers both for the next launch. The launcher exports
 `GAMESCOPE_FRAMEGEN_HUD_OPACITY` and `GAMESCOPE_FRAMEGEN_HUD_SCALE`; Auto
 clears those overrides.
@@ -204,4 +207,4 @@ HUD labels use muted cyan (canonical cyan in CGA); measured values use bright
 white. Colons and pipe-delimited fields separate the readings, for example
 `SOURCE: 40 fps | GENERATED: 78 fps | FILL: 98%`. Sparklines, checkout hash and
 independent backing opacity remain. Label/value attributes fit inside the
-existing packed character bytes; the uniform remains 1584 bytes.
+existing packed character bytes; the uniform is 1648 bytes (eight lines).
