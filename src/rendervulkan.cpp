@@ -13822,10 +13822,10 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	// The admission gate above remains tied to this decision's actual remaining
 	// time. If the mature rung fits a normally planned slot (native: the KMS
 	// commit budget; nested: the refresh interval less the compositor's wake
-	// lead), a late-phase decision is not capacity evidence: skip it without
-	// degrading or resetting the recovery streak, and try again at the normal
-	// phase. Nested decisions hit this when the learned present bias moves the
-	// slot's wake towards the provisional (raw-vblank) start bound.
+	// lead), a late-phase decision is not capacity evidence. Nested may still
+	// use a mature cheaper rung that fits this window; otherwise skip without
+	// resetting recovery evidence. The learned present bias can repeatedly move
+	// the wake towards the provisional (raw-vblank) start bound.
 	//
 	// Otherwise retain the existing post-degradation hold. Known work that
 	// misses this slot's actual remaining budget is skipped rather than
@@ -13838,10 +13838,23 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 		? gamescope::framegen::deadline_budget_ns(
 			plan.wakeNs - ulDecisionStartNs )
 		: 0u;
+	std::array<gamescope::framegen::LadderRungCost_t,
+		CVulkanDevice::kFramegenLadderSlots> fallbackCosts = {};
+	for ( uint32_t nRung = nCurrentRung + 1u;
+		nRung <= nMaxCausalDegradeSteps; nRung++ )
+	{
+		const FramegenCausalRungSelection_t sample = sampleRung( nRung );
+		fallbackCosts[nRung] = { sample.ulCostNs, sample.uSamples };
+	}
+	const std::span<const gamescope::framegen::LadderRungCost_t> cheaperRungs =
+		std::span( fallbackCosts ).subspan( nCurrentRung + 1u,
+			nMaxCausalDegradeSteps - nCurrentRung );
+	bool bMatureOnly = false;
 	switch ( gamescope::framegen::causal_shortfall_action(
 		bDegradeForPriorMiss, result.ulCostNs, result.uSamples,
 		ulRemainingBudgetNs, ulShortfallSlotBudgetNs,
-		g_framegenHistory.nDegradeHold ) )
+		g_framegenHistory.nDegradeHold,
+		ulNativeSlotBudgetNs != 0u ? decltype( cheaperRungs ){} : cheaperRungs ) )
 	{
 		case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly:
 			return result;
@@ -13849,6 +13862,9 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 			g_framegenHistory.nDegradeHold--;
 			framegen_recovery_note_capacity_failure();
 			return result;
+		case gamescope::framegen::CausalShortfallAction_t::DegradePhaseOnly:
+			bMatureOnly = true;
+			break;
 		case gamescope::framegen::CausalShortfallAction_t::Degrade:
 			break;
 	}
@@ -13856,26 +13872,21 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	// Select one new monotonic rung for this decision. Mature non-fitting rungs
 	// can be passed over; the first cold rung gets one non-blocking probe. If the
 	// cheapest measured rung still cannot fit, settle there and skip honestly.
-	for ( uint32_t nRung = nCurrentRung + 1u;
-		nRung <= nMaxCausalDegradeSteps; nRung++ )
+	const uint32_t nFallback = gamescope::framegen::select_causal_fallback_rung(
+		cheaperRungs, ulRemainingBudgetNs, bMatureOnly );
+	if ( nFallback < cheaperRungs.size() )
 	{
+		const uint32_t nRung = nCurrentRung + 1u + nFallback;
 		FramegenCausalRungSelection_t candidate = sampleRung( nRung );
-		const bool bMature = candidate.ulCostNs != 0u
-			&& candidate.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
-		if ( sampleFits( candidate ) )
-		{
-			candidate.bAdmit = true;
-			candidate.bCommittedRung = true;
-			g_framegenHistory.nDegradeSteps = nRung;
-			g_framegenHistory.nDegradeHold = gamescope::framegen::k_uDeadlineHoldFrames;
-			framegen_recovery_note_degradation();
-			return candidate;
-		}
-		if ( !bMature )
-			break;
-		result = candidate;
+		candidate.bAdmit = true;
+		candidate.bCommittedRung = true;
+		g_framegenHistory.nDegradeSteps = nRung;
+		g_framegenHistory.nDegradeHold = gamescope::framegen::k_uDeadlineHoldFrames;
+		framegen_recovery_note_degradation();
+		return candidate;
 	}
 
+	result = sampleRung( nMaxCausalDegradeSteps );
 	const bool bDegraded = nCurrentRung < nMaxCausalDegradeSteps;
 	g_framegenHistory.nDegradeSteps = nMaxCausalDegradeSteps;
 	g_framegenHistory.nDegradeHold = 0u;
@@ -14056,9 +14067,9 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	// immediate miss handling and remaining-time recovery budget; only the
 	// phase-only skip gains a slot reference (its wake lead, see
 	// nested_slot_budget_ns).
-	const uint64_t ulShortfallSlotBudgetNs = bNativeKmsTiming
-		? ulNativeSlotBudgetNs
-		: gamescope::framegen::nested_slot_budget_ns( ulVblankIntervalNs,
+	const uint64_t ulShortfallSlotBudgetNs =
+		gamescope::framegen::causal_shortfall_slot_budget_ns(
+			bNativeKmsTiming, ulNativeSlotBudgetNs, ulVblankIntervalNs,
 			rawGrid.D0 > rawGrid.W0 ? rawGrid.D0 - rawGrid.W0 : 0u );
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
 		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,

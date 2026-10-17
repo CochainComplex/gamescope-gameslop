@@ -7019,10 +7019,109 @@ constexpr uint64_t recorded_remaining_budget_ns( const RecordedCausalDecision_t 
 constexpr uint64_t recorded_nested_slot_budget_ns( const RecordedCausalDecision_t &d )
 {
 	// The compositor wake lead is target - wake (the bias shifts both equally).
-	return nested_slot_budget_ns( k_ulRecordedIntervalNs, d.targetNs - d.wakeNs );
+	return causal_shortfall_slot_budget_ns( false, 0u,
+		k_ulRecordedIntervalNs, d.targetNs - d.wakeNs );
 }
 
 } // namespace
+
+TEST_CASE( "causal shortfall reference selection is wired into the renderer",
+	"[framegen][deadline][nested][reference-wiring]" )
+{
+	const auto assignments = framegen_source_statements(
+		framegen_rendervulkan_source(), "const uint64_t ulShortfallSlotBudgetNs=", ";" );
+	REQUIRE( assignments.size() == 1u );
+	CHECK( assignments.front().find( "=gamescope::framegen::causal_shortfall_slot_budget_ns(" )
+		!= std::string::npos );
+	CHECK( causal_shortfall_slot_budget_ns( true, 123u, 8'000'000u, 3'000'000u ) == 123u );
+	CHECK( causal_shortfall_slot_budget_ns( false, 0u, 8'000'000u, 3'000'000u )
+		== 4'250'000u );
+}
+
+TEST_CASE( "repeated nested anchor windows admit a mature cheaper rung",
+	"[framegen][deadline][nested][anchor-window]" )
+{
+	constexpr uint64_t intervalNs = 8'000'000u;
+	constexpr int64_t biasNs = -3'500'000;
+	constexpr std::array<LadderRungCost_t, 2> costs = { {
+		{ 1'500'000u, k_uDeadlineMinSamples },
+		{ 300'000u, k_uDeadlineMinSamples },
+	} };
+	uint32_t rung = 0u;
+	for ( uint64_t frame = 0u; frame < 32u; frame++ )
+	{
+		const uint64_t rawTargetNs = 100'000'000u + frame * 2u * intervalNs;
+		const DisplayGrid_t rawGrid = {
+			.D0 = rawTargetNs, .W0 = rawTargetNs - 3'000'000u, .T = intervalNs,
+		};
+		const DisplayGrid_t grid = apply_present_bias( rawGrid, biasNs );
+		RealAnchorState_t anchor = {
+			.realFrameId = frame + 1u,
+			.sourceReadyNs = rawTargetNs - 500'000u,
+			.provisionalTargetNs = grid.D0,
+			.provisionalBiasNs = biasNs,
+			.epoch = 1u,
+		};
+		CausalPlanOptions_t options = {
+			.nowNs = anchor.sourceReadyNs, .gridEpoch = 1u,
+			.presentBiasNs = biasNs, .sourceTimestampsReliable = true,
+			.dedicatedQueue = true,
+		};
+		const CadencePredictorState cadence = trained_cadence( 2u * intervalNs );
+		const CausalSlotPlan_t plan = plan_next_causal_slot( grid, anchor, cadence, options );
+		REQUIRE( plan.admit );
+		REQUIRE( plan.provisional );
+		const uint64_t remainingNs = deadline_budget_ns(
+			plan.wakeNs - anchor.provisional_start_estimate() );
+		REQUIRE( remainingNs == 1'275'000u );
+		const uint64_t slotNs = causal_shortfall_slot_budget_ns(
+			false, 0u, intervalNs, rawGrid.D0 - rawGrid.W0 );
+		if ( costs[rung].costNs > remainingNs )
+		{
+			const auto cheaper = std::span( costs ).subspan( rung + 1u );
+			const auto action = causal_shortfall_action( false, costs[rung].costNs,
+				costs[rung].samples, remainingNs, slotNs, 0u, cheaper );
+			REQUIRE( action == CausalShortfallAction_t::DegradePhaseOnly );
+			rung += 1u + select_causal_fallback_rung( cheaper, remainingNs, true );
+		}
+		REQUIRE( rung == 1u );
+		CHECK( deadline_cost_fits( costs[rung].costNs, plan.wakeNs,
+			options.nowNs, anchor.provisional_start_estimate() ) );
+
+		// Delayed feedback leaves only 0.5 ms even after anchor correction.
+		anchor.correctedFlipNs = grid.D0;
+		options.nowNs = plan.wakeNs - 500'000u;
+		options.skipAtOrPastNextReal = true;
+		const auto corrected = plan_next_causal_slot( grid, anchor, cadence, options );
+		REQUIRE( corrected.admit );
+		CHECK_FALSE( deadline_cost_fits( costs[0].costNs, corrected.wakeNs, options.nowNs, 0u ) );
+		CHECK( deadline_cost_fits( costs[rung].costNs, corrected.wakeNs, options.nowNs, 0u ) );
+		options.afterTargetNs = corrected.targetNs;
+		CHECK( plan_next_causal_slot( grid, anchor, cadence, options ).skipReason
+			== DeadlineSkipReason_t::ForwardCap );
+	}
+}
+
+TEST_CASE( "phase fallback skips cold rungs and uniformly collapsed windows",
+	"[framegen][deadline][nested][anchor-window]" )
+{
+	constexpr std::array<LadderRungCost_t, 3> cheaper = { {
+		{ 0u, 0u }, { 300'000u, k_uDeadlineMinSamples - 1u },
+		{ 300'000u, k_uDeadlineMinSamples },
+	} };
+	CHECK( select_causal_fallback_rung( cheaper, 1'275'000u, true ) == 2u );
+	CHECK( select_causal_fallback_rung( cheaper, 1'275'000u, false ) == 0u );
+	CHECK( causal_shortfall_action( false, 1'500'000u, k_uDeadlineMinSamples,
+		1'275'000u, 4'250'000u, 4u, cheaper ) == CausalShortfallAction_t::DegradePhaseOnly );
+	CHECK( causal_shortfall_action( false, 1'500'000u, k_uDeadlineMinSamples,
+		3'000u, 4'250'000u, 4u, cheaper ) == CausalShortfallAction_t::SkipPhaseOnly );
+	CHECK( causal_shortfall_action( false, 1'500'000u, k_uDeadlineMinSamples,
+		1'275'000u, 4'250'000u, 0u, std::span( cheaper ).first( 2u ) )
+		== CausalShortfallAction_t::SkipPhaseOnly );
+	// Native supplies no phase fallback and retains its phase-only skip.
+	CHECK( causal_shortfall_action( false, 1'500'000u, k_uDeadlineMinSamples,
+		1'275'000u, 4'250'000u, 0u ) == CausalShortfallAction_t::SkipPhaseOnly );
+}
 
 TEST_CASE( "nested late-phase decisions are not ladder capacity evidence",
 	"[framegen][deadline][recovery][nested]" )
