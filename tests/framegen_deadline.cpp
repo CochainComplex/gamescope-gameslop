@@ -7061,6 +7061,19 @@ TEST_CASE( "the renderer classifies causal shortfalls through the shared seams",
 			"const uint64_t ulShortfallSlotBudgetNs ="
 			" gamescope::framegen::causal_shortfall_slot_budget_ns("
 			" bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );" ) } );
+	// The classifier and the rung selection receive that reference, not the
+	// native budget.
+	CHECK( statements( "switch ( gamescope::framegen::causal_shortfall_action(", "{" )
+		== std::vector<std::string>{ framegen_canonical(
+			"switch ( gamescope::framegen::causal_shortfall_action("
+			" bDegradeForPriorMiss, result.ulCostNs, result.uSamples,"
+			" ulRemainingBudgetNs, ulShortfallSlotBudgetNs,"
+			" g_framegenHistory.nDegradeHold ) ) {" ) } );
+	CHECK( statements( "FramegenCausalRungSelection_t rung = framegen_select_causal_rung(", ";" )
+		== std::vector<std::string>{ framegen_canonical(
+			"FramegenCausalRungSelection_t rung = framegen_select_causal_rung("
+			" plan, now, ulPlainWakeNs, commitPlan.earlyCommit,"
+			" ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );" ) } );
 	// A phase-only skip returns at once: it writes no rung, hold or recovery
 	// evidence.
 	CHECK( statements( "case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly:", ";" )
