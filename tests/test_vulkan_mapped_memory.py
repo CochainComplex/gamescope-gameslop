@@ -30,9 +30,21 @@ def main():
                         "\n\t\t}\n\t\t\n\t\tres = g_device.vk.AllocateMemory")
     allocate = next(line for line in init.splitlines()
                     if "res = g_device.vk.AllocateMemory(" in line)
+    create = between(init, "\tres = g_device.vk.CreateImage(",
+                     "\n\tVkMemoryRequirements memRequirements;")
+    allocate_tail = between(init, allocate,
+                            "\n\t}\n\telse\n\t{\n\t\tvk_log.infof")
+    allocate_tail = allocate_tail[len(allocate):]
+    reuse = between(init, '\t\tvk_log.infof("%d vs %d!",',
+                    "\n\t}\n\t\n\tres = g_device.vk.BindImageMemory")
+    destructor = between(source, "CVulkanTexture::~CVulkanTexture( void )",
+                         "\nint CVulkanTexture::memoryFence()")
+    swapchain = between(source, "bool CVulkanTexture::BInitFromSwapchain(",
+                        "\ngamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()")
     find_type = between(source, "int32_t CVulkanDevice::findMemoryType(",
                         "\nstd::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer(")
-    members = [line for line in header.splitlines()
+    texture_header = between(header, "class CVulkanTexture ", "\n};")
+    members = [line for line in texture_header.splitlines()
                if line.startswith(("\tinline uint8_t *mappedData()",
                                    "\tinline uint8_t *mappedPixels()",
                                    "\tinline uint32_t rowPitch()",
@@ -44,6 +56,20 @@ def main():
                                    "\tuint32_t m_lumaPitch =",
                                    "\tuint32_t m_chromaOffset =",
                                    "\tuint32_t m_chromaPitch =",
+                                   "\tbool m_bInitialized =",
+                                   "\tbool m_bOwnsImage =",
+                                   "\tbool m_bDeviceLocal =",
+                                   "\tbool m_bOutputImage =",
+                                   "\tVkImage m_vkImage =",
+                                   "\tVkDeviceMemory m_vkImageMemory =",
+                                   "\tVkImageView m_",
+                                   "\tuint32_t m_drmFormat =",
+                                   "\tuint32_t m_width =",
+                                   "\tuint32_t m_height =",
+                                   "\tuint32_t m_depth =",
+                                   "\tuint32_t m_contentWidth =",
+                                   "\tuint32_t m_contentHeight =",
+                                   "\tVkFormat m_format =",
                                    "\tuint8_t *m_pMappedData ="))]
     layout = between(init, "\tif ( flags.bMappable == true )\n\t{\n\t\tassert( tiling",
                      "\n\tif ( flags.bExportable == true )")
@@ -68,6 +94,11 @@ def main():
         (directory / "memory_type.inc").write_text(find_type)
         (directory / "image_allocation.inc").write_text(
             properties + allocation_info + selection + "\n" + allocate + "\n")
+        (directory / "image_create.inc").write_text(create)
+        (directory / "image_allocation_tail.inc").write_text(allocate_tail)
+        (directory / "image_reuse.inc").write_text(reuse)
+        (directory / "image_destructor.inc").write_text(destructor)
+        (directory / "image_swapchain.inc").write_text(swapchain)
         (directory / "mapped_members.inc").write_text("\n".join(members) + "\n")
         (directory / "mapped_layout.inc").write_text(layout)
         (directory / "export_layout.inc").write_text(export_layout)
