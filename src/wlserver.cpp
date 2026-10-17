@@ -2579,6 +2579,8 @@ void wlserver_run(void)
 	}
 
 #if HAVE_LIBEIS
+	// The EIS waiter thread may still be dispatching on the context; join it before freeing that.
+	g_LibEisWaiter.Shutdown();
 	g_InputServer = nullptr;
 #endif
 
