@@ -4021,7 +4021,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	{
 		assert( tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT );
 		const VkImageSubresource image_subresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.aspectMask = isYcbcr() ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
 		};
 		VkSubresourceLayout image_layout;
 		g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &image_subresource, &image_layout);
@@ -4031,14 +4031,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		if (isYcbcr())
 		{
-			const VkImageSubresource lumaSubresource = {
-				.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT,
-			};
-			VkSubresourceLayout lumaLayout;
-			g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &lumaSubresource, &lumaLayout);
-
-			m_lumaOffset = lumaLayout.offset;
-			m_lumaPitch = lumaLayout.rowPitch;
+			m_lumaOffset = image_layout.offset;
+			m_lumaPitch = image_layout.rowPitch;
 
 			const VkImageSubresource chromaSubresource = {
 				.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT,
@@ -4129,7 +4123,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		else
 		{
 			const VkImageSubresource subresource = {
-				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.aspectMask = isYcbcr() ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
 			};
 			VkSubresourceLayout subresourceLayout = {};
 			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );

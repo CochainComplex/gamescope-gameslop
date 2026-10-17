@@ -40,9 +40,17 @@ def main():
                                    "\tuint32_t m_unRowPitch =",
                                    "\tVkDeviceSize m_mappedOffset =",
                                    "\tVkDeviceSize m_size =",
+                                   "\tuint32_t m_lumaOffset =",
+                                   "\tuint32_t m_lumaPitch =",
+                                   "\tuint32_t m_chromaOffset =",
+                                   "\tuint32_t m_chromaPitch =",
                                    "\tuint8_t *m_pMappedData ="))]
-    layout = between(init, "\t\tm_unRowPitch = image_layout.rowPitch;",
-                     "\n\t\tif (isYcbcr())")
+    layout = between(init, "\tif ( flags.bMappable == true )\n\t{\n\t\tassert( tiling",
+                     "\n\tif ( flags.bExportable == true )")
+    # Capture enables export independently of CPU mapping. Execute its actual
+    # nonmodifier query and assignments instead of reproducing their policy.
+    export_layout = between(init, "\n\t\t\tconst VkImageSubresource subresource = {\n",
+                            "\n\t\t}\n\n\t\tm_dmabuf = dmabuf;")
     mapping = between(init, "\tif ( flags.bMappable )\n",
                       "\n\tm_bInitialized = true;")
     upload = between(source, "static void framegen_net_stage_weights(",
@@ -62,6 +70,7 @@ def main():
             properties + allocation_info + selection + "\n" + allocate + "\n")
         (directory / "mapped_members.inc").write_text("\n".join(members) + "\n")
         (directory / "mapped_layout.inc").write_text(layout)
+        (directory / "export_layout.inc").write_text(export_layout)
         (directory / "mapped_mapping.inc").write_text(mapping)
         (directory / "mapped_upload.inc").write_text(upload)
         (directory / "mapped_readback.inc").write_text(readback)
