@@ -1096,17 +1096,19 @@ namespace gamescope
 
     void CWaylandConnector::UpdateFullscreenState()
     {
+        const bool bDesiredFullscreen = *m_pDesiredFullscreenState;
+
         if ( !m_bVisible )
             g_bFullscreen = false;
 
-        if ( *m_pDesiredFullscreenState != g_bFullscreen && m_bVisible )
+        if ( bDesiredFullscreen != g_bFullscreen && m_bVisible )
         {
-            if ( *m_pDesiredFullscreenState )
+            if ( bDesiredFullscreen )
                 libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
             else
                 libdecor_frame_unset_fullscreen( m_Planes[0].GetFrame() );
 
-            g_bFullscreen = *m_pDesiredFullscreenState;
+            g_bFullscreen = bDesiredFullscreen;
         }
     }
 
@@ -2533,13 +2535,14 @@ namespace gamescope
     {
         std::shared_ptr<CWaylandConnector> pConnector = std::make_shared<CWaylandConnector>( this, ulVirtualConnectorKey );
         m_pFocusConnector = pConnector.get();
-        m_InputThread.SetFullscreenState( pConnector->GetFullscreenState() );
+        m_InputThread.SetFullscreenState( {} );
 
         if ( !pConnector->Init() )
         {
             return nullptr;
         }
 
+        m_InputThread.SetFullscreenState( pConnector->GetFullscreenState() );
         return pConnector;
     }
 
@@ -3181,7 +3184,7 @@ namespace gamescope
                 // flag so GUI objects still die on the compositor thread. A late
                 // write to an orphaned flag cannot change the next connector.
                 if ( auto pState = m_pFullscreenState.load().lock() )
-                    *pState = !g_bFullscreen;
+                    *pState = !*pState;
                 break;
             }
 
