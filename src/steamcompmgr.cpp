@@ -2545,9 +2545,10 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 		layer->ctm = s_scRGB709To2020Matrix;
 	// The cached layer may draw the pre-emptively upscaled image instead of the
 	// imported buffer; only the imported buffer is the commit's own texture.
-	if ( layer->tex == commit->vulkanTex )
-		layer->pCommitTexture = &commit->vulkanTex;
+	// Assigned every time: a slot reused after layers.pop() keeps the old values.
+	layer->pCommitTexture = layer->tex == commit->vulkanTex ? &commit->vulkanTex : nullptr;
 	// A held commit may outlive its window, so it has no staged-copy counter.
+	layer->pStagedCopyCount = nullptr;
 	layer->acquireReadyTimeNs = commit->present_time;
 	layer->ulCommitID = commit->commitID;
 
@@ -2620,8 +2621,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : frameInfo->eUpscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, frameInfo->eUpscaleScaler, layer->colorspace );
-	if ( layer->tex == lastCommit->vulkanTex )
-		layer->pCommitTexture = &lastCommit->vulkanTex;
+	layer->pCommitTexture = layer->tex == lastCommit->vulkanTex ? &lastCommit->vulkanTex : nullptr;
 	layer->pStagedCopyCount = &w->ulStagedCopyCount;
 	layer->acquireReadyTimeNs = lastCommit->present_time;
 	layer->ulCommitID = lastCommit->commitID;
