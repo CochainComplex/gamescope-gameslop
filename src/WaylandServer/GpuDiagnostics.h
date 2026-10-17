@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <wayland-server.h>
 #include "gamescope-control-protocol.h"
 #include "framegen/gpu_diagnostics.hpp"
@@ -21,9 +22,10 @@ static void gpu_diagnostics_snapshot(wl_client *, wl_resource *resource)
 static const struct gamescope_gpu_diagnostics_v1_interface gpu_diagnostics_impl={
 	.destroy=gpu_diagnostics_destroy, .get_snapshot=gpu_diagnostics_snapshot,
 };
-static void gpu_diagnostics_bind(wl_client *client, void *, uint32_t, uint32_t id)
+static void gpu_diagnostics_bind(wl_client *client, void *, uint32_t version, uint32_t id)
 {
-	auto *resource=wl_resource_create(client,&gamescope_gpu_diagnostics_v1_interface,1,id);
+	// Honour the client's requested version, capped at the one this host speaks.
+	auto *resource=wl_resource_create(client,&gamescope_gpu_diagnostics_v1_interface,std::min(version,1u),id);
 	if (!resource) { wl_client_post_no_memory(client); return; }
 	wl_resource_set_implementation(resource,&gpu_diagnostics_impl,nullptr,nullptr);
 }

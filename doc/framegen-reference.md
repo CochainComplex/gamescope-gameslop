@@ -407,13 +407,18 @@ while the colour probe records (`GAMESCOPE_FRAMEGEN_RECORD_COLOR`), with
 frame where the owned history image pool is busy, and when the output image
 does not support transfer-source copies. Base-layer scenes
 (`GAMESCOPE_FRAMEGEN_BASE`) are not affected: they take history from the game
-layer, which never contains the HUD. When the HUD is in history, motion
+layer, which never contains the HUD. Nested backends differ: the nested Wayland
+backend owns its output ring and behaves like DRM (the split applies, with the
+same exceptions), while a Vulkan-swapchain backend (nested SDL) has no
+compositor-owned output ring and always generates from the base layer, so its
+history never contains the HUD. When the HUD is in history, motion
 estimation, generated frames, and the learned net's online training see the HUD
 box. The text changes at most once per second, so it reads as a static overlay,
 but a large or opaque HUD (for example CGA at 36% or a high
 `GAMESCOPE_FRAMEGEN_HUD_OPACITY`) covers more of the scene that the estimator
 sees. gamescope logs one info line ("framegen: HUD is in real-frame history
-...") the first time this happens, naming the reason. For quality measurements
+...") the first time this happens, naming the first reason that holds (or
+"the HUD-free split conditions were not met"). For quality measurements
 under bidir or the colour probe, keep the HUD off or small.
 
 Compact fields use cyan labels, colons and bright measured values. Spatial is
