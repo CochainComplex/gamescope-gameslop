@@ -204,7 +204,7 @@ GAMESCOPE_FRAMEGEN_HUD=2 gamescope \
 
 ### Step 3. Confirm it works
 
-The HUD defaults to a small, translucent status panel at the bottom right (`GAMESCOPE_FRAMEGEN_HUD_CORNER` moves it). `GAMESCOPE_FRAMEGEN_HUD=1` shows four concise lines for source/generated rates, mode/pipeline/multiplier, learning/profile status, and recovery/deadline/jitter; requested-but-inactive features add a fifth line. `GAMESCOPE_FRAMEGEN_HUD=2` shows full device, mode, rates, ladder, pacing and training diagnostics. The first tests use `2`. An optional [native Wayland settings menu](tools/vapor-menu/README.md) edits per-game presets for the next launch.
+The HUD defaults to a small, translucent status panel at the bottom right (`GAMESCOPE_FRAMEGEN_HUD_CORNER` moves it). `GAMESCOPE_FRAMEGEN_HUD=1` shows four concise lines for source/generated rates, mode/pipeline/multiplier, learning/profile status, and recovery/deadline/jitter; a fifth line shows the original deadline-hit and jitter history graphs; requested-but-inactive features add a sixth line. `GAMESCOPE_FRAMEGEN_HUD=2` shows full device, mode, rates, ladder, pacing and training diagnostics. The first tests use `2`. An optional [native Wayland settings menu](tools/vapor-menu/README.md) edits per-game presets for the next launch.
 
 | Look at this | Healthy | Not healthy: what to do |
 |---|---|---|
