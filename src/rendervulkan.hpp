@@ -514,10 +514,12 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t wi
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
 // bForceFramegenHud: draw the framegen HUD even though this is an override
-// composite. Only the swapchain generated-frame present passes true (see
-// vulkan_present_framegen_frame_to_window); every other caller keeps the
-// default and therefore the historical behaviour.
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, bool bForceFramegenHud = false );
+// composite. Only the generated-frame presents pass true: the swapchain one
+// (vulkan_present_framegen_frame_to_window) and the output-space overlay one
+// for frames predicted from HUD-free history; every other caller keeps the
+// default and therefore the historical behaviour. pHudFrameInfo, when set, is
+// the stack the HUD text is built from instead of frameInfo.
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, bool bForceFramegenHud = false, const struct FrameInfo_t *pHudFrameInfo = nullptr );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
