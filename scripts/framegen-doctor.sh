@@ -97,27 +97,28 @@ else
 fi
 
 if command -v pkg-config >/dev/null 2>&1; then
-	# Source: subprojects/wlroots/meson.build wayland_server and pixman dependencies.
-	pkg_check wayland-server wayland-server 1.23.1
-	pkg_check pixman-1 pixman-1 0.43.0
-	if ! pkg-config --atleast-version=1.23.1 wayland-server 2>/dev/null \
-		|| ! pkg-config --atleast-version=0.43.0 pixman-1 2>/dev/null; then
-		printf '      FIX: build Wayland and pixman into one PREFIX; pass '\''-Dpkg_config_path=PREFIX/lib/pkgconfig:PREFIX/share/pkgconfig'\''.\n'
+	# Source: subprojects/wlroots/meson.build (wayland_kwargs), protocol/meson.build and render/pixman/meson.build.
+	pkg_check wayland-server wayland-server 1.24.0
+	pkg_check wayland-protocols wayland-protocols 1.47
+	pkg_check pixman-1 pixman-1 0.46.0
+	if ! pkg-config --atleast-version=1.24.0 wayland-server 2>/dev/null \
+		|| ! pkg-config --atleast-version=1.47 wayland-protocols 2>/dev/null \
+		|| ! pkg-config --atleast-version=0.46.0 pixman-1 2>/dev/null; then
+		printf '      FIX: build Wayland, wayland-protocols and pixman into one PREFIX; pass '\''-Dpkg_config_path=PREFIX/lib/pkgconfig:PREFIX/share/pkgconfig'\''.\n'
 	fi
 
 	# Source: subprojects/wlroots/meson.build and backend/{drm,libinput,session}/meson.build.
-	pkg_check libdrm libdrm 2.4.122
-	pkg_check xkbcommon xkbcommon
+	pkg_check libdrm libdrm 2.4.129
+	pkg_check xkbcommon xkbcommon 1.8.0
 	pkg_check libinput libinput 1.19.0
 	pkg_check libseat libseat 0.2.0
-	if DISPLAYINFO_VERSION=$(pkg-config --modversion libdisplay-info 2>/dev/null); then
-		if pkg-config --atleast-version=0.4.0 libdisplay-info; then
-			build_fail "libdisplay-info $DISPLAYINFO_VERSION (need < 0.4.0)" "use libdisplay-info < 0.4.0"
-		else
-			pass "libdisplay-info $DISPLAYINFO_VERSION (< 0.4.0)"
-		fi
+	# Source: subprojects/wlroots/backend/drm/meson.build (>= 0.2.0) and src/meson.build (< 0.5.0). Both fall back to
+	# the bundled subprojects/libdisplay-info submodule (checked above), so the system version only decides which one.
+	if DISPLAYINFO_VERSION=$(pkg-config --modversion libdisplay-info 2>/dev/null) \
+		&& pkg-config --atleast-version=0.2.0 libdisplay-info && ! pkg-config --atleast-version=0.5.0 libdisplay-info; then
+		pass "libdisplay-info $DISPLAYINFO_VERSION (system, >= 0.2.0, < 0.5.0)"
 	else
-		build_fail "libdisplay-info: pkg-config module missing" "install libdisplay-info development files"
+		pass "libdisplay-info ${DISPLAYINFO_VERSION:-not installed} (build uses the bundled submodule)"
 	fi
 	pkg_check hwdata hwdata
 
@@ -125,10 +126,15 @@ if command -v pkg-config >/dev/null 2>&1; then
 	pkg_check sdl2 sdl2
 	if VK_VERSION=$(pkg-config --modversion vulkan 2>/dev/null); then
 		VK_INCLUDEDIR=$(pkg-config --variable=includedir vulkan 2>/dev/null)
-		if [[ -r "${VK_INCLUDEDIR:-/usr/include}/vulkan/vulkan.h" ]]; then
-			pass "Vulkan headers present (vulkan.pc $VK_VERSION)"
-		else
+		VK_CORE="${VK_INCLUDEDIR:-/usr/include}/vulkan/vulkan_core.h"
+		# Source: layer/meson.build (VK_EXT_present_timing revision 3, Vulkan-Headers 1.4.335).
+		VK_HEADER=$(awk '/^#define VK_HEADER_VERSION / { print $3 }' "$VK_CORE" 2>/dev/null)
+		if [[ ! -r "${VK_INCLUDEDIR:-/usr/include}/vulkan/vulkan.h" ]]; then
 			build_fail "Vulkan loader found, but vulkan/vulkan.h missing" "install Vulkan headers"
+		elif ! grep -q 'VK_API_VERSION_1_4' "$VK_CORE" 2>/dev/null || [[ "${VK_HEADER:-0}" -lt 335 ]]; then
+			build_fail "Vulkan headers 1.x.${VK_HEADER:-?} (need 1.4.335 or newer)" "install Vulkan-Headers >= 1.4.335 into PREFIX and point vulkan.pc there"
+		else
+			pass "Vulkan headers 1.4.$VK_HEADER (vulkan.pc $VK_VERSION)"
 		fi
 	else
 		build_fail "Vulkan headers/loader pkg-config module missing" "install Vulkan headers and loader development files"

@@ -55,7 +55,7 @@ How the scheduler, the bidirectional delay controller, and the optional in-game 
 ## Requirements
 
 - Test tools: `vkcube` and `vulkaninfo` (package `vulkan-tools` on most distributions). `vkmark` is optional.
-- The doctor requires `wayland-server` >= 1.23.1 and `pixman-1` >= 0.43.0. These are known-good versions; the Meson files accept older ones (see [Install](#install)).
+- Upstream's wlroots 0.20 needs `wayland-server` >= 1.24.0, `wayland-protocols` >= 1.47, `pixman-1` >= 0.46.0, `libdrm` >= 2.4.129 and `xkbcommon` >= 1.8.0. The WSI layer needs Vulkan-Headers >= 1.4.335. Many current distributions ship older versions (see [Install](#install)).
 - Two Vulkan GPUs visible to the compositor are recommended; one GPU also works (see the single-GPU command in [Quick start](#quick-start)). Any pair that can share GPU buffers should work. Validated: NVIDIA (proprietary) render to AMD (RADV) present. Intel, and NVIDIA as the present GPU, are untested.
 - The display must be connected to the present GPU. That GPU runs gamescope, frame generation, composition, and scanout.
 - Native operation requires Linux DRM/KMS. A nested window (gamescope opening a window inside your existing X11 or Wayland desktop) is enough for first tests.
@@ -90,7 +90,10 @@ Build fails? Run the preflight, which checks the build tools and libraries and p
 ./scripts/framegen-doctor.sh
 ```
 
-- It checks `wayland-server` 1.23.1 or newer and `pixman-1` 0.43.0 or newer. If your distribution's versions are older, build them into one prefix and add `-Dpkg_config_path=PREFIX/lib/pkgconfig:PREFIX/share/pkgconfig` to `meson setup`.
+- It checks the minimums from [Requirements](#requirements). If your distribution's versions are older, build them into one prefix and add `-Dpkg_config_path=PREFIX/lib/pkgconfig:PREFIX/share/pkgconfig` to `meson setup`.
+  - Install only the core `libdrm` library into that prefix. Mesa keeps the system's `libdrm_amdgpu` and the others.
+  - For Vulkan, the headers are enough, together with a `vulkan.pc` that points at them and links the system loader.
+  - Run with `GAMESCOPE_LOCAL_PREFIX=PREFIX` (see [Choose how to run it](#2-choose-how-to-run-it)), so the newer libraries are found at run time.
 - `catch2-with-main` is optional. Without it, keep `-Denable_tests=false` as above.
 
 ### 2. Choose how to run it
