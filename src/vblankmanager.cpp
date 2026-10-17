@@ -222,7 +222,8 @@ namespace gamescope
 			.ulOffset = ulOffset,
 			.ulNow = get_time_in_nanos(),
 			.bVRR = bVRR,
-			.bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0,
+			.bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0
+				&& !NestedRefreshFollowsHost( nNestedRefresh, g_nOutputRefresh ),
 		}, m_LastVBlankSchedule );
 	}
 
@@ -412,7 +413,8 @@ namespace gamescope
 				{
 					.ulInterval = mHzToRefreshCycle( nNestedRefresh ? nNestedRefresh : g_nOutputRefresh ),
 					.bVRR = bVRR,
-					.bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0,
+					.bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0
+						&& !NestedRefreshFollowsHost( nNestedRefresh, g_nOutputRefresh ),
 				} );
 				// A feedback rearm can start FrameSync before the previous nudge is read.
 				if ( time.schedule.ulTargetVBlank > ulTargetFloor )

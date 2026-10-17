@@ -59,4 +59,12 @@ namespace gamescope
         // Same thing.
         return RefreshCycleTomHz( nmHz );
     }
+
+    // A nested -r at the host's own rate (same whole Hz, e.g. -r 120 on a 119.88 Hz host) stays phase-locked to
+    // host presentation feedback, so commits land just before host scanout and framegen plans against it.
+    // Only a different rate needs its own cadence (upstream 81146cab).
+    constexpr bool NestedRefreshFollowsHost( int32_t nNestedmHz, int32_t nHostmHz )
+    {
+        return nNestedmHz > 0 && nHostmHz > 0 && ConvertmHzToHz( nNestedmHz ) == ConvertmHzToHz( nHostmHz );
+    }
 }
