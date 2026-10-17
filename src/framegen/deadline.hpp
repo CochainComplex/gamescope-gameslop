@@ -143,6 +143,29 @@ struct DisplayGrid_t
 	}
 };
 
+// How far the compositor's wake precedes the vblank it composites for: the
+// vblank timer's draw-time estimate plus its redzone.
+[[nodiscard]] constexpr uint64_t compositor_wake_lead_ns(
+	uint64_t targetVBlankNs, uint64_t wakeNs )
+{
+	return targetVBlankNs > wakeNs ? targetVBlankNs - wakeNs : 0u;
+}
+
+// Capacity reference of a normally planned causal slot, used only to classify
+// a budget shortfall (deadline_shortfall_is_phase_only); admission always uses
+// the decision's remaining time. Native: the KMS commit slot budget. Nested
+// backends have no commit reservation: a generated slot is composited at the
+// compositor's own wake, so the slot right after its real frame offers at most
+// one refresh interval less the wake lead of the raw grid.
+[[nodiscard]] constexpr uint64_t causal_shortfall_slot_budget_ns(
+	bool nativeKmsTiming, uint64_t nativeSlotBudgetNs,
+	const DisplayGrid_t &rawGrid )
+{
+	return nativeKmsTiming ? nativeSlotBudgetNs
+		: fixed_refresh_slot_budget_ns( rawGrid.T,
+			compositor_wake_lead_ns( rawGrid.D0, rawGrid.W0 ), 0u );
+}
+
 [[nodiscard]] constexpr DisplayGrid_t apply_present_bias(
 	const DisplayGrid_t &grid, int64_t biasNs )
 {
