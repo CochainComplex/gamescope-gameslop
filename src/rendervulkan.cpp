@@ -184,6 +184,27 @@ static uint32_t framegen_hud_level()
 	return s_uLevel;
 }
 
+static bool framegen_hud_cga()
+{
+	static const bool enabled = []()
+	{
+		const char *style = getenv( "GAMESCOPE_FRAMEGEN_HUD_STYLE" );
+		return style != nullptr && strcmp( style, "cga" ) == 0;
+	}();
+	return enabled;
+}
+
+static uint32_t framegen_hud_opacity()
+{
+	static const uint32_t value = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD_OPACITY", 101u,
+		[]( const char *text ) -> std::optional<uint32_t>
+		{
+			const auto parsed = gamescope::framegen::parse_uint32_setting( text, true );
+			return parsed && *parsed <= 100u ? parsed : std::nullopt;
+		}, "automatic (14% quiet / 36% CGA)" );
+	return value;
+}
+
 enum class FramegenHudCorner : uint32_t
 {
 	TopLeft,
@@ -11379,10 +11400,11 @@ static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
 			auto &slot = g_framegenHud.uploadSlots[nUploadSlot];
 			const gamescope::framegen::FramegenHudUniform_t uniform =
 				gamescope::framegen::make_framegen_hud_uniform(
-					g_framegenHud.text, g_framegenHud.hdr );
+					g_framegenHud.text, g_framegenHud.hdr, framegen_hud_cga(), framegen_hud_opacity() );
 			memcpy( slot.pMapped, &uniform, sizeof( uniform ) );
 			slot.logicalWidthPixels = uniform.widthChars * 8u + 8u;
-			slot.logicalHeightPixels = uniform.lineCount * 8u + 8u;
+			slot.logicalHeightPixels = gamescope::framegen::framegen_hud_height(
+				uniform.lineCount, ( uniform.style & 1u ) != 0u );
 			g_framegenHud.activeUploadSlot = nUploadSlot;
 			g_framegenHud.dirty = false;
 		}

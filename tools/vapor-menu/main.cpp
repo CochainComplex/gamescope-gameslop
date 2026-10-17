@@ -74,20 +74,31 @@ struct Artwork {
     }
 };
 
-static constexpr std::array<const char *, 14> labels = {
+static constexpr std::array<const char *, 17> labels = {
     "RESUME GAME", "PRESET", "PIPELINE", "MULTIPLIER", "MOTION MODE",
     "FRAME GENERATION", "ONLINE TRAINING", "BIDIRECTIONAL", "LEARNED PROFILE",
-    "HUD", "HUD POSITION", "SAVE PRESET", "SAVE AS NEW PRESET", "TAKE SCREENSHOT"
+    "HUD", "HUD POSITION", "SAVE PRESET", "SAVE AS NEW PRESET", "TAKE SCREENSHOT", "MENU STYLE", "HUD BG OPACITY", "HUD TEXT SIZE"
 };
+static constexpr std::array<const char *,9> settingKeys{
+    "pipeline","multiplier","mode","framegen","online","bidir","net_profile","hud","corner"};
+static std::string disabledReason(int row, const vapor::Store *store) {
+    return store && row>=2 && row<=10
+        ? store->draft.disabledReason(settingKeys[row-2],store->context) : "";
+}
 static std::string rowValue(int row, const vapor::Store *store) {
     if (!store) {
-        static const std::array<const char *,14> preview{"", "default", "learned", "x2", "motion", "on", "on", "off", "learned.bin", "compact", "br", "", "", ""};
+        static const std::array<const char *,17> preview{"", "default", "learned", "x2", "motion", "on", "on", "off", "learned.bin", "compact", "br", "", "", "", "quiet", "auto", "auto"};
         return preview[row];
     }
+    if (row==15 || row==16) {
+        const auto &value=store->draft.values.at(row==15 ? "hud_opacity" : "hud_scale");
+        return value=="auto" ? value : value+(row==15 ? "%" : "x");
+    }
+    if (row==14) return store->draft.values.at("style");
     if (row==1) return store->name+(store->dirty ? " *" : "");
-    static const std::array<const char *,9> keys{"pipeline","multiplier","mode","framegen","online","bidir","net_profile","hud","corner"};
     if (row>=2 && row<=10) {
-        auto value=store->draft.values.at(keys[row-2]);
+        if (!disabledReason(row,store).empty()) return "inactive";
+        auto value=store->draft.values.at(settingKeys[row-2]);
         if (row==3) return "x"+value;
         if (row==8) return std::filesystem::path(value).filename().string();
         if (row==9) return value=="0" ? "off" : value=="1" ? "compact" : "details";
@@ -95,49 +106,84 @@ static std::string rowValue(int row, const vapor::Store *store) {
     }
     return "";
 }
-static Artwork paint(int width, int height, int selected, bool alternate, int opacity, const vapor::Store *store=nullptr) {
+static Artwork paint(int width, int height, int selected, bool mallsoft, int opacity, const vapor::Store *store=nullptr, bool cga=false) {
     Artwork a(width, height);
-    const unsigned pink = alternate ? 0xffad68 : 0xff65cc;
-    const unsigned cyan = alternate ? 0xb5fc8d : 0x7ef9ff;
-    const int scale = std::clamp(std::min(width/720, height/480), 1, 3);
-    const int w = std::min(width, 448*scale), h = std::min(height, 360*scale);
-    const int x = (width-w)/2, y = (height-h)/2;
-    a.rect(x+5, y+5, w, h, 0x410b58, 120);
-    a.rect(x, y, w, h, 0x151127, opacity);
-    a.rect(x, y, w, 2, pink); a.rect(x, y+h-2, w, 2, cyan);
-    a.rect(x, y, 2, h, pink); a.rect(x+w-2, y, 2, h, cyan);
-    auto text = [&](int px, int py, const std::string &s, unsigned c, int z=1) {
-        a.text(x+px*scale, y+py*scale, s, c, scale*z);
-    };
-    // Striped sunset and a perspective grid, kept away from the menu text.
-    for (int row = -22*scale; row <= 22*scale; ++row) {
-        int half = int(std::sqrt(double(22*scale*22*scale-row*row)));
-        if (row < 0 || (row/scale)%5 < 3)
-            a.rect(x+w-52*scale-half, y+49*scale+row, half*2, 1, pink, 210);
+    if (store) {
+        mallsoft=store->draft.values.at("style")=="mallsoft";
+        cga=store->draft.values.at("style")=="cga";
     }
-    for (int i=0; i<4; ++i)
-        a.rect(x+18*scale, y+(286+i*i)*scale, w-36*scale, 1, 0x56366e, 100);
-    text(18, 15, "G A M E S C O P E", cyan);
-    text(18, 35, "AFTER HOURS", pink, 2);
-    text(18, 64, "PROFILE SETTINGS / NEXT LAUNCH", 0xb3a6d1);
-    constexpr int page=8;
-    const int first=std::clamp(selected-page+1,0,int(labels.size())-page);
-    for (int i=first; i<std::min(first+page,int(labels.size())); ++i) {
-        const int yy = 91+(i-first)*25;
-        if (selected == i) {
-            a.rect(x+14*scale, y+(yy-5)*scale, w-28*scale, 21*scale, 0x352044, 210);
-            a.rect(x+14*scale, y+(yy-5)*scale, 2*scale, 21*scale, cyan);
-        }
-        text(24, yy, (selected == i ? "> " : "  ") + std::string(labels[i]), selected == i ? cyan : 0xd6cce9);
-        auto value=rowValue(i,store);
-        if (value.size()>20) value=value.substr(0,17)+"...";
-        text(264, yy, value, pink);
+    // Fit a complete dashboard, keeping integer pixel-font scaling.
+    const int scale=std::clamp(std::min(width/608,height/340),1,4);
+    const int w=608*scale, h=340*scale, x=(width-w)/2, y=(height-h)/2;
+    const unsigned ink=cga ? 0xffffff : mallsoft ? 0x303c40 : 0xf0eaf5;
+    const unsigned secondary=cga ? 0xe0e9ed : mallsoft ? 0x45585b : 0xc1bdce;
+    const unsigned accent=cga ? 0x55ffff : mallsoft ? 0x316569 : 0xb3d9da;
+    const unsigned rose=cga ? 0xffaaff : mallsoft ? 0x80465f : 0xe3b5ce;
+    const unsigned field=cga ? 0x11121c : mallsoft ? 0xdeddd5 : 0x201d2d;
+    const unsigned focus=cga ? 0x242538 : mallsoft ? 0xc1cfca : 0x373346;
+    auto rect=[&](int px,int py,int ww,int hh,unsigned color,unsigned alpha=255) {
+        a.rect(x+px*scale,y+py*scale,ww*scale,hh*scale,color,alpha);
+    };
+    auto text=[&](int px,int py,const std::string &s,unsigned color) {
+        a.text(x+px*scale,y+py*scale,s,color,scale);
+    };
+    auto shortened=[](std::string value,size_t limit) {
+        return value.size()>limit ? value.substr(0,limit-3)+"..." : value;
+    };
+    rect(0,0,608,340,mallsoft ? 0xd3cfc5 : 0x151127,opacity);
+    if (cga) {
+        for (int yy=0;yy<340;yy+=2) for (int xx=0;xx<608;xx+=2)
+            rect(xx,yy,2,2,gamescope::framegen::framegen_hud_cga_color(xx/2,yy/2,170),opacity);
+        // Dither remains in the margins; quiet solid fields support readable text.
+        rect(10,8,588,52,field,248);
+        rect(10,66,288,184,field,248);
+        rect(310,66,288,184,field,248);
+        rect(10,256,588,76,field,248);
+    }
+    rect(0,0,608,1,rose); rect(0,339,608,1,accent);
+    if (mallsoft) {
+        // Washed glass divisions, without decoration behind the controls.
+        for (int i=0;i<4;++i) rect(480+i*30,8,1,16,0x99aaa5,150);
+    }
+    text(18,14,"gamescope-gameslop",accent);
+    text(314,14,"SETTINGS / NEXT LAUNCH",secondary);
+    rect(14,32,580,23,selected==1 ? focus : field);
+    if (selected==1) rect(14,32,2,23,accent);
+    text(22,40,"PRESET",selected==1 ? accent : secondary);
+    text(118,40,shortened(rowValue(1,store),58),ink);
+    text(22,70,"FRAME GENERATION",rose);
+    text(322,70,"HUD / APPEARANCE",rose);
+    constexpr std::array<int,7> generation{5,4,2,3,6,7,8};
+    constexpr std::array<int,5> appearance{9,10,14,15,16};
+    auto control=[&](int row,int column,int slot) {
+        const int px=column ? 314 : 14, py=86+slot*23;
+        const bool active=selected==row;
+        bool disabled=false;
+        disabled=!disabledReason(row,store).empty();
+        rect(px,py,280,21,active ? focus : field,cga ? 255 : 245);
+        if (active) rect(px,py,2,21,accent);
+        text(px+8,py+2,labels[row],disabled ? secondary : active ? accent : secondary);
+        auto value=rowValue(row,store);
+        if (!store && row==14) value=cga ? "cga" : mallsoft ? "mallsoft" : "quiet";
+        text(px+8,py+12,shortened(value,33),disabled ? secondary : ink);
+    };
+    for (size_t i=0;i<generation.size();++i) control(generation[i],0,int(i));
+    for (size_t i=0;i<appearance.size();++i) control(appearance[i],1,int(i));
+    text(322,211,"TAB SWITCHES GROUP",secondary);
+    text(322,226,"SAVE TO APPLY NEXT LAUNCH",secondary);
+    constexpr std::array<int,4> actions{0,11,12,13};
+    constexpr std::array<const char *,4> captions{"RESUME","SAVE PRESET","SAVE AS NEW","SCREENSHOT"};
+    for (int i=0;i<4;++i) {
+        const int px=14+i*146;
+        rect(px,258,142,23,selected==actions[i] ? focus : field);
+        if (selected==actions[i]) rect(px,258,2,23,accent);
+        text(px+8,266,captions[i],selected==actions[i] ? accent : ink);
     }
     auto status=store ? store->status : "Saved settings apply next launch";
-    if (status.size()>50) status=status.substr(0,47)+"...";
-    text(18, 299, status, 0xb3a6d1);
-    text(18, 320, "ARROWS EDIT   ENTER SELECT   ESC CLOSE", cyan);
-    text(18, 341, "CTRL+SHIFT+F12   "+std::to_string(selected+1)+"/"+std::to_string(labels.size()), 0xa695c2);
+    if (auto reason=disabledReason(selected,store); !reason.empty()) status=reason;
+    text(18,291,shortened(status,71),rose);
+    text(18,310,"UP/DOWN FOCUS  LEFT/RIGHT EDIT  ENTER ACT  TAB GROUP  ESC CLOSE",secondary);
+    text(18,325,"CTRL+SHIFT+F12",secondary);
     return a;
 }
 
@@ -164,8 +210,8 @@ struct App {
     EGLSurface target = EGL_NO_SURFACE;
     EGLConfig config{};
     GLuint program = 0, texture = 0;
-    std::array<Action, 7> actions{};
-    bool visible = false, configured = false, dirty = false, alternate = false;
+    std::array<Action, 8> actions{};
+    bool visible = false, configured = false, dirty = false;
     int width = 1280, height = 720, selected = 0, opacity = 235;
     vapor::Store profiles;
 
@@ -226,17 +272,29 @@ struct App {
         if (index == 0) { toggle(); return; }
         if (!visible) return;
         if (index == 1) { toggle(); return; }
-        if (index == 2) selected = (selected+int(labels.size())-1)%int(labels.size());
-        if (index == 3) selected = (selected+1)%int(labels.size());
+        // Visual order: preset, generation column, appearance column, actions.
+        static constexpr std::array<int,17> order{1,5,4,2,3,6,7,8,9,10,14,15,16,0,11,12,13};
+        if (index==2 || index==3) {
+            auto position=std::find(order.begin(),order.end(),selected)-order.begin();
+            selected=order[(position+(index==2 ? 16 : 1))%order.size()];
+        }
+        if (index==7) {
+            if (selected==1) selected=5;
+            else if (selected>=2 && selected<=8) selected=9;
+            else if (selected==9 || selected==10 || selected>=14) selected=0;
+            else selected=1;
+        }
         if (index == 4 || index == 5 || index == 6) {
             int delta = index == 4 ? -1 : 1;
             if (selected == 1) profiles.select(delta);
             if (selected>=2 && selected<=10 && selected!=8) {
-                static const std::array<const char *,9> keys{"pipeline","multiplier","mode","framegen","online","bidir","net_profile","hud","corner"};
-                profiles.draft.cycle(keys[selected-2],delta); profiles.dirty=true;
-                profiles.status="Unsaved / changes apply next launch";
+                profiles.edit(settingKeys[selected-2],delta);
             }
-            if (selected==8) { profiles.cycleLearned(delta); profiles.status="Unsaved / learned file unchanged"; }
+            if (selected==14) {
+                profiles.draft.cycle("style",delta); profiles.dirty=true;
+                profiles.status="Menu preview / save; HUD on next launch";
+            }
+            if (selected==8) profiles.cycleLearned(delta);
             if (index==6 && selected==11) profiles.persist();
             if (index==6 && selected==12) profiles.clone();
             if (index == 6 && selected == 0) toggle();
@@ -261,8 +319,8 @@ struct App {
     }
     void bindings() {
         static const gamescope_action_binding_listener listener{triggered};
-        const std::array<uint32_t, 6> keys{XKB_KEY_Escape, XKB_KEY_Up, XKB_KEY_Down,
-            XKB_KEY_Left, XKB_KEY_Right, XKB_KEY_Return};
+        const std::array<uint32_t, 7> keys{XKB_KEY_Escape, XKB_KEY_Up, XKB_KEY_Down,
+            XKB_KEY_Left, XKB_KEY_Right, XKB_KEY_Return, XKB_KEY_Tab};
         for (size_t i=0; i<actions.size(); ++i) {
             auto &a = actions[i]; a.app=this; a.index=int(i);
             a.binding = gamescope_action_binding_manager_create_action_binding(manager);
@@ -317,7 +375,7 @@ struct App {
         if (!window) initEgl();
         wl_egl_window_resize(window,width,height,0,0);
         glViewport(0,0,width,height);
-        Artwork image = visible ? paint(width,height,selected,alternate,opacity,&profiles) : Artwork(width,height);
+        Artwork image = visible ? paint(width,height,selected,false,opacity,&profiles) : Artwork(width,height);
         glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,image.pixels.data());
         const GLfloat vertices[]{-1,-1, 1,-1, -1,1, 1,1};
         glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,0,vertices); glEnableVertexAttribArray(0);
@@ -354,9 +412,9 @@ static void closed(void *, zwlr_layer_surface_v1 *) { running=0; }
 
 int main(int argc, char **argv) {
     try {
-        if (argc==3 && (!std::strcmp(argv[1],"--preview-ppm") || !std::strcmp(argv[1],"--preview-hud-ppm"))) {
-            auto image=paint(1280,720,2,false,235);
-            if (!std::strcmp(argv[1],"--preview-hud-ppm")) {
+        if (argc==3 && (!std::strcmp(argv[1],"--preview-ppm") || !std::strcmp(argv[1],"--preview-hud-ppm") || !std::strcmp(argv[1],"--preview-mallsoft-ppm") || !std::strcmp(argv[1],"--preview-hud-details-ppm") || !std::strcmp(argv[1],"--preview-hud-off-ppm") || !std::strcmp(argv[1],"--preview-cga-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-details-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-clear-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-opaque-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-large-ppm"))) {
+            auto image=paint(1280,720,2,!std::strcmp(argv[1],"--preview-mallsoft-ppm"),235,nullptr,!std::strcmp(argv[1],"--preview-cga-ppm"));
+            if (!std::strcmp(argv[1],"--preview-hud-ppm") || !std::strcmp(argv[1],"--preview-hud-details-ppm") || !std::strcmp(argv[1],"--preview-hud-off-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-details-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-clear-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-opaque-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-large-ppm")) {
                 // Layout preview uses the runtime formatter/font. GPU color
                 // management is verified separately; this is not a game capture.
                 image=Artwork(1280,720);
@@ -366,29 +424,59 @@ int main(int argc, char **argv) {
                     image.rect(0,row,1280,1,((28+row/30)<<16)|((36+row/24)<<8)|(49+row/18));
                 for (int i=0;i<8;++i) image.rect(i*180,610,90,110,0x374054);
                 const gamescope::framegen::FramegenHudSnapshot_t snapshot{
+                    .version="preview+96ad25e89", .deviceName="AMD Radeon Graphics",
                     .mode=GamescopeFramegenMode::Motion,
                     .pipeline=GamescopeFramegenPipeline::Learned,
                     .multiplier=2u, .refreshMilliHz=120000u,
                     .netActive=true, .netOnline=true,
                     .real=200u, .generated=390u, .repeats=10u,
                     .deadlineHitPercent=99u, .pacingSdTenthsMs=7u,
+                    .deadlineHitHistory={95,97,99,100,99,98,99,100,100,99,99,100},
+                    .pacingSdMsHistory={0.4,0.7,1.1,0.9,0.5,0.6,0.7,0.5,0.8,0.7,0.6,0.7},
                     .netTrainedSteps=1200u, .netProfileLoaded=true,
                 };
-                auto text=gamescope::framegen::format_framegen_hud(1u,snapshot);
-                auto uniform=gamescope::framegen::make_framegen_hud_uniform(text,false);
-                const int w=int(uniform.widthChars)*16+16, h=int(text.lineCount)*16+16;
+                auto text=gamescope::framegen::format_framegen_hud(
+                    !std::strcmp(argv[1],"--preview-hud-off-ppm") ? 0u :
+                    (!std::strcmp(argv[1],"--preview-hud-details-ppm") || !std::strcmp(argv[1],"--preview-hud-cga-details-ppm")) ? 2u : 1u,snapshot);
+                if (text.lineCount>0) {
+                const bool cgaHud=std::strstr(argv[1],"--preview-hud-cga")!=nullptr;
+                const int fontScale=!std::strcmp(argv[1],"--preview-hud-cga-large-ppm") ? 3 : 2;
+                const uint32_t opacity=!std::strcmp(argv[1],"--preview-hud-cga-clear-ppm") ? 0u :
+                    !std::strcmp(argv[1],"--preview-hud-cga-opaque-ppm") ? 100u : 101u;
+                auto uniform=gamescope::framegen::make_framegen_hud_uniform(text,false,cgaHud,opacity);
+                const int pitch=int(gamescope::framegen::framegen_hud_line_pitch(cgaHud));
+                const int w=(int(uniform.widthChars)*8+8)*fontScale;
+                const int h=int(gamescope::framegen::framegen_hud_height(text.lineCount,cgaHud))*fontScale;
                 const int x=image.width-w-8, y=image.height-h-8;
-                image.blendRect(x,y,w,h,0x110d1b,36);
-                image.blendRect(x,y,w,2,0x80e0e6,122); image.blendRect(x,y+2,2,h-2,0xe066b8,97);
-                for (uint32_t i=0;i<text.lineCount;++i)
-                    image.text(x+8,y+8+int(i)*16,text.lines[i].data(),i==0 ? 0xa1dbe0 : 0xbfb5cf,2,219);
+                const unsigned alpha=opacity<=100u ? (opacity*255u+50u)/100u : cgaHud ? 92u : 36u;
+                if (cgaHud) {
+                    for (int yy=0;yy<h;yy+=fontScale) for (int xx=0;xx<w;xx+=fontScale)
+                        image.blendRect(x+xx,y+yy,fontScale,fontScale,
+                            gamescope::framegen::framegen_hud_cga_color(xx/fontScale,yy/fontScale,h/fontScale),alpha);
+                    for (uint32_t i=0;i<text.lineCount;++i)
+                        image.blendRect(x+3*fontScale,y+(3+int(i)*pitch)*fontScale,
+                            (int(uniform.lineLengths[i])*8+2)*fontScale,10*fontScale,0x000000,alpha*65u/100u);
+                } else image.blendRect(x,y,w,h,0x110d1b,alpha);
+                image.blendRect(x,y,w,fontScale,cgaHud ? 0xffffff : 0x80e0e6,122);
+                image.blendRect(x,y+fontScale,fontScale,h-fontScale,cgaHud ? 0xffffff : 0xe066b8,97);
+                for (uint32_t i=0;i<text.lineCount;++i) {
+                    const int tx=x+4*fontScale, ty=y+(4+int(i)*pitch)*fontScale;
+                    if (cgaHud) {
+                        image.text(tx-fontScale,ty,text.lines[i].data(),0x000000,fontScale,250);
+                        image.text(tx+fontScale,ty,text.lines[i].data(),0x000000,fontScale,250);
+                        image.text(tx,ty-fontScale,text.lines[i].data(),0x000000,fontScale,250);
+                        image.text(tx,ty+fontScale,text.lines[i].data(),0x000000,fontScale,250);
+                    }
+                    image.text(tx,ty,text.lines[i].data(),cgaHud ? 0xffffff : i==0 ? 0xa1dbe0 : 0xbfb5cf,fontScale,cgaHud ? 250 : 219);
+                }
+                }
             }
             std::ofstream out(argv[2],std::ios::binary); out << "P6\n1280 720\n255\n";
             for (size_t i=0;i<image.pixels.size();i+=4) out.write(reinterpret_cast<const char *>(&image.pixels[i]),3);
             require(bool(out),"Cannot write preview"); return 0;
         }
         bool smoke=argc==2 && !std::strcmp(argv[1],"--smoke");
-        if (argc!=1 && !smoke) { std::puts("Usage: vapor-menu [--preview-ppm PATH | --smoke]\nCtrl+Shift+F12 toggle; arrows navigate; Enter apply; Escape resume."); return argc==2 && !std::strcmp(argv[1],"--help") ? 0 : 1; }
+        if (argc!=1 && !smoke) { std::puts("Usage: vapor-menu [--preview-ppm PATH | --preview-mallsoft-ppm PATH | --preview-hud-ppm PATH | --preview-hud-details-ppm PATH | --preview-hud-off-ppm PATH | --smoke]\nCtrl+Shift+F12 toggle; arrows navigate; Enter apply; Escape resume."); return argc==2 && !std::strcmp(argv[1],"--help") ? 0 : 1; }
         App a;
         a.display=wl_display_connect(nullptr); require(a.display,"Cannot connect to Wayland; launch INSIDE gamescope");
         wl_registry *registry=wl_display_get_registry(a.display);
@@ -403,7 +491,7 @@ int main(int argc, char **argv) {
         int smokeStep=0;
         if (smoke) a.toggle();
         std::signal(SIGINT,stop); std::signal(SIGTERM,stop);
-        std::puts("Vapor menu ready: Ctrl+Shift+F12 (inside gamescope)");
+        std::puts("gamescope-gameslop menu ready: Ctrl+Shift+F12 (inside gamescope)");
         while (running) {
             require(wl_display_dispatch_pending(a.display)>=0,"Wayland disconnected");
             int timeout=-1;
@@ -413,7 +501,14 @@ int main(int argc, char **argv) {
                 const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(now-smokeStart).count();
                 if (ms>4000) { require(smokeStep==4,"Smoke did not finish rendering"); break; }
                 if (ms>500 && smokeStep==0 && a.configured && !a.dirty) {
-                    a.action(3); a.action(3); a.action(5); a.action(3); a.action(5);
+                    // Follow visual order and exercise fast group navigation.
+                    a.selected=1; a.action(7); require(a.selected==5,"Generation group navigation failed");
+                    a.action(7); require(a.selected==9,"HUD group navigation failed");
+                    a.action(7); require(a.selected==0,"Action group navigation failed");
+                    a.action(7); require(a.selected==1,"Preset group navigation failed");
+                    a.action(3); a.action(3); a.action(3); // Pipeline, after enable/mode.
+                    require(a.selected==2,"Visual focus order failed");
+                    a.action(5); a.action(3); a.action(5);
                     // Exercise the integrated mode through the same menu actions.
                     a.selected=2;
                     for (size_t i=0; i<vapor::choices.at("pipeline").size() &&
@@ -421,6 +516,17 @@ int main(int argc, char **argv) {
                     require(a.profiles.draft.values.at("pipeline")=="spatial" &&
                         a.profiles.draft.values.at("multiplier")=="3" && a.profiles.dirty,
                         "Menu profile edit failed");
+                    a.selected=7; a.action(5);
+                    require(a.profiles.draft.values.at("bidir")=="off","Spatial allowed bidir");
+                    a.selected=4; a.action(5); // Motion -> extrapolate.
+                    a.selected=2; a.action(5); // Inactive pipeline must not change.
+                    require(a.profiles.draft.values.at("pipeline")=="spatial" &&
+                        !disabledReason(2,&a.profiles).empty(),"Inactive pipeline was editable");
+                    const auto online=a.profiles.draft.values.at("online");
+                    a.selected=6; a.action(5);
+                    require(a.profiles.draft.values.at("online")==online,"Inactive training was editable");
+                    a.selected=4; a.action(4); // Restore motion.
+                    std::puts("Smoke: configuration dependencies PASS");
                     smokeStep=1;
                 }
                 if (ms>1000 && smokeStep==1) { a.toggle(); smokeStep=2; }
@@ -448,6 +554,6 @@ int main(int argc, char **argv) {
             if (result>0 && (fd.revents&POLLIN)) require(wl_display_read_events(a.display)>=0,"Wayland read failed");
             else { wl_display_cancel_read(a.display); require(result<=0 || !(fd.revents&(POLLERR|POLLHUP|POLLNVAL)),"Wayland connection closed"); }
         }
-    } catch (const std::exception &e) { std::fprintf(stderr,"vapor-menu: %s\n",e.what()); return 1; }
+    } catch (const std::exception &e) { std::fprintf(stderr,"gamescope-gameslop menu: %s\n",e.what()); return 1; }
     return 0;
 }
