@@ -183,19 +183,28 @@ held-out evaluation, CPU training and candidate evaluation, preparation bundles,
 then sequential selected NPU runs. See the [spec and command](../tools/framegen-npu/README.md#campaign).
 Captures come from `GAMESCOPE_FRAMEGEN_RECORD`, using the fg-matrix harness
 `run.py record` phase or any motion-mode run; use frozen, separate train and
-held-out directories. Evaluation/preparation stay in the gamescope Python
+held-out directories. The recorder samples on every new motion preparation,
+including cheaper motion rungs, with extrapolation excluded; it is not rung-0-only.
+Evaluation/preparation stay in the gamescope Python
 (NumPy plus ONNX for export); NPU execution stays in the configured SDK Python.
 
 Hash receipts permit complete, consistent steps to resume. Stale or incomplete
 directories stop without deletion. Per-step artifacts and `campaign.json` /
 `campaign.md` preserve metrics, source-minus-neutral deltas, CPU training time,
-NPU status/load/p50/p99 and raw-head parity. The single verified VAIML BF16
+NPU status/load/p50/p99 and raw-head parity. See the README for
+[cache states and subprocess lifecycle](../tools/framegen-npu/README.md#explicit-npu-execution)
+and [campaign timeout budgets](../tools/framegen-npu/README.md#campaign).
+
+The single verified VAIML BF16
 configuration is `tools/framegen-npu/amd-bf16.example.json`; reference its absolute
 path (or a private copy) in both `config_file` and `config_files`.
 These remain field-resolution offline metrics, not served RGB; temporal sigma
 is residual variation, and NPU timing is the host call including copies.
 `quality_validated` remains false. The orchestration has CPU-only contract
 tests; adding it does not constitute a new hardware or quality result.
+
+For the Xonotic latency baseline and its measurement limits, see the
+[findings](framegen-npu-findings.md#5-where-the-igpu-time-goes-and-what-can-move).
 
 ## Primary runtime references
 

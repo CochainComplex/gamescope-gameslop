@@ -20,7 +20,8 @@ Implemented:
   Intel is an implemented adapter, **not hardware-validated support**.
 - Separate SDK interpreter/environment, process-group timeout, local failure,
   strict NPU execution checks, model/runtime/driver/config cache identity and
-  failed-cache quarantine. No automatic SDK installation or library replacement.
+  quarantine for never-compiled cache keys. No automatic SDK installation or
+  library replacement.
 - Raw-head numeric comparison on every measured call, explicit tolerances,
   timing and provenance JSON. These are execution/parity tests, not quality gates.
 
@@ -53,6 +54,8 @@ python3 tools/framegen-npu/experiment.py probe \
 An advertised provider or accelerator node does not prove support for a model.
 The `available_is_not_execution` marker is deliberate. A missing SDK, inaccessible
 device, crash or timeout fails locally; the compositor continues unchanged.
+Config `python` must name the SDK interpreter itself (or an exec wrapper), so
+the worker's direct parent is its supervisor.
 
 AMD: set `XILINX_XRT` and the child's `LD_LIBRARY_PATH` in the config **before**
 launch. On this machine `/opt/xilinx/xrt/lib` must precede the SDK's bundled XRT.
@@ -123,11 +126,11 @@ separate train and held-out captures before starting; do not record into them.
 python3 tools/framegen-npu/experiment.py campaign --spec /absolute/campaign.json
 ```
 
-The gamescope Python running this command needs NumPy and ONNX: it evaluates
-through the existing evaluator functions and prepares bundles in process. Only
+The gamescope Python running this command needs NumPy, plus ONNX for `npu:true`
+sources: it evaluates and prepares selected bundles in process. Only
 NPU execution uses the SDK Python from `config`; all CPU work finishes first,
 then selected NPU sources run sequentially through the existing supervisor.
-Setting every `npu` to `false` permits CPU-only work (including ONNX export).
+Setting every `npu` to `false` permits CPU-only training/evaluation without ONNX.
 
 The spec has exactly these fields; paths must be absolute. Keys are JSON uint32
 integers (`240` = `0xf0`, `65776` = `0x100f0`). `cpu` is optional; profile lists
@@ -142,7 +145,8 @@ reserved, and benchmark/source names use letters, digits, underscore or hyphen.
   "runs": 100,
   "atol": 0.001,
   "rtol": 0.05,
-  "timeout": 7200,
+  "train_timeout": 600,
+  "npu_timeout": 7200,
   "benches": [{
     "name": "gravitymark",
     "train": "/absolute/captures/gravitymark-train",
@@ -158,11 +162,14 @@ reserved, and benchmark/source names use letters, digits, underscore or hyphen.
 }
 ```
 
-`timeout` bounds each CPU training subprocess and each SDK run, in seconds.
-Every source gets a preparation bundle; GPU profiles use their explicit set key,
-and the CPU candidate's `candidate.gsfr` is evaluated without a profile key.
-`out/<bench>/` contains `eval-neutral`, `eval-<source>`, `bundle-<source>` and
-selected `run-<source>` directories. Each successful step has a hash receipt.
+`train_timeout` bounds each CPU training subprocess; `npu_timeout` bounds each
+SDK run, in seconds. Legacy `timeout` supplies either omitted budget.
+Only `npu:true` sources get bundles; GPU profiles use their explicit set key,
+and CPU candidates are evaluated without a profile key.
+`out/<bench>/` contains `eval-neutral`, `eval-<source>`, and selected
+`bundle-<source>`/`run-<source>` directories. A CPU source with `npu:false` uses
+`train-cpu/`; profiles with `npu:false` need only evaluation. Each successful
+step has a hash receipt.
 Reusing the same spec skips only complete steps whose input and artifact hashes
 match. Inputs, code, config contents and referenced SDK config files participate
 in identity. Stale/partial/failed directories stop the campaign and remain for
@@ -172,8 +179,8 @@ outside the input files. Runtime changes also require a new `runtime_tag`.
 
 `campaign.json` and `campaign.md` are refreshed after steps and on failure. They
 compare neutral and all sources side by side, including CPU training duration,
-NPU load/timing/parity and source-minus-neutral deltas for every metric. Lower
-residual/bad/edge/sigma and higher SSIM are preferable within this offline scope.
+NPU load/timing/parity, cold/warm cache state, and source-minus-neutral deltas.
+Lower residual/bad/edge/sigma and higher SSIM are preferable within this offline scope.
 These are **field-resolution offline metrics, not served RGB**;
 `temporal_sigma` measures residual variation, not displayed flicker.
 `quality_validated` remains false. **NPU timing = host call incl. copies**;
@@ -194,9 +201,20 @@ The first compile can take 10–15 minutes. It is explicit offline work, never a
 startup prerequisite. The default timeout is 60 s; increasing it opts into that
 work. Results are `result.json` and `worker.log`; generated signatures stay in
 the private run directory. For a new run, supply a new output directory. Cache
-root may be reused. A per-key lock prevents concurrent compilation; an interrupted
-or failed key stays quarantined. Use a **new cache root** after diagnosis, rather
+root may be reused. A per-key lock prevents concurrent compilation. Cold compiles
+start `building`; successful loads become `ready` with `compiled:true` before
+parity. Failures become `failed`, preserving the compiled flag and reason. Only
+never-compiled keys remain quarantined; compiled keys can be reused after
+parity/load failure or interruption.
+`load_ms` is labelled cold (compile plus load) or warm (reuse) by `cache_state_before`.
+Use a **new cache root** after diagnosing an incomplete compile, rather
 than blindly deleting caches another process may use.
+
+SIGTERM and non-ignored SIGHUP stop the worker process group and write an abort
+receipt; ignored SIGHUP stays ignored for `nohup`. Linux parent-death SIGKILL
+stops the worker even inside a native SDK call if its supervisor disappears.
+That kill cannot flush receipts: a half compile stays `building` and quarantined;
+compiler descendants are not covered by the worker's parent-death signal.
 
 AMD disables CPU graph-assignment and Python runtime fallback, requires the
 requested provider to remain active, and inspects ORT kernel events. CPU kernels

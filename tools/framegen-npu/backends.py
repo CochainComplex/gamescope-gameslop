@@ -102,6 +102,14 @@ class IntelOpenVino:
 BACKENDS = {b.name: b for b in (AmdOrt, IntelOpenVino)}
 
 
+class ParityError(RuntimeError):
+    def __init__(self, max_abs_error, atol, rtol):
+        super().__init__(f'NPU output exceeds declared raw-head parity tolerance; '
+                         f'max_abs_error={max_abs_error:.9g}')
+        self.parity = {'passed': False, 'max_abs_error': max_abs_error,
+                       'atol': atol, 'rtol': rtol}
+
+
 def measure(backend, features, reference, runs, atol, rtol):
     """Raw-head parity only: not a field, image-quality or gameplay gate."""
     import numpy as np
@@ -109,7 +117,7 @@ def measure(backend, features, reference, runs, atol, rtol):
         raise RuntimeError('reference cannot distinguish zero output at these tolerances')
     if np.allclose(reference, reference[0:1], atol=atol, rtol=rtol):
         raise RuntimeError('fixtures cannot distinguish repeated/stale output at these tolerances')
-    times, errors = [], []
+    times, errors, passed = [], [], True
     for direction in range(len(features)):
         x, ref = features[direction], reference[direction]
         for i in range(runs + 1):  # one untimed warmup per direction
@@ -118,11 +126,12 @@ def measure(backend, features, reference, runs, atol, rtol):
             elapsed = (time.perf_counter() - start) * 1000
             if y.shape != ref.shape or not np.isfinite(y).all():
                 raise RuntimeError('invalid NPU output shape or non-finite values')
-            if not np.allclose(y, ref, atol=atol, rtol=rtol):
-                raise RuntimeError('NPU output exceeds declared raw-head parity tolerance')
+            errors.append(float(np.max(np.abs(y - ref))))
+            passed = bool(np.allclose(y, ref, atol=atol, rtol=rtol)) and passed
             if i:
                 times.append(elapsed)
-                errors.append(float(np.max(np.abs(y - ref))))
+    if not passed:
+        raise ParityError(max(errors), atol, rtol)
     return {'calls': len(times), 'directions': len(features),
             'call_ms_p50': float(np.percentile(times, 50)),
             'call_ms_p99': float(np.percentile(times, 99)),
