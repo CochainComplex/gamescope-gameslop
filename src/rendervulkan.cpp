@@ -2271,7 +2271,8 @@ VkDescriptorSet CVulkanDevice::descriptorSet( CVulkanCmdBuffer *pCmdBuffer, bool
 	m_currentDescriptorSet = ( m_currentDescriptorSet + 1 ) % m_descriptorSets.size();
 
 	// Not wait(), its ring reset would clobber constants this recording already uploaded.
-	if ( const uint64_t ulSeqNo = m_descriptorSetSeqNos[ uIndex ] )
+	// hasCompleted() answers from the completion cache first, so a long-retired set costs no syscall.
+	if ( const uint64_t ulSeqNo = m_descriptorSetSeqNos[ uIndex ]; ulSeqNo && !hasCompleted( ulSeqNo ) )
 	{
 		VkSemaphoreWaitInfo waitInfo = {
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
