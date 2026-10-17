@@ -7902,6 +7902,11 @@ handle_io_error(Display *dpy)
 	if ( !g_bRun )
 	{
 		xwm_log.infof("X11 I/O error while shutting down, exiting.");
+		// _exit skips steamcompmgr's teardown, so persist the net profile here or
+		// every interrupted session loses its learning since the last checkpoint.
+		static std::atomic_flag s_bFlushed = ATOMIC_FLAG_INIT;
+		if ( !s_bFlushed.test_and_set() )
+			vulkan_framegen_flush_profile();
 		_exit(0);
 	}
 

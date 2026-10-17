@@ -9201,6 +9201,11 @@ void vulkan_framegen_update_dormancy()
 	force_repaint();
 }
 
+void vulkan_framegen_flush_profile()
+{
+	framegen_net_profile_flush();
+}
+
 void vulkan_framegen_shutdown()
 {
 	// Persist learning first, even if framegen was turned off live. This is the
