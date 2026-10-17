@@ -7100,6 +7100,15 @@ using FramegenMetricsLatencyDistribution_t = gamescope::framegen::MetricsLatency
 // delayed real's whole bidir delay.
 using FramegenMetricsSourceLatencyDistribution_t = gamescope::framegen::MetricsSourceLatencyDistribution;
 
+using NetLearningSkip = gamescope::framegen::NetLearningSkip;
+static bool framegen_net_online_enabled();
+struct FramegenNetProgress_t
+{
+	uint64_t recorded, published, saved;
+};
+static FramegenNetProgress_t framegen_net_progress();
+static gamescope::framegen::NetLearningPair g_framegenNetLearningPair;
+
 struct FramegenMetricsWindow_t
 {
 	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
@@ -7151,6 +7160,8 @@ struct FramegenMetricsWindow_t
 	FramegenMetricsSourceLatencyDistribution_t realSourceToRecord;
 	FramegenMetricsSourceLatencyDistribution_t realRecordToFlip;
 	gamescope::framegen::MotionQualityCounts quality;
+	uint64_t trainedSteps = 0, publishedSteps = 0, droppedNetReadbacks = 0, rejectedNetReadbacks = 0;
+	gamescope::framegen::NetLearningSkips learningSkips;
 };
 
 struct FramegenMetricsPendingEvents_t
@@ -7167,8 +7178,21 @@ struct FramegenMetricsPendingEvents_t
 	uint64_t copyGpuSamples = 0;
 	uint64_t copyGpuNsMax = 0;
 	gamescope::framegen::MotionQualityCounts quality;
+	uint64_t trainedSteps = 0, publishedSteps = 0, droppedNetReadbacks = 0, rejectedNetReadbacks = 0;
+	gamescope::framegen::NetLearningSkips learningSkips;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
+
+static void framegen_net_note_skip( NetLearningSkip reason )
+{
+	if ( framegen_net_online_enabled() )
+		g_framegenNetLearningPair.skip( reason );
+}
+
+static void framegen_net_finish_pair()
+{
+	g_framegenMetricsPendingEvents.learningSkips.add( g_framegenNetLearningPair.finish() );
+}
 
 struct FramegenMetricsState_t
 {
@@ -7220,6 +7244,11 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.copyGpuSamples += events.copyGpuSamples;
 	window.copyGpuNsMax = std::max( window.copyGpuNsMax, events.copyGpuNsMax );
 	window.quality += events.quality;
+	window.trainedSteps += events.trainedSteps;
+	window.publishedSteps += events.publishedSteps;
+	window.droppedNetReadbacks += events.droppedNetReadbacks;
+	window.rejectedNetReadbacks += events.rejectedNetReadbacks;
+	window.learningSkips += events.learningSkips;
 }
 
 static void framegen_metrics_flush_events()
@@ -7302,6 +7331,8 @@ static void framegen_metrics_log( const char *pszLabel,
 	const gamescope::framegen::FixedRefreshPresentLead_t viableLead =
 		framegen_native_present_lead(
 			ulVblankIntervalNs / 10u, ulVblankIntervalNs );
+	const FramegenNetProgress_t net = framegen_net_progress();
+	const auto skip = window.learningSkips.dominant();
 	vk_log.infof( "framegen-metrics: %s real=%" PRIu64 " gen=%" PRIu64
 		" dreal=%" PRIu64 " rep=%" PRIu64
 		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
@@ -7324,7 +7355,11 @@ static void framegen_metrics_log( const char *pszLabel,
 		" ring_ovf=%" PRIu64
 		" q_resid=%.4f q_bad_mv=%.3f q_killed_mv=%.3f q_killed_match=%.3f"
 		" q_killed_fb=%.3f q_samples=%" PRIu64
-		" src_rec_ms_p50=%.3f src_rec_ms_p95=%.3f rec_flip_ms_p50=%.3f rec_flip_ms_p95=%.3f",
+		" src_rec_ms_p50=%.3f src_rec_ms_p95=%.3f rec_flip_ms_p50=%.3f rec_flip_ms_p95=%.3f"
+		" train_online=%u train_recorded=%" PRIu64 " train_published=%" PRIu64
+		" train_skip=%s train_skip_n=%" PRIu64
+		" train_recorded_total=%" PRIu64 " train_published_total=%" PRIu64 " train_saved_total=%" PRIu64
+		" train_rb_dropped=%" PRIu64 " train_rb_rejected=%" PRIu64,
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -7362,7 +7397,12 @@ static void framegen_metrics_log( const char *pszLabel,
 		window.quality.killedFraction(), window.quality.killedMatchFraction(),
 		window.quality.killedFbFraction(), window.quality.samples,
 		window.realSourceToRecord.p50(), window.realSourceToRecord.p95(),
-		window.realRecordToFlip.p50(), window.realRecordToFlip.p95() );
+		window.realRecordToFlip.p50(), window.realRecordToFlip.p95(),
+		framegen_net_online_enabled() ? 1u : 0u, window.trainedSteps, window.publishedSteps,
+		gamescope::framegen::net_learning_skip_name( skip ),
+		window.learningSkips.counts[ static_cast<size_t>( skip ) ],
+		net.recorded, net.published, net.saved,
+		window.droppedNetReadbacks, window.rejectedNetReadbacks );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -7495,6 +7535,7 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 
 static void framegen_metrics_shutdown()
 {
+	framegen_net_finish_pair();
 	framegen_metrics_flush_events();
 	char szTotal[80];
 	snprintf( szTotal, sizeof( szTotal ), "TOTAL w=%" PRIu64 " dormant=%s",
@@ -8297,6 +8338,15 @@ struct FramegenHistory_t
 };
 
 static FramegenHistory_t g_framegenHistory;
+
+static void framegen_net_drop_profile_readback()
+{
+	if ( g_framegenHistory.ulNetProfileSeqNo != 0
+		&& g_framegenHistory.ulNetProfileSeqNo != g_framegenHistory.ulNetProfileConsumedSeqNo )
+		g_framegenMetricsPendingEvents.droppedNetReadbacks++;
+	g_framegenHistory.ulNetProfileSeqNo = 0;
+	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
+}
 
 struct FramegenImagePoolPressure_t
 {
@@ -9110,8 +9160,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.ulNetRecordConsumedSeqNo = 0;
 	// A pending profile snapshot dies with the scene too; the learned
 	// weights themselves persist — they describe the game, not one shot.
-	g_framegenHistory.ulNetProfileSeqNo = 0;
-	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
+	framegen_net_drop_profile_readback();
 	// Temporal acceleration must never cross a scene/cadence discontinuity.
 	g_framegenMotion.uMotionHistoryFrameId = 0;
 	g_framegenMotion.uMotionHistoryIntervalNs = 0;
@@ -10754,6 +10803,11 @@ static bool g_bFramegenNetProfileLoaded = false;
 static uint64_t g_ulFramegenNetProgress = 0;                     // trained steps, all-time
 static uint64_t g_ulFramegenNetLiveProgress = 0;                 // progress at the cached readback
 static std::atomic<uint64_t> g_ulFramegenNetSavedProgress = { 0 }; // progress at the last successful write
+static FramegenNetProgress_t framegen_net_progress()
+{
+	return { g_ulFramegenNetProgress, g_ulFramegenNetLiveProgress,
+		g_ulFramegenNetSavedProgress.load() };
+}
 static std::atomic<bool> g_bFramegenNetWriteInFlight = { false };
 // Periodic profile I/O is off the render thread, but the worker remains owned:
 // reset/exit joins it before touching the same temp path or destroying process
@@ -10991,8 +11045,7 @@ static void framegen_net_activate_key( uint32_t uKey )
 		if ( g_framegenNetLiveWeights.size() == k_uFramegenNetFloats )
 			framegen_net_store_put( g_uFramegenNetActiveKey, g_framegenNetLiveWeights );
 		g_framegenNetLiveWeights.clear();
-		g_framegenHistory.ulNetProfileSeqNo = 0;
-		g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
+		framegen_net_drop_profile_readback();
 		// GSFD samples carry no key, so a capture directory must never mix
 		// encodings: saturating the counter ends capture for the process.
 		if ( framegen_record_dir() != nullptr && g_uFramegenRecordCount > 0
@@ -12222,7 +12275,10 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	FramegenMotionResources_t &m = g_framegenMotion;
 	if ( m.netState == nullptr || m.netGradSlices == nullptr || m.netWeightsPrior == nullptr
 		|| m.statsAccum == nullptr || m.mvFieldRevChk == nullptr || m.width < 16 || m.height < 16 )
+	{
+		framegen_net_note_skip( NetLearningSkip::Resources );
 		return false;
+	}
 
 	const uint32_t uOptGroups = div_roundup( k_uFramegenNetFloats, 64u );
 	const auto bindOpt = [&]()
@@ -12249,10 +12305,15 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	// pressure valve for weak present GPUs (learning just converges slower).
 	static uint32_t s_uFrameCounter = 0;
 	if ( ( s_uFrameCounter++ % framegen_net_online_every() ) != 0 )
+	{
+		framegen_net_note_skip( NetLearningSkip::Every );
 		return false;
+	}
 
 	m.uNetTrainStep++;
 	g_ulFramegenNetProgress++;
+	g_framegenMetricsPendingEvents.trainedSteps++;
+	g_framegenNetLearningPair.step();
 	const uint32_t uHalf = k_uFramegenNetTrainTiles / 2;
 	const uint32_t uSeed = m.uNetTrainStep * 0x9E3779B9u + 0x61C88647u;
 	const bool bConservativeBidir = vulkan_framegen_bidir_active();
@@ -12354,7 +12415,9 @@ static void framegen_net_profile_write_file( std::vector<uint8_t> bytes, uint64_
 		g_ulFramegenNetSavedProgress = ulProgress;
 		g_ulFramegenNetSavedRevision = ulRevision;
 		static std::atomic<bool> s_bLoggedFirstSave = { false };
-		if ( !s_bLoggedFirstSave.exchange( true ) || g_bFramegenDebug )
+		// Reset/exit flushes must identify their own persisted watermark even
+		// when an earlier short checkpoint already emitted the first-save log.
+		if ( !s_bLoggedFirstSave.exchange( true ) || g_bFramegenDebug || !bFromWorker )
 			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps, %zu weight set%s)",
 				pszPath, ulProgress, uSets, uSets == 1u ? "" : "s" );
 	}
@@ -12445,6 +12508,7 @@ static void framegen_net_profile_consume()
 	{
 		if ( !gamescope::framegen::is_finite_binary32( g_framegenNetReadbackWeights[ i ] ) )
 		{
+			g_framegenMetricsPendingEvents.rejectedNetReadbacks++;
 			vk_log.errorf( "framegen: net weights went non-finite at step %u — reinitializing from the prior (consider a lower GAMESCOPE_FRAMEGEN_NET_LR)", g_framegenMotion.uNetTrainStep );
 			// framegen_record_net runs before the optimizer-init dispatch in the
 			// next batch. Force its upload path too, otherwise that one inference
@@ -12458,6 +12522,7 @@ static void framegen_net_profile_consume()
 	// the preceding live allocation as next frame's scratch storage, so a bad
 	// candidate cannot poison persistence and steady-state readback allocates none.
 	g_framegenNetLiveWeights.swap( g_framegenNetReadbackWeights );
+	g_framegenMetricsPendingEvents.publishedSteps += g_ulFramegenNetProgress - g_ulFramegenNetLiveProgress;
 	g_ulFramegenNetLiveProgress = g_ulFramegenNetProgress;
 
 	// Periodic checkpoint, off-thread — an fwrite into a possibly-contended
@@ -12668,7 +12733,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 						vk_log.errorf( "framegen: online-learning state allocation failed; serving the prior without training" );
 					}
 					g_framegenMotion.bNetStatePending = true;
-					g_framegenHistory.ulNetProfileSeqNo = 0;
+					framegen_net_drop_profile_readback();
 				}
 			}
 			if ( !bNetOk )
@@ -13265,7 +13330,10 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	}
 
 	if ( slots.empty() )
+	{
+		framegen_net_note_skip( NetLearningSkip::OutputPool );
 		return false;
+	}
 	if ( pColorProbe != nullptr
 		&& ( slots.size() != k_uFramegenColorProbeCandidates
 			|| pColorProbe->reference == nullptr
@@ -13386,6 +13454,17 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const bool bNetStateReadback = pColorProbe == nullptr
 		&& !bReuseMotion && g_framegenMotion.bNetActive && framegen_net_online_enabled()
 		&& framegen_record_net_train( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
+	// Mirrors bNetStateReadback above and framegen_net_requested's pipeline gate.
+	if ( pColorProbe != nullptr )
+		framegen_net_note_skip( NetLearningSkip::ColorProbe );
+	else if ( bReuseMotion )
+		framegen_net_note_skip( NetLearningSkip::Reuse );
+	else if ( eff.pipeline < GamescopeFramegenPipeline::Learned )
+		framegen_net_note_skip( NetLearningSkip::Pipeline );
+	else if ( !bMotion )
+		framegen_net_note_skip( NetLearningSkip::Motion );
+	else if ( !g_framegenMotion.bNetActive )
+		framegen_net_note_skip( NetLearningSkip::NetUnavailable );
 	if ( bMotion && !bReuseMotion && pColorProbe == nullptr )
 	{
 		g_framegenMotion.uMotionFieldFrameId = g_framegenHistory.currentFrameId;
@@ -13959,12 +14038,21 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 		|| framegen_predicted_interval_ns() == 0u
 		|| g_framegenHistory.causalAnchor.realFrameId == 0u
 		|| ulCompositeSeqNo == 0u )
+	{
+		if ( vulkan_framegen_is_enabled() && framegen_causal_deadline_enabled()
+			&& !vulkan_framegen_vrr_hybrid_active() && !vulkan_framegen_bidir_active() )
+			framegen_net_note_skip( !g_framegenHistory.pending.empty()
+				? NetLearningSkip::NoSlot : NetLearningSkip::History );
 		return false;
+	}
 
 	// One batch in flight, always: the lockless descriptor/timestamp rings and
 	// the cross-queue read pins all depend on it.
 	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::Busy );
 		return false;
+	}
 
 	const uint64_t now = get_time_in_nanos();
 	if ( now > g_framegenHistory.currentPresentTimeNs
@@ -14018,6 +14106,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			} );
 	if ( !plan.admit )
 	{
+		framegen_net_note_skip( NetLearningSkip::NoSlot );
 		if ( plan.skipReason
 			== gamescope::framegen::DeadlineSkipReason_t::NextRealSafelyDue )
 			framegen_metrics_note_admission_skip();
@@ -14026,7 +14115,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	const uint64_t ulStartEstimateNs = plan.provisional
 		? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
 	if ( std::max( now, ulStartEstimateNs ) >= plan.wakeNs )
+	{
+		framegen_net_note_skip( NetLearningSkip::Budget );
 		return false;
+	}
 
 	const uint64_t ulGridIndex = gamescope::framegen::grid_index_at_or_after(
 		plainGrid, plan.targetNs );
@@ -14036,7 +14128,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	// that can no longer be submitted before that wake is skipped, never slid;
 	// the next planning call (tick or drain) takes the following slot.
 	if ( oTargetVBlankNs && !framegen_nested_slot_submittable( *oTargetVBlankNs, now ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::NoSlot );
 		return false;
+	}
 	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
 	const gamescope::framegen::FixedRefreshCommitPlan_t commitPlan =
 		gridCommitPlan.earlyCommit
@@ -14065,6 +14160,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 		ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );
 	if ( !rung.bAdmit )
 	{
+		framegen_net_note_skip( NetLearningSkip::Budget );
 		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
 		const uint64_t ulRemainingNs = plan.wakeNs > ulDecisionStartNs
 			? plan.wakeNs - ulDecisionStartNs : 0u;
@@ -15454,6 +15550,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	g_framegenHistory.pLastBaseTexture = pBaseTexture;
 	g_framegenHistory.ulLastBaseCommitID = ulBaseCommitID;
 
+	if ( framegen_net_online_enabled() )
+		g_framegenMetricsPendingEvents.learningSkips.add(
+			g_framegenNetLearningPair.begin( g_framegenPresentState.ulCurrentRealFrameId ) );
+
 	// Base-layer dispatcher: decide per recorded frame whether the base-layer path
 	// applies. History then tracks the pre-upscale game buffer instead of the
 	// composited output; the dims/mode-keyed reset inside ensure_resources
@@ -15463,7 +15563,10 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// generate from this frame (the colour probe included).
 	framegen_net_note_input_key( pFrameInfo, bBaseLayer );
 	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::ColorProbe );
 		return;
+	}
 
 	// Bidir and base-layer generation are exclusive per scene. The first
 	// decision is always reported; later changes only under framegen debug and
@@ -15736,6 +15839,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// Prime: the first frame after a reset/invalidation only establishes history.
 	if ( !g_framegenHistory.valid )
 	{
+		framegen_net_note_skip( NetLearningSkip::History );
 		static uint64_t s_uPrimeDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uPrimeDebugLogCounter ) )
 			vk_log.infof( "framegen: priming history with real frame id=%" PRIu64, g_framegenHistory.currentFrameId );
@@ -15783,6 +15887,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	if ( !bShouldGenerate )
 	{
+		framegen_net_note_skip( !bGpuHasHeadroom ? NetLearningSkip::Busy
+			: bGeneratable ? NetLearningSkip::Cadence : NetLearningSkip::NoSlot );
 		if ( bBidirDeadline )
 		{
 			framegen_bidir_plan_pair(

@@ -526,6 +526,8 @@ percentile at full scale only says the value is somewhere beyond it. An empty
 distribution prints 0.000. `src_rec_ms_*` and `rec_flip_ms_*` split
 `src_flip_ms_*` at the latch ([Latency gate](#latency-gate-framegen-on-vs-off)).
 
+Learning fields (`train_recorded`, `train_published`, their `_total` watermarks, `train_saved_total`, `train_online`, `train_skip`, `train_skip_n`, `train_rb_dropped`, `train_rb_rejected`) are documented in [Metrics log fields](framegen-reference.md#metrics-log-fields); these harness gates ignore them.
+
 `ring_ovf` counts the bidir queue fronts that the output-ring ceiling forced
 out ahead of their planned slot in the window. Each one is an overflow that
 the bidir ring bound (`D_ring`) learns from; it stays 0 outside bidir.
@@ -1282,7 +1284,7 @@ framegen is on (`src/Backends/WaylandBackend.cpp` and
 
 ### Measuring it
 
-With `GAMESCOPE_FRAMEGEN_METRICS=1`, four fields appended at the end of each
+With `GAMESCOPE_FRAMEGEN_METRICS=1`, four fields on each
 `framegen-metrics:` line split `src_flip_ms_*` at the latch:
 
 | Fields | Interval |

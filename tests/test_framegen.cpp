@@ -1440,6 +1440,58 @@ static void test_fault_injection_grammar()
 	CHECK( !finite.Consume() && finite.Exhausted() );
 }
 
+static void test_net_learning_metrics()
+{
+	using gamescope::framegen::NetLearningPair;
+	using gamescope::framegen::NetLearningSkip;
+	using gamescope::framegen::NetLearningSkips;
+	using gamescope::framegen::net_learning_skip_name;
+	using enum NetLearningSkip;
+	NetLearningPair pair;
+	NetLearningSkips window, total;
+	window.add( NoSkip );
+	CHECK( window.counts[ static_cast<size_t>( NoSkip ) ] == 0 );
+	CHECK( window.dominant() == NoSkip );
+	CHECK( pair.finish() == NoSkip );
+	CHECK( pair.begin( 0 ) == NoSkip );
+	CHECK( pair.begin( 1 ) == NoSkip );
+	// Repeated polls neither double-count nor hide the pipeline gate.
+	pair.skip( Pipeline );
+	for ( int i = 0; i < 8; i++ )
+	{
+		CHECK( pair.begin( 1 ) == NoSkip );
+		pair.skip( NoSlot );
+		pair.skip( Busy );
+	}
+	window.add( pair.begin( 2 ) );
+	CHECK( window.counts[ static_cast<size_t>( Pipeline ) ] == 1 );
+	// A successful step wins over x3 cached refills and later failures.
+	pair.skip( Budget );
+	pair.step();
+	pair.skip( Reuse );
+	pair.skip( Resources );
+	CHECK( pair.begin( 3 ) == NoSkip );
+	pair.skip( Resources );
+	pair.skip( Every );
+	window.add( pair.begin( 4 ) );
+	CHECK( window.counts[ static_cast<size_t>( Every ) ] == 1 );
+	// Shutdown counts the final unstepped pair exactly once.
+	window.add( pair.finish() );
+	CHECK( pair.finish() == NoSkip );
+	CHECK( window.counts[ static_cast<size_t>( NoBatch ) ] == 1 );
+	CHECK( window.dominant() == NoBatch ); // Deterministic tie.
+	window.add( Pipeline );
+	CHECK( window.dominant() == Pipeline );
+	total += window;
+	window = {};
+	CHECK( window.dominant() == NoSkip );
+	CHECK( total.counts[ static_cast<size_t>( Pipeline ) ] == 2 );
+	CHECK( total.dominant() == Pipeline );
+	CHECK( std::string_view( net_learning_skip_name( total.dominant() ) ) == "pipeline" );
+	for ( size_t i = 0; i < static_cast<size_t>( Count ); i++ )
+		CHECK( std::string_view( net_learning_skip_name( static_cast<NetLearningSkip>( i ) ) ) != "unknown" );
+}
+
 int main()
 {
 	test_fps_limit_policy();
@@ -1464,6 +1516,7 @@ int main()
 	test_query_ring_selection();
 	test_metrics_distribution();
 	test_metrics_source_latency_distribution();
+	test_net_learning_metrics();
 	test_fault_injection_grammar();
 	return g_bPassed ? 0 : 1;
 }
