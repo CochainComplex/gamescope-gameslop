@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -24,34 +25,47 @@ struct GpuDiagnostics {
 
 // Buffer layout is evidence, never proof of a client's Vulkan device UUID.
 inline uint32_t gpu_buffer_observation(const char *origin, bool staged) {
-    uint32_t kind = 0;
-    if (origin && *origin) {
-        kind = !std::strcmp(origin,"cpu") ? 1 : !std::strcmp(origin,"linear") ? 2
-             : !std::strcmp(origin,"AMD") ? 3 : !std::strcmp(origin,"NVIDIA") ? 4
-             : !std::strcmp(origin,"Intel") ? 5 : 6;
+    const uint32_t staging = staged ? 256u : 0u;
+    if (!origin || !*origin) return staging;
+    // Keep the packed observation values stable; unknown origins use kind 6.
+    constexpr const char *origins[] = {"cpu", "linear", "AMD", "NVIDIA", "Intel"};
+    for (uint32_t i = 0; i < std::size(origins); ++i) {
+        if (!std::strcmp(origin, origins[i])) return (i + 1) | staging;
     }
-    return kind | (staged ? 256u : 0u);
+    return 6u | staging;
+}
+
+inline bool gpu_buffer_matches_card(const GpuCard &card, uint32_t index,
+                                    uint32_t presenter, uint32_t kind, bool staged) {
+    if (card.software) return false;
+    switch (kind) {
+        case 2: return staged && index != presenter;
+        case 3: return card.vendor == 0x1002;
+        case 4: return card.vendor == 0x10de;
+        case 5: return card.vendor == 0x8086;
+        default: return false;
+    }
 }
 inline GpuDiagnostics resolve_gpu_diagnostics(GpuDiagnostics result, uint32_t observation) {
     result.renderer = kUnknownGpu;
     const uint32_t kind = observation & 255u;
     const bool staged = (observation & 256u) != 0;
-    result.transport = kind == 0 ? "not observed" : staged ? "staged / copied" : "imported / not staged";
-    if (kind == 0) { result.evidence = "No composited client buffer observed"; return result; }
+    if (kind == 0) {
+        result.transport = "not observed";
+        result.evidence = "No composited client buffer observed";
+        return result;
+    }
+    result.transport = staged ? "staged / copied" : "imported / not staged";
     if (kind == 1) { result.evidence = "CPU/shared-memory buffer; GPU producer unknown"; return result; }
-    const uint32_t vendor = kind == 3 ? 0x1002 : kind == 4 ? 0x10de : kind == 5 ? 0x8086 : 0;
     uint32_t matches = 0, candidate = kUnknownGpu;
     for (uint32_t i=0; i<result.cards.size(); ++i) {
-        const auto &card = result.cards[i];
-        if (card.software) continue;
-        if ((vendor && card.vendor == vendor) || (kind == 2 && staged && i != result.presenter)) {
-            ++matches; candidate = i;
-        }
+        if (!gpu_buffer_matches_card(result.cards[i], i, result.presenter, kind, staged)) continue;
+        ++matches; candidate = i;
     }
     if (matches == 1) {
         result.renderer = candidate;
-        result.evidence = vendor ? "Inferred: modifier vendor, one matching GPU"
-                                 : "Inferred: staged linear buffer, one other GPU";
+        result.evidence = kind == 2 ? "Inferred: staged linear buffer, one other GPU"
+                                   : "Inferred: modifier vendor, one matching GPU";
     } else if (matches > 1) result.evidence = "Ambiguous: multiple matching GPUs; no exact address";
     else result.evidence = kind == 2 ? "Unknown: linear buffer has no GPU identity"
                                     : "Unknown: buffer vendor has no matching visible GPU";
