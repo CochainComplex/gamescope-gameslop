@@ -3745,7 +3745,8 @@ paint_all( global_focus_t *pFocus, bool async )
 			std::thread screenshotThread = std::thread([=] {
 				pthread_setname_np( pthread_self(), "gamescope-scrsh" );
 
-				const uint8_t *mappedData = pScreenshotTexture->mappedData();
+				const uint8_t *mappedData = pScreenshotTexture->isYcbcr()
+					? pScreenshotTexture->mappedData() : pScreenshotTexture->mappedPixels();
 				const uint32_t width = pScreenshotTexture->width();
 				const uint32_t height = pScreenshotTexture->height();
 
