@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "gpu_diagnostics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,7 +26,7 @@ inline constexpr std::array<uint32_t, 16> k_uFramegenHudCgaBayer = {
 		? 0xff55ffu : 0x55ffffu;
 }
 
-inline constexpr uint32_t k_uFramegenHudMaxLines = 7u;
+inline constexpr uint32_t k_uFramegenHudMaxLines = 8u;
 inline constexpr uint32_t k_uFramegenHudMaxColumns = 72u;
 inline constexpr uint32_t k_uFramegenHudPackedTextWords =
 	( k_uFramegenHudMaxLines * k_uFramegenHudMaxColumns ) / 4u;
@@ -185,6 +186,7 @@ struct FramegenHudSnapshot_t
 	const char *deviceName = "unknown";
 	const char *otherDeviceName = nullptr;
 	const char *renderOrigin = nullptr;
+	GpuDiagnostics gpu;
 	GamescopeFramegenMode mode = GamescopeFramegenMode::Extrapolate;
 	GamescopeFramegenPipeline pipeline = GamescopeFramegenPipeline::Warp;
 	uint32_t multiplier = 2u;
@@ -350,26 +352,29 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		snapshot.vrrActive ? "VRR" : "fixed" );
 	framegen_hud_add_line( result, line );
 
-	constexpr size_t k_nFramegenHudDeviceColumnWidth = 19u;
-	char deviceName[k_nFramegenHudDeviceColumnWidth + 1u] = {};
-	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
-	char otherDeviceName[k_nFramegenHudDeviceColumnWidth + 1u] = {};
-	framegen_hud_trim_device_name( otherDeviceName, sizeof( otherDeviceName ),
-		snapshot.otherDeviceName );
-	const char *renderOrigin = "n/a";
-	if ( snapshot.renderOrigin != nullptr && snapshot.renderOrigin[0] != '\0' )
-	{
-		if ( std::strcmp( snapshot.renderOrigin, "linear" ) == 0 )
-			renderOrigin = snapshot.clientBuffersStaged
-				? ( snapshot.otherDeviceName != nullptr ? otherDeviceName : "other-GPU" )
-				: "present-GPU";
-		else
-			renderOrigin = snapshot.renderOrigin;
+	const auto &gpu=snapshot.gpu;
+	const GpuCard *present=gpu.presenter<gpu.cards.size() ? &gpu.cards[gpu.presenter] : nullptr;
+	const GpuCard *render=gpu.renderer<gpu.cards.size() ? &gpu.cards[gpu.renderer] : nullptr;
+	const char *renderName=render ? render->name.c_str() : "unknown";
+	// Old snapshots without hardware inventory retain a clearly tentative hint.
+	if (gpu.cards.empty() && snapshot.renderOrigin) {
+		if (!std::strcmp(snapshot.renderOrigin,"linear"))
+			renderName=snapshot.clientBuffersStaged && snapshot.otherDeviceName
+				? snapshot.otherDeviceName : "unknown (linear buffer)";
+		else renderName=snapshot.renderOrigin;
 	}
-	std::snprintf( line, sizeof( line ),
-		"%-8s %-19s render %-19.19s buffers %s", "present", deviceName,
-		renderOrigin, snapshot.clientBuffersStaged ? "xGPU" : "local" );
-	framegen_hud_add_line( result, line );
+	std::string presentName=present ? present->name : (snapshot.deviceName ? snapshot.deviceName : "unknown");
+	const auto begin=presentName.find_first_not_of(" \t");
+	presentName=begin==std::string::npos ? "unknown" : presentName.substr(begin,presentName.find_last_not_of(" \t")-begin+1);
+	std::snprintf(line,sizeof(line),"%s: %.44s @ %.12s",
+		gpu.scope.rfind("Nested",0)==0 ? "COMPOSE" : "PRESENT",
+		presentName.c_str(),
+		present && !present->pci.empty() ? present->pci.c_str() : "unknown");
+	framegen_hud_add_line(result,line);
+	std::snprintf(line,sizeof(line),"RENDER?: %.34s @ %.12s [%s]",renderName,
+		render && !render->pci.empty() ? render->pci.c_str() : "unknown",
+		snapshot.clientBuffersStaged ? "staged" : "import");
+	framegen_hud_add_line(result,line);
 
 	const char *bidirState = snapshot.bidirActive ? "on"
 		: snapshot.bidirRequested ? "requested(OFF)" : "off";
@@ -377,12 +382,12 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		? ( snapshot.netOnline ? "online" : "blob" )
 		: snapshot.netRequested ? "requested(OFF)" : "off";
 	std::snprintf( line, sizeof( line ),
-		"%-8s bidir:%s  base:%s  net:%s  adapt:%s", "modes",
+		"BIDIR: %s | BASE: %s | NET: %s | ADAPT: %s",
 		bidirState, snapshot.baseLayer ? "on" : "off", netState,
 		snapshot.adapt ? "on" : "off" );
 	if ( snapshot.vrrRequested && !snapshot.vrrActive )
 	{
-		constexpr const char *pszVrrFallback = "  vrr:requested(off)";
+		constexpr const char *pszVrrFallback = " | VRR: requested(off)";
 		if ( std::strlen( line ) + std::strlen( pszVrrFallback )
 			<= k_uFramegenHudMaxColumns )
 		{
@@ -405,15 +410,17 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	framegen_hud_format_steps(
 		generatedSteps, sizeof( generatedSteps ), snapshot.generated );
 	std::snprintf( line, sizeof( line ),
-		"%-8s source %ufps[%s] gen %ufps[%s] repeat %ufps fill %u%%",
-		"rates", gameRate, realSteps, generatedRate, generatedSteps,
+		"SOURCE: %ufps[%s] | GEN: %ufps[%s] | REPEAT: %ufps | FILL: %u%%", gameRate, realSteps, generatedRate, generatedSteps,
 		repeatRate, fillPercent );
+	if (std::strlen(line)>k_uFramegenHudMaxColumns)
+		std::snprintf(line,sizeof(line),"SOURCE: %ufps | GEN: %ufps | REPEAT: %ufps | FILL: %u%%",
+			gameRate,generatedRate,repeatRate,fillPercent);
 	framegen_hud_add_line( result, line );
 
 	char ladderState[24] = {};
 	const char *ladderMode = snapshot.mode == GamescopeFramegenMode::Motion
 		? "motion" : "extrapolate";
-	std::snprintf( line, sizeof( line ), "%-8s %s/%s rung %u/%u  %s", "ladder",
+	std::snprintf( line, sizeof( line ), "QUALITY: %s/%s rung %u/%u | STATE: %s",
 		pipeline_name( snapshot.pipeline ), ladderMode,
 		snapshot.ladderSteps, snapshot.ladderMaxSteps,
 		framegen_hud_ladder_state( ladderState, sizeof( ladderState ), snapshot ) );
@@ -430,7 +437,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const FramegenHudSparkline_t jitterSparkline = framegen_hud_sparkline(
 		snapshot.pacingSdMsHistory, 4.0 );
 	std::snprintf( line, sizeof( line ),
-		"%-8s hit %u%%  %s   jitter +/-%u.%ums  %s", "pace",
+		"HIT: %u%% %s | JITTER: +/-%u.%ums %s",
 		std::min( snapshot.deadlineHitPercent, 100u ),
 		hitSparkline.data(),
 		sdTenths / 10u, sdTenths % 10u,
@@ -442,7 +449,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		char steps[24] = {};
 		framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
 		std::snprintf( line, sizeof( line ),
-			"%-8s %s . %s steps . profile %s", "net",
+			"LEARN: %s | STEPS: %s | PROFILE: %s",
 			snapshot.netOnline ? "online" : "offline", steps,
 			snapshot.netProfileLoaded ? "loaded" : "none" );
 		framegen_hud_add_line( result, line );
@@ -467,7 +474,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const uint64_t total = fresh + snapshot.repeats;
 	const uint32_t fill = total != 0u ? ( fresh * 100u + total / 2u ) / total : 0u;
 	char line[128] = {};
-	std::snprintf( line, sizeof( line ), "source %ufps | generated %ufps | fill %u%%",
+	std::snprintf( line, sizeof( line ), "SOURCE: %u fps | GENERATED: %u fps | FILL: %u%%",
 		source, generated, fill );
 	framegen_hud_add_line( result, line );
 	char steps[24] = {}, state[24] = {};
@@ -475,19 +482,20 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const char *version = snapshot.version != nullptr ? snapshot.version : "unknown";
 	const char *checkout = std::strchr( version, '+' );
 	checkout = checkout != nullptr ? checkout + 1 : version;
-	std::snprintf( line, sizeof( line ), "%s / %s x%u | %uHz%s | git %.16s",
+	std::snprintf( line, sizeof( line ), "MODE: %s/%s%s x%u %uHz%s | GIT: %.16s",
 		mode_name( snapshot.mode ), pipeline_name( snapshot.pipeline ),
+		std::strcmp( pipeline_name( snapshot.pipeline ), "spatial" ) == 0 ? "[EXP]" : "",
 		std::clamp( snapshot.multiplier, 2u, 4u ),
 		std::min( 999u, ( snapshot.refreshMilliHz + 500u ) / 1000u ),
 		snapshot.vrrActive ? " VRR" : "", checkout );
 	framegen_hud_add_line( result, line );
-	std::snprintf( line, sizeof( line ), "learning %s%s%s | profile %s",
+	std::snprintf( line, sizeof( line ), "LEARN: %s%s%s | PROFILE: %s",
 		snapshot.netActive ? ( snapshot.netOnline ? "online " : "frozen " ) : "off",
 		snapshot.netActive ? steps : "", snapshot.netActive ? " steps" : "",
 		snapshot.netProfileLoaded ? "loaded" : "not loaded" );
 	framegen_hud_add_line( result, line );
 	const uint32_t jitter = std::min( snapshot.pacingSdTenthsMs, 9999u );
-	std::snprintf( line, sizeof( line ), "%s | deadline %u%% | jitter %u.%ums",
+	std::snprintf( line, sizeof( line ), "STATE: %s | HIT: %u%% | JITTER: %u.%ums",
 		framegen_hud_ladder_state( state, sizeof( state ), snapshot ),
 		std::min( snapshot.deadlineHitPercent, 100u ), jitter / 10u, jitter % 10u );
 	framegen_hud_add_line( result, line );
@@ -496,7 +504,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	// Reuse the diagnostic scales: deadline hit 0..100%, jitter 0..4 ms.
 	const auto hitHistory = framegen_hud_sparkline( snapshot.deadlineHitHistory, 100.0 );
 	const auto jitterHistory = framegen_hud_sparkline( snapshot.pacingSdMsHistory, 4.0 );
-	std::snprintf( line, sizeof( line ), "deadline %s | jitter %s",
+	std::snprintf( line, sizeof( line ), "HIT: %s | JITTER: %s",
 		hitHistory.data(), jitterHistory.data() );
 	framegen_hud_add_line( result, line );
 	line[0] = '\0';
@@ -522,8 +530,25 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	return ( cga ? 1u : 0u ) | ( opacity <= 100u ? ( opacity + 1u ) << 8u : 0u );
 }
 
+// Attribute bit lives in each existing packed character byte; font remains ASCII.
+// A colon separates label/value within each pipe-delimited field. Diagnostic
+// rows without colons retain their first word as the label.
+[[nodiscard]] inline bool framegen_hud_value_column( const char *text, uint32_t column )
+{
+	if (text[column]=='|' || text[column]==' ') return false;
+	uint32_t begin=column, end=column;
+	while (begin>0u && text[begin-1u]!='|') --begin;
+	while (text[end] && text[end]!='|') ++end;
+	while (begin<end && text[begin]==' ') ++begin;
+	for (uint32_t i=begin; i<end; ++i)
+		if (text[i]==':') return column>i;
+	for (uint32_t i=begin; i<end; ++i)
+		if (text[i]==' ') return column>i;
+	return false;
+}
+
 // Scalar-layout UBO consumed by cs_framegen_hud.comp. Text is packed four
-// ASCII bytes per uint; the uint64_t font above is split explicitly so the GPU
+// attributed ASCII bytes per uint (bit 7 marks a value); the uint64_t font above is split explicitly so the GPU
 // ABI is independent of host endianness and uint64 shader support.
 struct alignas( 16 ) FramegenHudUniform_t
 {
@@ -537,9 +562,9 @@ struct alignas( 16 ) FramegenHudUniform_t
 };
 
 static_assert( offsetof( FramegenHudUniform_t, lineLengths ) == 16u );
-static_assert( offsetof( FramegenHudUniform_t, text ) == 44u );
-static_assert( offsetof( FramegenHudUniform_t, font ) == 548u );
-static_assert( sizeof( FramegenHudUniform_t ) == 1'584u );
+static_assert( offsetof( FramegenHudUniform_t, text ) == 48u );
+static_assert( offsetof( FramegenHudUniform_t, font ) == 624u );
+static_assert( sizeof( FramegenHudUniform_t ) == 1'648u );
 
 struct FramegenHudPush_t
 {
@@ -572,7 +597,8 @@ static_assert( sizeof( FramegenHudPush_t ) == 16u );
 		{
 			const uint32_t byteIndex = line * k_uFramegenHudMaxColumns + column;
 			result.text[byteIndex / 4u] |=
-				static_cast<uint32_t>( static_cast<uint8_t>( text.lines[line][column] ) )
+				( static_cast<uint32_t>( static_cast<uint8_t>( text.lines[line][column] ) & 0x7fu )
+				  | ( framegen_hud_value_column( text.lines[line].data(), column ) ? 0x80u : 0u ) )
 				<< ( 8u * ( byteIndex % 4u ) );
 		}
 	}

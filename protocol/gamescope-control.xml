@@ -156,4 +156,34 @@
     </request>
 
   </interface>
+  <!-- Optional read-only diagnostics, separate from the stable control ABI. -->
+  <interface name="gamescope_gpu_diagnostics_v1" version="1">
+    <description summary="on-demand GPU identity snapshot">
+      Inventory describes this Gamescope instance's visible Vulkan devices.
+      Renderer identity is inferred from the last composited base buffer, not
+      a verified client device UUID. A nested outer presenter's GPU is unknown.
+      No unsolicited updates are sent. Each get_snapshot ends with done.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_snapshot"/>
+    <event name="device">
+      <arg name="index" type="uint"/>
+      <arg name="vendor" type="uint"/>
+      <arg name="device" type="uint"/>
+      <arg name="software" type="uint"/>
+      <arg name="name" type="string"/>
+      <arg name="pci" type="string"/>
+      <arg name="node" type="string"/>
+      <arg name="driver" type="string"/>
+    </event>
+    <event name="route">
+      <arg name="presenter" type="uint" summary="inventory index or 0xffffffff if unknown"/>
+      <arg name="renderer" type="uint" summary="inferred inventory index or 0xffffffff if unknown"/>
+      <arg name="evidence" type="string"/>
+      <arg name="transport" type="string"/>
+      <arg name="scope" type="string"/>
+      <arg name="build" type="string"/>
+    </event>
+    <event name="done"/>
+  </interface>
 </protocol>
