@@ -225,10 +225,12 @@ def grade_pair(flow, conf, luma_src, luma_dst):
     """All metrics for one warped field against its destination luma."""
     warped = warp(luma_src, flow)
     rm = resid_map(warped, luma_dst)
-    cw = float(conf.sum()) or 1.0
+    cw = float(conf.sum())
     return {
         "resid": float(rm.mean()),
-        "resid_conf": float((rm * conf).sum() / cw),   # weighted where it actually ships
+        # Weighted where it actually ships. A frame with no confidence ships no
+        # motion, so it has no conf-resid (None) rather than a flattering 0.
+        "resid_conf": float((rm * conf).sum() / cw) if cw > 0.0 else None,
         "bad%": float((rm > 0.10).mean() * 100.0),
         "ssim": ssim(warped, luma_dst),
         "edge": edge_err(warped, luma_dst),
@@ -259,7 +261,10 @@ def evaluate(samples, params):
     for key, rows in acc.items():
         if not rows:
             continue
-        agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
+        agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0] if k != "resid_conf"}
+        weighted = [r["resid_conf"] for r in rows if r["resid_conf"] is not None]
+        agg["resid_conf"] = float(np.mean(weighted)) if weighted else float("nan")
+        out.setdefault("conf_empty", {})[key] = len(rows) - len(weighted)
         s = np.asarray(seq[key])
         # Temporal stability: how much the per-frame residual lurches. Lower is
         # steadier (the flash/particle-chaos class the adaptation probe fights).
@@ -289,6 +294,7 @@ def main():
     print("\nfield-resolution photometric quality "
           "(structural + temporal; higher ssim / lower everything else is better):")
     print(fmt("neutral", res["neutral"]))
+    print(f"  (conf-resid skips frames with zero confidence: {res['conf_empty']})")
     if "refined" in res:
         print(fmt("refined", res["refined"]))
         n, r = res["neutral"], res["refined"]
