@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cstdlib>
 #include <wayland-server.h>
 #include "gamescope-control-protocol.h"
 #include "framegen/gpu_diagnostics.hpp"
@@ -39,9 +40,17 @@ inline void create_gpu_diagnostics_global(wl_display *display) {
 // names GPUs, PCI addresses, render nodes, drivers and the build. It is
 // advertised only when GAMESCOPE_GPU_DIAGNOSTICS is on (1/true/yes/on); unset,
 // off or an invalid value keeps it hidden. Returns whether it was created.
-inline bool create_gpu_diagnostics_global_if_requested(wl_display *display, const char *value) {
-    if (!gamescope::framegen::parse_bool_setting(value).value_or(false)) return false;
+template <typename Log>
+inline bool create_gpu_diagnostics_global_if_requested(wl_display *display, Log &log) {
+    const char *value = std::getenv("GAMESCOPE_GPU_DIAGNOSTICS");
+    const auto requested = gamescope::framegen::parse_bool_setting(value);
+    if (!requested.value_or(false)) {
+        if (value != nullptr && !requested.has_value())
+            log.errorf("ignoring invalid GAMESCOPE_GPU_DIAGNOSTICS=\"%s\" (using off)", value);
+        return false;
+    }
     create_gpu_diagnostics_global(display);
+    log.infof("GAMESCOPE_GPU_DIAGNOSTICS: gamescope_gpu_diagnostics_v1 is advertised to every Wayland client (GPU names, PCI addresses, render nodes, drivers, build)");
     return true;
 }
 } // namespace gamescope

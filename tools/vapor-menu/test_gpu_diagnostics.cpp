@@ -4,6 +4,7 @@
 #include "control-client.h"
 #include <cassert>
 #include <csignal>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -16,6 +17,18 @@ struct Client {
     gamescope_gpu_diagnostics_v1 *protocol=nullptr;
     GpuDiagnostics result;
     bool done=false;
+};
+struct DiagnosticLog {
+    unsigned infos = 0, errors = 0;
+    std::string info, error;
+    void infof(const char *message) { ++infos; info = message; }
+    void errorf(const char *format, const char *value) {
+        ++errors;
+        char message[1024];
+        const int length = std::snprintf(message, sizeof(message), format, value);
+        assert(length >= 0 && static_cast<size_t>(length) < sizeof(message));
+        error = message;
+    }
 };
 static const gamescope_gpu_diagnostics_v1_listener listener{
     [](void *data,gamescope_gpu_diagnostics_v1 *,uint32_t index,uint32_t vendor,uint32_t device,uint32_t software,
@@ -44,8 +57,11 @@ static const wl_registry_listener registryListener{
 };
 int main(int argc, char **argv) {
     // The global is opt-in: present only when GAMESCOPE_GPU_DIAGNOSTICS is on.
-    assert(argc==2 && (!std::strcmp(argv[1],"--expect-present") || !std::strcmp(argv[1],"--expect-absent")));
+    assert(argc==3 && (!std::strcmp(argv[1],"--expect-present") || !std::strcmp(argv[1],"--expect-absent")));
+    assert(!std::strcmp(argv[2],"info") || !std::strcmp(argv[2],"error") || !std::strcmp(argv[2],"quiet"));
     const bool expectPresent=!std::strcmp(argv[1],"--expect-present");
+    const bool expectError=!std::strcmp(argv[2],"error");
+    assert(expectPresent==!std::strcmp(argv[2],"info"));
     alarm(15);
     for (int scenario=0;scenario<4;++scenario) {
         GpuDiagnostics inventory;
@@ -56,14 +72,32 @@ int main(int argc, char **argv) {
         gpu_diagnostics_store().initialize(inventory);
         gpu_diagnostics_store().observe(scenario==2 ? "linear" : "NVIDIA",scenario!=2);
         int sockets[2]; assert(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,sockets)==0);
+        const pid_t parent=getpid();
         const pid_t child=fork(); assert(child>=0);
         if (child==0) {
+            alarm(15);
+            // Cover parent exit both before and after installing the death signal.
+            if (prctl(PR_SET_PDEATHSIG,SIGKILL)!=0 || getppid()!=parent)
+                _exit(EXIT_FAILURE);
             close(sockets[1]);
             auto *server=wl_display_create(); assert(server);
             if (scenario!=3) {
+                DiagnosticLog log;
                 const bool created=gamescope::create_gpu_diagnostics_global_if_requested(
-                    server,std::getenv("GAMESCOPE_GPU_DIAGNOSTICS"));
+                    server,log);
                 assert(created==expectPresent);
+                assert(log.infos==unsigned(expectPresent));
+                assert(log.errors==unsigned(expectError));
+                if (expectPresent) {
+                    assert(log.info.find("GAMESCOPE_GPU_DIAGNOSTICS")!=std::string::npos);
+                    assert(log.info.find("every Wayland client")!=std::string::npos);
+                }
+                if (expectError) {
+                    const char *value=std::getenv("GAMESCOPE_GPU_DIAGNOSTICS");
+                    assert(value);
+                    assert(log.error.find(std::string("GAMESCOPE_GPU_DIAGNOSTICS=\"")+value+"\"")!=std::string::npos);
+                    assert(log.error.find("using off")!=std::string::npos);
+                }
             }
             assert(wl_client_create(server,sockets[0]));
             wl_display_run(server);
