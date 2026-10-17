@@ -276,6 +276,18 @@ static bool framegen_backend_supported()
 	return GetBackend() != nullptr && GetBackend()->SupportsFramegen();
 }
 
+static bool framegen_configured();
+using gamescope::framegen::FramegenDormantReason;
+// Runtime dormancy (see vulkan_framegen_update_dormancy). Both are written only
+// on the compositor thread; present-wait, page-flip and Wayland feedback threads
+// read them through vulkan_framegen_is_enabled(), hence atomics read relaxed.
+// The reason is published once per compositor iteration, so those threads never
+// touch g_uOutputRotation or the virtual-connector convar themselves.
+static std::atomic<FramegenDormantReason> g_eFramegenDormantReason = { FramegenDormantReason::NotDormant };
+// Set by a failed framegen-sized ring allocation and read directly, so the
+// default-size retry and the rest of that composite already run dormant.
+static std::atomic<bool> g_bFramegenRingAllocationFailed = { false };
+
 // True when the compositor owns the output image ring. On a Vulkan-swapchain
 // backend the "ring" IS the swapchain: g_output.nOutImage comes from
 // vkAcquireNextImageKHR and the images belong to the presentation engine
@@ -651,7 +663,7 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 	// compositor startup instead of on the first generated frame. A lazy miss in
 	// pipeline() calls vkCreateComputePipelines on the compositor thread and is a
 	// visible first-use hitch, especially for the larger ML shaders.
-	if ( vulkan_framegen_is_enabled() )
+	if ( framegen_configured() )
 		compileFramegenPipelines();
 
 	m_pipelineThread = std::jthread([this](std::stop_token st){compileAllPipelines(st);});
@@ -5689,6 +5701,25 @@ static bool vulkan_ensure_output_images()
 	if ( vulkan_make_output_images( pOutput ) )
 		return true;
 
+	// A framegen-sized ring (8-12 images) that does not fit must not black out
+	// every composite: framegen goes dormant (ring_allocation) and the ring is
+	// retried exactly once at the default size. The flag holds until the next
+	// vulkan_remake_output_images(), the only retry of the larger ring.
+	const uint32_t nFailedRing = uint32_t( pOutput->outputImages.size() );
+	if ( nFailedRing > k_uOutputRingSizeDefault )
+	{
+		g_bFramegenRingAllocationFailed.store( true, std::memory_order_relaxed );
+		vk_log.infof( "framegen: dormant (ring_allocation): could not allocate the %u-image framegen output ring; using %u images",
+			nFailedRing, k_uOutputRingSizeDefault );
+		// Drop every partial allocation before the default-size retry.
+		pOutput->outputImages.clear();
+		pOutput->outputImagesPartialOverlay.clear();
+		pOutput->nOutImage = 0;
+		pOutput->nLastOutImage = 0;
+		if ( vulkan_make_output_images( pOutput ) )
+			return true;
+	}
+
 	// A half-made set would pass the check above, so the next use tries again from nothing.
 	pOutput->outputImages.clear();
 	pOutput->outputImagesPartialOverlay.clear();
@@ -5702,6 +5733,9 @@ bool vulkan_remake_output_images()
 	VulkanOutput_t *pOutput = &g_output;
 	g_device.waitIdle();
 	vulkan_framegen_reset( "output_images_remade" );
+	// A mode/HDR/rotation (or dormancy) remake is the only retry of a failed
+	// framegen-sized ring; creation is lazy, so the next composite tries it.
+	g_bFramegenRingAllocationFailed.store( false, std::memory_order_relaxed );
 
 	pOutput->nOutImage = 0;
 
@@ -6887,6 +6921,36 @@ struct FramegenPresentState_t
 	bool bTagPending = false;
 };
 static FramegenPresentState_t g_framegenPresentState;
+// First present token of the current dormancy epoch (compositor thread).
+// Tokens stay monotonic across dormancy; older feedback still counts in METRICS
+// but never teaches the restarted display timing state.
+static uint64_t g_ulFramegenFirstPresentToken = 0;
+
+// Compositor thread only: the last applied reason and per-reason time spent
+// dormant, for the METRICS summary. The clock is read only on transitions and
+// at shutdown.
+struct FramegenDormancy_t
+{
+	FramegenDormantReason reason = FramegenDormantReason::NotDormant;
+	uint64_t sinceNs = 0;
+	std::array<uint64_t, static_cast<size_t>( FramegenDormantReason::RingAllocation ) + 1u> durationNs = {};
+};
+static FramegenDormancy_t g_framegenDormancy;
+
+static FramegenDormantReason framegen_longest_dormant_reason()
+{
+	auto durationNs = g_framegenDormancy.durationNs;
+	if ( g_framegenDormancy.reason != FramegenDormantReason::NotDormant )
+		durationNs[ static_cast<size_t>( g_framegenDormancy.reason ) ] +=
+			get_time_in_nanos() - g_framegenDormancy.sinceNs;
+	FramegenDormantReason longest = FramegenDormantReason::NotDormant;
+	for ( size_t i = 1; i < durationNs.size(); i++ )
+	{
+		if ( durationNs[ i ] > durationNs[ static_cast<size_t>( longest ) ] )
+			longest = static_cast<FramegenDormantReason>( i );
+	}
+	return longest;
+}
 
 // The display interval framegen paces against: the refresh the vblank timer
 // counts in (GetRefresh()). Nested, g_nOutputRefresh later becomes the parent
@@ -7338,9 +7402,10 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 static void framegen_metrics_shutdown()
 {
 	framegen_metrics_flush_events();
-	char szTotal[32];
-	snprintf( szTotal, sizeof( szTotal ), "TOTAL w=%" PRIu64,
-		g_framegenMetrics.nClosedWindows );
+	char szTotal[80];
+	snprintf( szTotal, sizeof( szTotal ), "TOTAL w=%" PRIu64 " dormant=%s",
+		g_framegenMetrics.nClosedWindows,
+		gamescope::framegen::framegen_dormant_reason_name( framegen_longest_dormant_reason() ) );
 	framegen_metrics_log( szTotal, g_framegenMetrics.total );
 }
 
@@ -7581,8 +7646,9 @@ static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
 }
 
 // Present tags and feedback exist for framegen, and for the opt-in metrics
-// (which also give the framegen-OFF baseline). Constant after init, so framegen
-// OFF without metrics does no per-frame present bookkeeping.
+// (which also give the framegen-OFF baseline). Constant except across a
+// dormancy transition, which restarts g_framegenPresentState; framegen OFF or
+// dormant without metrics does no per-frame present bookkeeping.
 static bool framegen_present_tracking_enabled()
 {
 	return vulkan_framegen_is_enabled() || framegen_metrics_enabled();
@@ -7718,6 +7784,8 @@ void vulkan_framegen_drain_present_feedback()
 			continue;
 		if ( bMetricsCollectionEnabled )
 			framegen_metrics_add_feedback( feedback );
+		if ( feedback.tag.ulPresentToken < g_ulFramegenFirstPresentToken )
+			continue;
 
 		if ( feedback.bPresented && feedback.bTimestampValid )
 		{
@@ -8407,7 +8475,10 @@ static bool framegen_vrr_hybrid_configured()
 
 bool vulkan_framegen_vrr_hybrid_requested()
 {
-	return framegen_vrr_hybrid_configured() && g_device.hasFramegenQueue();
+	// The framegen queue outlives dormancy; the runtime gate keeps a dormant
+	// session's VRR decisions identical to an unconfigured one's.
+	return vulkan_framegen_is_enabled()
+		&& framegen_vrr_hybrid_configured() && g_device.hasFramegenQueue();
 }
 
 bool vulkan_framegen_vrr_hybrid_active()
@@ -8633,9 +8704,11 @@ static bool framegen_color_probe_active()
 		&& g_uFramegenColorRecordCount < framegen_color_record_max();
 }
 
-// Fixed at startup (command line and backend); a runtime toggle would have to
-// reset g_framegenPresentState, which framegen_present_tracking_enabled gates.
-bool vulkan_framegen_is_enabled()
+// Fixed at startup (command line and backend). Gates what must outlive runtime
+// dormancy: device-lifetime setup and the shutdown drain. The device queue and
+// descriptor reservations keep their own g_bExperimentalFramegen &&
+// framegen_backend_supported() test.
+static bool framegen_configured()
 {
 	// Only enable on backends that actually present generated frames. Otherwise
 	// generation would run and be discarded, and the forced-composite / no-VRR /
@@ -8648,6 +8721,18 @@ bool vulkan_framegen_is_enabled()
 		&& ( g_eFramegenMode == GamescopeFramegenMode::Extrapolate
 			|| g_eFramegenMode == GamescopeFramegenMode::Blend
 			|| g_eFramegenMode == GamescopeFramegenMode::Motion );
+}
+
+// Configured and not dormant; callable from any thread. The reason changes only
+// in vulkan_framegen_update_dormancy(), which also restarts the present state
+// that framegen_present_tracking_enabled() gates. A ring allocation failure
+// turns this off mid-composite, right after the reset of a ring remake (or at
+// startup); the next update completes that transition.
+bool vulkan_framegen_is_enabled()
+{
+	return framegen_configured()
+		&& g_eFramegenDormantReason.load( std::memory_order_relaxed ) == FramegenDormantReason::NotDormant
+		&& !g_bFramegenRingAllocationFailed.load( std::memory_order_relaxed );
 }
 
 // Deadline-driven degradation ladder. The startup mode/pipeline/multiplier are the
@@ -8993,6 +9078,93 @@ void vulkan_framegen_reset( const char *reason )
 	g_framegenColorProbe = {};
 }
 
+// The one dormancy transition point: the compositor thread, once per main-loop
+// iteration, after steamcompmgr's mode/rotation remake and before any paint or
+// vblank-driven generated present. It is the only writer of the published
+// reason, so every framegen decision of an iteration sees one state.
+void vulkan_framegen_update_dormancy()
+{
+	if ( !framegen_configured() )
+		return;
+	// g_uOutputRotation and the virtual-connector convar are read here, on the
+	// thread that already reads them per iteration (the rotation remake block,
+	// the virtual-connector focus rebuild), never from feedback threads.
+	const FramegenDormantReason reason = gamescope::framegen::framegen_dormant_reason(
+		g_uOutputRotation,
+		gamescope::VirtualConnectorIsSingleOutput(),
+		g_bFramegenRingAllocationFailed.load( std::memory_order_relaxed ) );
+	const FramegenDormantReason previous = g_framegenDormancy.reason;
+	if ( reason == previous )
+		return;
+
+	const uint64_t ulNowNs = get_time_in_nanos();
+	if ( previous != FramegenDormantReason::NotDormant )
+		g_framegenDormancy.durationNs[ static_cast<size_t>( previous ) ] +=
+			ulNowNs - g_framegenDormancy.sinceNs;
+	g_framegenDormancy.reason = reason;
+	g_framegenDormancy.sinceNs = ulNowNs;
+	const char *pszReason = gamescope::framegen::framegen_dormant_reason_name( reason );
+	switch ( reason )
+	{
+		case FramegenDormantReason::NotDormant:
+			vk_log.infof( "framegen: active again (was %s)",
+				gamescope::framegen::framegen_dormant_reason_name( previous ) );
+			break;
+		case FramegenDormantReason::OutputRotation:
+			vk_log.infof( "framegen: dormant (output_rotation): composited output rotation is active; generated frames assume an unrotated output" );
+			break;
+		case FramegenDormantReason::MultiOutput:
+			vk_log.infof( "framegen: dormant (multi_output): more than one virtual output; framegen keeps a single frame history" );
+			break;
+		case FramegenDormantReason::RingAllocation:
+			// Straight from active, the failed allocation has just logged.
+			if ( previous != FramegenDormantReason::NotDormant )
+				vk_log.infof( "framegen: dormant (ring_allocation): the framegen output ring failed to allocate; retried at the next output remake" );
+			break;
+	}
+	g_eFramegenDormantReason.store( reason, std::memory_order_relaxed );
+
+	// Drop everything queued for presentation. Unlike focus_change (which keeps
+	// bidir's delayed reals for the next opportunity), nothing consumes the
+	// queue while dormant, so the delayed reals go too, counted as dropped. The
+	// reset then retires framegen-queue and base-ingest work and drops history,
+	// read pins and the framegen output/present images, as on a ring remake.
+	framegen_clear_pending();
+	char szResetReason[64];
+	snprintf( szResetReason, sizeof( szResetReason ), "dormant:%s", pszReason );
+	vulkan_framegen_reset( reason == FramegenDormantReason::NotDormant ? "resume" : szResetReason );
+
+	// Present tracking may toggle here (framegen_present_tracking_enabled), so
+	// restart its per-frame identity and timing learners. Tokens, slot and real
+	// frame ids stay monotonic for METRICS; feedback from tags taken before now
+	// still counts there but no longer teaches the display timing state.
+	const uint64_t ulLastPresentToken = g_framegenPresentState.ulLastPresentToken;
+	const uint64_t ulLastSlotId = g_framegenPresentState.ulLastSlotId;
+	const uint64_t ulNextRealFrameId = g_framegenPresentState.ulCurrentRealFrameId + 1u;
+	g_framegenPresentState = {};
+	g_framegenPresentState.ulLastPresentToken = ulLastPresentToken;
+	g_framegenPresentState.ulLastSlotId = ulLastSlotId;
+	g_framegenPresentState.ulCurrentRealFrameId = ulNextRealFrameId;
+	g_ulFramegenFirstPresentToken = ulLastPresentToken + 1u;
+
+	// vulkan_make_output_images sizes the ring by vulkan_framegen_is_enabled().
+	// A ring made under the other state is remade here, outside any paint: the
+	// remake only empties it (waitIdle first) and the next composite allocates
+	// lazily. An empty ring (the rotation remake just ran) needs nothing. A
+	// ring_allocation ring already is default-sized, so it is left alone and
+	// keeps its latch.
+	const uint32_t nWantedRing = reason == FramegenDormantReason::NotDormant
+		? gamescope::framegen::output_ring_size_for_multiplier( g_nFramegenMultiplier )
+		: k_uOutputRingSizeDefault;
+	if ( framegen_owns_output_ring() && !g_output.outputImages.empty()
+		&& g_output.outputImages.size() != nWantedRing )
+		vulkan_remake_output_images();
+
+	// Recomposite under the new policy (forced composite, VRR, tearing) and,
+	// on resume, prime history from a fresh real frame.
+	force_repaint();
+}
+
 void vulkan_framegen_shutdown()
 {
 	// Persist learning first, even if framegen was turned off live. This is the
@@ -9008,7 +9180,7 @@ void vulkan_framegen_shutdown()
 	g_bFramegenFeedbackShutdown = true;
 	framegen_flush_present_wait_tags( false );
 
-	if ( !vulkan_framegen_is_enabled() )
+	if ( !framegen_configured() )
 	{
 		if ( framegen_metrics_enabled() )
 			framegen_metrics_shutdown();
