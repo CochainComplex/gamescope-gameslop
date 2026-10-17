@@ -425,15 +425,6 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
 }
 
-// The HUD shader keeps its own copies of hud.hpp's contracts; the tests below
-// read them from the source so changing either side alone fails here.
-static std::string framegen_hud_shader_source()
-{
-	std::ifstream shader( FRAMEGEN_HUD_SHADER_PATH );
-	return std::string( ( std::istreambuf_iterator<char>( shader ) ),
-		std::istreambuf_iterator<char>() );
-}
-
 static std::string framegen_read_source( const char *path )
 {
 	std::ifstream file( path );
@@ -590,7 +581,7 @@ static std::optional<uint32_t> framegen_hud_shader_uint( const std::string &sour
 
 TEST_CASE( "HUD UBO declaration and outline threshold match cs_framegen_hud.comp", "[framegen][hud]" )
 {
-	const std::string source = framegen_hud_shader_source();
+	const std::string source = framegen_read_source( FRAMEGEN_HUD_SHADER_PATH );
 	REQUIRE_FALSE( source.empty() );
 
 	// Scalar-layout block: member order and array sizes give the offsets that
@@ -945,14 +936,9 @@ TEST_CASE( "HUD-in-history note is said once, for a frame that carries the HUD",
 
 // rendervulkan.cpp is not compiled by any test, so its wiring is pinned as
 // source: change it together with these expectations, never alone.
-static std::string framegen_rendervulkan_source()
-{
-	return framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
-}
-
 TEST_CASE( "vulkan_composite decides the HUD history split only through hud_history.hpp", "[framegen][hud][hud-history]" )
 {
-	const std::string source = framegen_rendervulkan_source();
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
 	REQUIRE_FALSE( source.empty() );
 
 	CHECK( framegen_source_statements( source, "gamescope::framegen::FramegenHudHistoryState hudHistory;",
@@ -1015,7 +1001,7 @@ static bool framegen_hud_history_check( gamescope::framegen::FramegenHudHistoryC
 
 TEST_CASE( "vulkan_composite takes the HUD-free copy before the HUD pass", "[framegen][hud][hud-history]" )
 {
-	const std::string source = framegen_rendervulkan_source();
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
 	REQUIRE_FALSE( source.empty() );
 
 	CHECK( framegen_source_statements( source, "const bool bCursorSplit=", ";" )
@@ -1045,7 +1031,7 @@ TEST_CASE( "vulkan_composite takes the HUD-free copy before the HUD pass", "[fra
 
 TEST_CASE( "framegen_record_real_frame says the HUD-in-history note through hud_history.hpp", "[framegen][hud][hud-history]" )
 {
-	const std::string source = framegen_rendervulkan_source();
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
 	REQUIRE_FALSE( source.empty() );
 
 	CHECK( framegen_source_definitions( source, "static void framegen_note_hud_in_history(" )
@@ -1071,7 +1057,7 @@ static void framegen_note_hud_in_history( bool bHudFreeRealFrame, const char *ps
 
 TEST_CASE( "framegen_hud_cga reads GAMESCOPE_FRAMEGEN_HUD_STYLE only through the settings helpers", "[framegen][hud]" )
 {
-	const std::string source = framegen_rendervulkan_source();
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
 	REQUIRE_FALSE( source.empty() );
 
 	CHECK( framegen_source_definitions( source, "static bool framegen_hud_cga(" )
@@ -1095,7 +1081,7 @@ static bool framegen_hud_cga()
 
 TEST_CASE( "CGA HUD Bayer table matches cs_framegen_hud.comp", "[framegen][hud]" )
 {
-	const std::string source = framegen_hud_shader_source();
+	const std::string source = framegen_read_source( FRAMEGEN_HUD_SHADER_PATH );
 	REQUIRE_FALSE( source.empty() );
 	const std::string_view marker = "uint[16](";
 	const size_t first = source.find( marker );
@@ -1497,7 +1483,7 @@ TEST_CASE( "nested correction uses strict measured admission before discarding p
 TEST_CASE( "nested correction wires the biased deadline and current work class into discard",
 	"[framegen][deadline][nested][correction][reference-wiring]" )
 {
-	const std::string source = framegen_rendervulkan_source();
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
 	REQUIRE_FALSE( source.empty() );
 	const auto statement = [&]( std::string_view start )
 	{
@@ -7161,7 +7147,7 @@ TEST_CASE( "causal shortfall reference: native keeps its budget, nested uses the
 TEST_CASE( "the renderer classifies causal shortfalls through the shared seams",
 	"[framegen][deadline][nested][reference-wiring]" )
 {
-	const std::string source = framegen_rendervulkan_source();
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
 	REQUIRE_FALSE( source.empty() );
 	const auto statements = [&]( std::string_view start, std::string_view end )
 	{
