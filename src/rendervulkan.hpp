@@ -259,7 +259,6 @@ public:
 		return format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
 	}
 
-	int memoryFence();
 
 	CVulkanTexture( void );
 	~CVulkanTexture( void );

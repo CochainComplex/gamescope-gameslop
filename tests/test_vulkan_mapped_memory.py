@@ -333,7 +333,7 @@ def main():
     reuse = between(init, '\t\tvk_log.infof("%d vs %d!",',
                     "\n\t}\n\t\n\tres = g_device.vk.BindImageMemory")
     destructor = between(source, "CVulkanTexture::~CVulkanTexture( void )",
-                         "\nint CVulkanTexture::memoryFence()")
+                         "\nstatic bool is_image_format_modifier_supported(")
     swapchain = between(source, "bool CVulkanTexture::BInitFromSwapchain(",
                         "\ngamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()")
     find_type = between(source, "int32_t CVulkanDevice::findMemoryType(",

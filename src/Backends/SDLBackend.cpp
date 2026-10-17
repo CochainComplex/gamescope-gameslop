@@ -170,6 +170,7 @@ namespace gamescope
 
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) override;
 		virtual bool UsesModifiers() const override;
+		virtual bool UsesDmabufForPresentation() const override { return false; }
 		virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const override;
 
         virtual IBackendConnector *GetCurrentConnector() override;
