@@ -72,6 +72,10 @@ test('wlserver_shutdown', find_program('python3'),
 test('vulkan_mapped_memory', find_program('python3'),
 	args: files('test_vulkan_mapped_memory.py'), timeout: 90)
 
+test('ycbcr_samplers', find_program('python3'),
+	args: [files('test_ycbcr_samplers.py'), meson.project_build_root() / 'src' / 'gamescope.p'],
+	depends: [gamescope_exe], timeout: 30)
+
 test('backend_exports', find_program('python3'),
 	args: files('test_backend_exports.py'), timeout: 90)
 
