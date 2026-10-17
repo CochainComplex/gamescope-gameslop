@@ -8032,6 +8032,9 @@ struct FramegenHistory_t
 		// read off the live history) so a frame planned before a fallback can
 		// never end up with two cursors, or none.
 		bool bCursorFree = false;
+		// Same contract for the framegen HUD: both endpoints were composited
+		// without it, so framegen_present_image draws the live HUD on top.
+		bool bHudFree = false;
 	};
 	std::vector<PendingGenerated_t> pending;
 
@@ -8135,6 +8138,12 @@ struct FramegenHistory_t
 	// onto generated frames. Shifted alongside previousReal/currentReal.
 	bool bCursorFreePrevious = false;
 	bool bCursorFreeCurrent = false;
+	// Same for the framegen HUD: previousReal / currentReal hold a composite the
+	// HUD was NOT drawn into (see the HUD split in vulkan_composite), so the
+	// present side draws the live HUD onto generated frames. Only ever true
+	// while GAMESCOPE_FRAMEGEN_HUD is on. Shifted alongside previousReal/currentReal.
+	bool bHudFreePrevious = false;
+	bool bHudFreeCurrent = false;
 	// Rolling index into g_output.framegenCursorHistoryImages.
 	uint32_t nNextCursorHistoryIndex = 0;
 	// Rolling index into g_output.framegenPresentImages for the next late
@@ -8356,7 +8365,7 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 static void framegen_clear_vrr_midpoint_state( bool bClearPending );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
 static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
-static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
+static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo, bool bCursorFree, bool bHudFree );
 
 static const char *framegen_color_record_dir()
 {
@@ -9666,15 +9675,17 @@ size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs )
 // stack (fresh overlays, latest cursor). Output-space cursor split: a frame
 // predicted from cursor-free history gets the LIVE pointer composited now, not
 // a motion-warped copy of where it was a real frame ago (front.tex untouched
-// when the live stack has no cursor layer). Otherwise the generated output is
+// when the live stack has no cursor layer). A frame predicted from HUD-free
+// history gets the live HUD the same way. Otherwise the generated output is
 // scanout-ready as is.
 static gamescope::Rc<CVulkanTexture> framegen_present_image( const FramegenHistory_t::PendingGenerated_t &front,
 	const struct FrameInfo_t *pPresentFrameInfo )
 {
 	if ( g_framegenHistory.bBaseLayer )
 		return framegen_base_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
-	if ( front.bCursorFree && !front.bReal )
-		return framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
+	if ( ( front.bCursorFree || front.bHudFree ) && !front.bReal )
+		return framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo,
+			front.bCursorFree, front.bHudFree );
 	return front.tex;
 }
 
@@ -10165,12 +10176,16 @@ static gamescope::Rc<CVulkanTexture> framegen_acquire_pool_image(
 // flippable — a cursor-free frame is a prediction input, not a scanout buffer.
 // bFramegenShared is mandatory: the framegen queue may live on another family
 // (see the split-family rules around framegen_create_base_history_texture).
+// With the framegen HUD on, the HUD split also copies the finished composite
+// into these images (transferDst). The HUD level is fixed for the process, so
+// the pool never mixes usage sets, and with the HUD off the flags stay as before.
 static bool framegen_create_cursor_history_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
 {
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bStorage = true;
 	createFlags.bSampled = true;
 	createFlags.bTransferSrc = true;
+	createFlags.bTransferDst = framegen_hud_level() != 0u;
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
@@ -10230,9 +10245,13 @@ static gamescope::Rc<CVulkanTexture> framegen_acquire_cursor_history_image( uint
 // edge differs — and it differs the same way on real and generated frames,
 // which is what matters for temporal consistency. It is also what a hardware
 // cursor plane does on KMS, where the cursor blends after the CRTC pipeline.
+//
+// pCursorLayer may be null: the generated-frame HUD present (no cursor to
+// draw) then gets a single PASSTHRU layer, i.e. a raw-value copy of pBase that
+// the HUD pass draws on.
 static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 	const gamescope::Rc<CVulkanTexture> &pBase,
-	const struct FrameInfo_t::Layer_t &cursorLayer,
+	const struct FrameInfo_t::Layer_t *pCursorLayer,
 	const struct FrameInfo_t *pSource )
 {
 	*pOut = FrameInfo_t{};
@@ -10257,7 +10276,9 @@ static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 	base.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
 	base.eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
 
-	*pOut->layers.push() = cursorLayer;
+	if ( pCursorLayer == nullptr )
+		return;
+	*pOut->layers.push() = *pCursorLayer;
 	// Compositor-owned layers carry no commit back-pointers; the import staging
 	// pass keys off these, and a stale pointer here would be a lifetime bug.
 	pOut->layers.get( 1 ).pCommitTexture = nullptr;
@@ -10272,10 +10293,22 @@ static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 // framegen_record_real_frame (no history poisoning) and off the output ring.
 // Returns the generated frame unchanged when there is nothing to draw, so a
 // frame with no cursor costs literally nothing.
-static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo )
+//
+// bCursorFree: the frame was predicted from cursor-free history, so the live
+// cursor goes on top. bHudFree: it was predicted from HUD-free history (the HUD
+// split in vulkan_composite), so the live HUD goes on top too, in the same
+// command buffer. Without that, the HUD would only reach real frames and
+// strobe at the real-frame rate. With no cursor to draw, the pass is a
+// single-layer PASSTHRU copy of the generated frame plus the HUD dispatch.
+// The present pool is flippable, and transfer usage on it would change the
+// scanout modifier negotiation, so this copy is the passthrough blit rather
+// than vkCmdCopyImage.
+static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo, bool bCursorFree, bool bHudFree )
 {
-	const int nCursorLayer = framegen_cursor_top_layer_index( pPresentFrameInfo );
-	if ( nCursorLayer < 0 )
+	const int nCursorLayer = bCursorFree
+		? framegen_cursor_top_layer_index( pPresentFrameInfo ) : -1;
+	const bool bDrawHud = bHudFree && framegen_hud_level() != 0u;
+	if ( nCursorLayer < 0 && !bDrawHud )
 		return pGeneratedOutput;
 
 	if ( !framegen_ensure_present_pool() || g_output.framegenPresentImages.empty()
@@ -10301,11 +10334,16 @@ static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescop
 
 	FrameInfo_t cursorFrameInfo;
 	framegen_build_cursor_overlay_frame_info( &cursorFrameInfo, pGeneratedOutput,
-		pPresentFrameInfo->layers.get( nCursorLayer ), pPresentFrameInfo );
+		nCursorLayer >= 0 ? &pPresentFrameInfo->layers.get( nCursorLayer ) : nullptr,
+		pPresentFrameInfo );
 
 	auto pCmdBuffer = g_device.commandBuffer();
 	g_device.addFramegenDependency( pCmdBuffer.get(), ulFramegenSeqNo );
-	std::optional<uint64_t> oSeqNo = vulkan_composite( &cursorFrameInfo, nullptr, false, pTarget, false, std::move( pCmdBuffer ) );
+	// The HUD text is built from the live stack (pPresentFrameInfo), not from
+	// this compositor-only frame info: it carries no client commit, so the HUD's
+	// render-origin line would otherwise differ between real and generated frames.
+	std::optional<uint64_t> oSeqNo = vulkan_composite( &cursorFrameInfo, nullptr, false, pTarget, false, std::move( pCmdBuffer ),
+		bDrawHud, pPresentFrameInfo );
 	if ( !oSeqNo )
 		return pGeneratedOutput;
 	// Same wait the real composition path performs before its flip: the commit
@@ -13420,6 +13458,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		// a second one would double it.
 		entry.bCursorFree = g_framegenHistory.bCursorFreePrevious
 			&& g_framegenHistory.bCursorFreeCurrent;
+		entry.bHudFree = g_framegenHistory.bHudFreePrevious
+			&& g_framegenHistory.bHudFreeCurrent;
 		entry.bProvisional = bExplicitProvisional
 			|| ( bDeadlineCostKeying && ulAnchorRealFrameId == 0u
 				&& !g_framegenHistory.causalAnchor.correctedFlipNs.has_value() );
@@ -15007,7 +15047,9 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 // either because the composite split it out (vulkan_composite) or because the
 // stack had no cursor layer to begin with. It is the caller's verdict, not a
 // property recomputable here: pFrameInfo still describes the FULL stack.
-static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame )
+// bHudFreeRealFrame: likewise for the framegen HUD — pRealFrame is a composite
+// the HUD was not drawn into, while the scanout image carries it.
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame, bool bHudFreeRealFrame )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
 		return;
@@ -15422,6 +15464,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		// inert here and must never claim otherwise.
 		g_framegenHistory.bCursorFreePrevious = false;
 		g_framegenHistory.bCursorFreeCurrent = false;
+		g_framegenHistory.bHudFreePrevious = false;
+		g_framegenHistory.bHudFreeCurrent = false;
 	}
 	else
 	{
@@ -15429,6 +15473,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		g_framegenHistory.currentReal = pRealFrame;
 		g_framegenHistory.bCursorFreePrevious = g_framegenHistory.bCursorFreeCurrent;
 		g_framegenHistory.bCursorFreeCurrent = bCursorFreeRealFrame;
+		g_framegenHistory.bHudFreePrevious = g_framegenHistory.bHudFreeCurrent;
+		g_framegenHistory.bHudFreeCurrent = bHudFreeRealFrame;
 	}
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 
@@ -15846,7 +15892,7 @@ static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo
 		g_device.noteStagingSubmission( ulSeqNo, nQuerySlot );
 }
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud )
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud, const struct FrameInfo_t *pHudFrameInfo )
 {
 	// Offscreen overrides do not consume a swapchain image. The generated
 	// window-present path reconciles before selecting its explicit override.
@@ -16059,6 +16105,34 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	const bool bCursorFreeHistory = bCursorSplitCandidate
 		&& ( bCursorSplit || !framegen_frame_has_cursor_layer( frameInfo ) );
 
+	// Framegen HUD split. The HUD is the last pass of this composite and lands
+	// in compositeImage; when that image is also the framegen history, motion
+	// estimation, every generated frame and the learned net's online training
+	// see the HUD. Same candidates as the cursor split, so it rides on its
+	// switch too (GAMESCOPE_FRAMEGEN_CURSOR=0 keeps the HUD in history, as
+	// before). When the cursor split ran, history is already the owned
+	// cursor-free image and the HUD only reaches the scanout target. Otherwise
+	// the composite still renders straight into the ring image exactly as with
+	// the HUD off, and a bit-exact copy of it into an owned image from the same
+	// pool, taken before the HUD pass, becomes history. Copying this way round
+	// needs transferSrc on the ring image (already requested for screenshots)
+	// and transferDst only on the non-flippable pool, so scanout usage and
+	// modifier selection stay as they are. A busy pool, or a ring image that
+	// lost transferSrc in BInit, keeps the HUD in history for this frame, and
+	// bHudFreeHistory says so to the present side. The present side then draws
+	// the live HUD onto generated frames (framegen_cursor_present_composite),
+	// so the HUD does not strobe at the real-frame rate.
+	const bool bHudSplitCandidate = bCursorSplitCandidate && framegen_hud_level() != 0u;
+	gamescope::Rc<CVulkanTexture> pHudFreeHistoryImage;
+	if ( bHudSplitCandidate && !bCursorSplit && compositeImage != nullptr
+		&& compositeImage->transferSrc() )
+	{
+		pHudFreeHistoryImage = framegen_acquire_cursor_history_image(
+			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
+	}
+	const bool bHudFreeHistory = bHudSplitCandidate
+		&& ( bCursorSplit || pHudFreeHistoryImage != nullptr );
+
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 	// Off the real-frame critical path: the staging copy goes out as its own
 	// submission now, so the composite recorded below (and the flip that waits on
@@ -16247,7 +16321,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	{
 		FrameInfo_t cursorFrameInfo;
 		framegen_build_cursor_overlay_frame_info( &cursorFrameInfo, compositeImage,
-			cursorSplitLayer, frameInfo );
+			&cursorSplitLayer, frameInfo );
 
 		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, cursorFrameInfo.layers.count(), cursorFrameInfo.ycbcrMask(), 0u, cursorFrameInfo.colorspaceMask(), EOTF_Count ));
 		bind_all_layers(cmdBuffer.get(), &cursorFrameInfo);
@@ -16266,6 +16340,19 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		// framegen_record_real_frame keys scene changes on layerCount and must
 		// keep seeing the true count.
 		*frameInfo->layers.push() = cursorSplitLayer;
+	}
+
+	// HUD split, second half: freeze the finished, HUD-free composite as
+	// history before the HUD pass below draws into the scanout image. A plain
+	// vkCmdCopyImage between images of the same size and VkFormat: bit-exact,
+	// no shader, no re-encode, so HDR (PQ, scRGB fp16) history is the very
+	// values the display gets minus the HUD. The command buffer's sync2
+	// tracking orders it after the composite write and orders the HUD write
+	// after this read.
+	if ( pHudFreeHistoryImage != nullptr )
+	{
+		cmdBuffer->copyImage( compositeImage, pHudFreeHistoryImage );
+		pFramegenHistoryImage = std::move( pHudFreeHistoryImage );
 	}
 
 	if ( pPipewireTexture != nullptr )
@@ -16349,8 +16436,12 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// presents a generated frame by compositing it into the acquired swapchain
 	// image with pOutputOverride set, and that IS the frame that reaches the
 	// display. Without the opt-in the HUD would only be drawn on real frames
-	// and would visibly strobe at half the presented rate. No existing caller
-	// passes true, so DRM / nested Wayland are unchanged.
+	// and would visibly strobe at half the presented rate. The output-space
+	// overlay present (framegen_cursor_present_composite) passes true for the
+	// same reason, but only for a generated frame predicted from HUD-free
+	// history: the HUD split above keeps the HUD out of the real frame's
+	// history, so the generated frame has none and needs the live one drawn on.
+	// Real composites here never go through it and draw the HUD as before.
 	int nFramegenHudSlot = -1;
 	if ( framegen_hud_level() != 0u
 		&& vulkan_framegen_is_enabled()
@@ -16358,7 +16449,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			|| ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr ) ) )
 	{
 		nFramegenHudSlot = framegen_hud_record(
-			cmdBuffer.get(), compositeImage, frameInfo );
+			cmdBuffer.get(), compositeImage, pHudFrameInfo != nullptr ? pHudFrameInfo : frameInfo );
 	}
 
 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
@@ -16376,7 +16467,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// swapchain backend must key on. It early-outs when framegen is disabled, and
 	// refuses output-space history when the compositor does not own the ring.
 	if ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory );
+		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory, bHudFreeHistory );
 
 	if ( framegen_owns_output_ring() && pOutputOverride == nullptr && increment )
 	{
