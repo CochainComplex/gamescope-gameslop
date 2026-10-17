@@ -4210,6 +4210,9 @@ gamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()
 	CVulkanTexture::createFlags flags;
 	flags.bSampled = true;
 	flags.bTransferDst = true;
+	// A copy source too: upstream's Xwayland blit merge (MergeBlitsOverOverride) copies from the base texture, which
+	// on the dual-GPU route is this staged image.
+	flags.bTransferSrc = true;
 	if ( !pTexture->BInit( m_width, m_height, m_depth, m_drmFormat, flags,
 			nullptr, m_contentWidth, m_contentHeight ) )
 	{
