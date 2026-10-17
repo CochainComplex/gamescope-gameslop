@@ -144,9 +144,12 @@ void main() {
     }
     // Crisp four-sided dark outline; unlike an offset shadow, this does not
     // create a second text image. CGA always has it. Quiet/Mallsoft get it
-    // below 10% effective backing opacity, where a bright scene would swallow
-    // the light lettering (framegen_hud_outlined in hud.hpp mirrors this).
-    if (cga || opacity < 0.10) {
+    // below 10% explicit backing opacity, where a bright scene would swallow
+    // the light lettering. Integer compare on the encoded percent, exactly as
+    // framegen_hud_outlined in hud.hpp (a float compare at 10/100 may round
+    // either way on GPUs that lower the division to a reciprocal multiply).
+    bool lowBacking = encodedOpacity != 0u && encodedOpacity - 1u < 10u;
+    if (cga || lowBacking) {
         bool outline = !ink && (text_pixel(logical + uvec2(1u,0u))
             || text_pixel(logical - uvec2(1u,0u))
             || text_pixel(logical + uvec2(0u,1u))
