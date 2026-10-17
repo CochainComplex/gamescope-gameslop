@@ -168,6 +168,10 @@ Require non-overlapping active plane ranges and checked buffer bounds; compare
 known color patches after decoding, not just buffer counts or alternating hashes.
 The `pipewire_buffers` CPU contract exercises descriptor layout and invalid
 geometry when PipeWire support is built.
+Capture checks using software clients must also establish scene progress:
+reused software buffers need fresh per-commit uploads, while live DMA-BUF
+imports retain memoization. The `buffer_import` contract checks both paths,
+retained snapshot pixels and failed-import retries.
 PipeWire advertises its linear DMA-BUF option only when Vulkan reports support
 for the actual capture format, usage and image flags; otherwise its mapped
 MemFd option remains available. A consumer requiring unsupported DMA-BUF caps

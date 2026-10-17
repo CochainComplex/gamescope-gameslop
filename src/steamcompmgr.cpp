@@ -1847,16 +1847,20 @@ import_commit (
 		commit->fifo = false;
 	}
 
-	if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+	struct wlr_dmabuf_attributes dmabuf = {0};
+	const bool is_dmabuf = wlr_buffer_get_dmabuf( buf, &dmabuf );
+	if ( is_dmabuf )
 	{
-		// Going from OwningRc -> Rc now.
-		commit->vulkanTex = pTexture;
-		return commit;
+		if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+		{
+			// Going from OwningRc -> Rc now.
+			commit->vulkanTex = pTexture;
+			return commit;
+		}
 	}
 
-	struct wlr_dmabuf_attributes dmabuf = {0};
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
-	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+	if ( is_dmabuf )
 	{
 		if ( g_bDebugDualGpuRoute )
 		{
@@ -1884,7 +1888,9 @@ import_commit (
 
 	commit->vulkanTex = pOwnedTexture;
 
-	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
+	// DMA-BUF imports share live storage. CPU uploads are per-commit snapshots.
+	if ( is_dmabuf )
+		s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
 
 	return commit;
 }
