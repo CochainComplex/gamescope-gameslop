@@ -1098,14 +1098,16 @@ generating (so its GPU-time input never starves); the genuine "even x2 overruns"
 reactive pacing gate. It **never mutates** `g_eFramegenMode`/`g_eFramegenPipeline`/`g_nFramegenMultiplier`
 (those are the user's ceiling and size the pool); it only reads an *effective* config. The selected
 rung remains monotonic throughout each post-step hold. Afterward, 90 consecutive large-headroom
-decisions may re-probe exactly one adjacent richer rung, followed by probation and scene-local
-back-off. Native fixed-refresh recovery measures that headroom against full slot capacity; a
+decisions may re-probe exactly one adjacent richer rung, followed by probation and back-off. A
+rung that falls back during two probations is held out of reach (log `ladder holds rung`) until
+the next full reset (`vulkan_framegen_reset`: resize, format, mode or output remake); scene
+resets keep the escalated back-off, the failure counts and the hold. Native fixed-refresh recovery measures that headroom against full slot capacity; a
 phase-late decision does not erase the streak, and one isolated miss does not degrade.
 
 ### 4.5 History invalidation and priming
 
 `vulkan_framegen_invalidate_history` drops history and resets `nStableFrames=0`,
-`nDegradeSteps=0`, the learned rung costs (`framegenResetRungCosts`), and the retained ring slots on:
+`nDegradeSteps` (to 0, or to the recovery hold floor), the learned rung costs (`framegenResetRungCosts`), and the retained ring slots on:
 focus change, layer-count change, output-EOTF change (SDR↔HDR without a format change), long
 frame-gap (`k_ulFramegenMaxRealFrameGapNs`, a stall/load-screen), resolution/format change. **The
 first real frame after any invalidation only primes** (sets `valid=true` and returns

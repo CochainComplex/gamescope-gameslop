@@ -3,6 +3,7 @@
 #include "policy.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -35,6 +36,13 @@ inline constexpr uint32_t k_uDeadlineRecoveryProbationDecisions = 225u;
 inline constexpr uint32_t k_uDeadlineRecoveryMaxBackoffDecisions = 2'700u;
 inline constexpr uint64_t k_uDeadlineRecoveryKnownHeadroomPercent = 70u;
 inline constexpr uint64_t k_uDeadlineRecoveryColdHeadroomPercent = 50u;
+
+// Degrade once and hold: a rung which falls back during this many separate
+// probations is out of reach until the workload configuration changes (a full
+// reset). Probe failures are counted per rung for the whole configuration, not
+// per scene, so scene cuts cannot re-arm a quality toggle.
+inline constexpr uint32_t k_uDeadlineRecoveryMaxFailedProbes = 2u;
+inline constexpr uint32_t k_uDeadlineRecoveryTrackedRungs = 8u;
 
 // One-slot deadline pacing measures the two materially different causal
 // submission shapes independently.
@@ -440,9 +448,15 @@ struct DeadlineLadderEvaluation
 	bool tryDegrade;
 };
 
-// Scene-local recovery state. decisionsSinceClimb also measures from the last
-// failed recovery (a degradation), so every new climb is separated from that
-// transition by the current back-off. Default construction is the scene reset.
+static_assert( max_degrade_steps( GamescopeFramegenMode::Motion,
+	GamescopeFramegenPipeline::Guided, 4 ) < k_uDeadlineRecoveryTrackedRungs );
+
+// Recovery state. The streak, probation and climb clock are scene-local;
+// decisionsSinceClimb also measures from the last failed recovery (a
+// degradation), so every new climb is separated from that transition by the
+// current back-off. The escalated back-off, the per-rung probe failures and
+// the hold floor survive reset_ladder_recovery_scene. Default construction is
+// the full reset, for a new workload configuration only.
 struct RecoveryState_t
 {
 	uint32_t streak = 0u;
@@ -450,6 +464,12 @@ struct RecoveryState_t
 	uint32_t probationRemaining = 0u;
 	uint32_t decisionsSinceClimb = 0u;
 	bool blockedThresholdReported = false;
+	// The rung the open probation is probing.
+	uint32_t probeRung = 0u;
+	std::array<uint8_t, k_uDeadlineRecoveryTrackedRungs> failedProbes = {};
+	// Richest rung recovery may still reach. Ladder cost falls monotonically
+	// with the rung index, so a rung richer than a held one cannot fit either.
+	uint32_t holdFloor = 0u;
 };
 
 struct LadderRecoveryEvaluation_t
@@ -532,8 +552,10 @@ struct DeadlineMissEvaluation_t
 }
 
 // A degradation during probation is a failed recovery probe. Double the wait
-// for the rest of the scene (saturating at one minute), then measure the next
-// back-off from this fallback rather than from the preceding climb.
+// for the rest of the configuration (saturating at one minute), then measure
+// the next back-off from this fallback rather than from the preceding climb.
+// The k_uDeadlineRecoveryMaxFailedProbes-th failure of one rung holds the
+// ladder below it until the full reset.
 [[nodiscard]] constexpr RecoveryState_t note_ladder_recovery_degradation(
 	RecoveryState_t state )
 {
@@ -544,6 +566,15 @@ struct DeadlineMissEvaluation_t
 			? k_uDeadlineRecoveryMaxBackoffDecisions
 			: std::min( k_uDeadlineRecoveryMaxBackoffDecisions,
 				state.backoffDecisions * 2u );
+		if ( state.probeRung < k_uDeadlineRecoveryTrackedRungs )
+		{
+			uint8_t &failed = state.failedProbes[ state.probeRung ];
+			if ( failed < UINT8_MAX )
+				failed++;
+			if ( failed >= k_uDeadlineRecoveryMaxFailedProbes )
+				state.holdFloor = std::max(
+					state.holdFloor, state.probeRung + 1u );
+		}
 	}
 	state.streak = 0u;
 	state.probationRemaining = 0u;
@@ -553,13 +584,37 @@ struct DeadlineMissEvaluation_t
 }
 
 [[nodiscard]] constexpr RecoveryState_t commit_ladder_recovery(
-	RecoveryState_t state )
+	RecoveryState_t state, uint32_t targetRung )
 {
 	state.streak = 0u;
 	state.probationRemaining = k_uDeadlineRecoveryProbationDecisions;
 	state.decisionsSinceClimb = 0u;
 	state.blockedThresholdReported = false;
+	state.probeRung = targetRung;
 	return state;
+}
+
+struct LadderSceneReset_t
+{
+	RecoveryState_t state;
+	uint32_t startRung = 0u;
+};
+
+// A scene reset re-probes from the richest rung that is not held. It drops the
+// scene-local evidence but keeps the escalated back-off, the probe failures
+// and the hold. Starting richer than the current rung is itself a climb, so it
+// opens a probation for the start rung exactly as a committed recovery does.
+[[nodiscard]] constexpr LadderSceneReset_t reset_ladder_recovery_scene(
+	RecoveryState_t state, uint32_t currentRung )
+{
+	const uint32_t startRung = state.holdFloor;
+	state.streak = 0u;
+	state.probationRemaining = 0u;
+	state.decisionsSinceClimb = 0u;
+	state.blockedThresholdReported = false;
+	if ( startRung < currentRung )
+		state = commit_ladder_recovery( state, startRung );
+	return { state, startRung };
 }
 
 [[nodiscard]] constexpr uint64_t deadline_budget_ns( uint64_t availableNs )
@@ -660,15 +715,16 @@ evaluate_deadline_miss_hysteresis(
 // Prefer the richest measured rung which fits the full recovery budget. If no
 // richer rung is mature, preserve the adjacent one-rung cold probe. A mature
 // but non-fitting rung is returned only as blocking evidence, with no target.
+// Rungs richer than holdFloor are never considered.
 [[nodiscard]] constexpr LadderRecoveryTarget_t select_ladder_recovery_target(
 	std::span<const LadderRungCost_t> rungs, uint32_t currentRung,
-	uint64_t budgetNs )
+	uint64_t budgetNs, uint32_t holdFloor = 0u )
 {
 	LadderRecoveryTarget_t result = { currentRung, {} };
 	bool foundMature = false;
 	const uint32_t end = std::min<uint32_t>(
 		currentRung, static_cast<uint32_t>( rungs.size() ) );
-	for ( uint32_t rung = 0u; rung < end; rung++ )
+	for ( uint32_t rung = holdFloor; rung < end; rung++ )
 	{
 		const LadderRungCost_t sample = rungs[ rung ];
 		if ( sample.costNs == 0u || sample.samples < k_uDeadlineMinSamples )
@@ -683,7 +739,7 @@ evaluate_deadline_miss_hysteresis(
 			return { rung, sample };
 	}
 
-	if ( !foundMature && currentRung > 0u )
+	if ( !foundMature && currentRung > holdFloor )
 	{
 		result.rung = currentRung - 1u;
 		if ( result.rung < rungs.size() )
@@ -702,7 +758,7 @@ evaluate_deadline_miss_hysteresis(
 	uint32_t richerRungSamples, uint64_t budgetNs )
 {
 	state = advance_ladder_recovery_decision( state, true );
-	if ( currentDegradeSteps == 0u
+	if ( currentDegradeSteps <= state.holdFloor
 		|| !deadline_recovery_headroom(
 			currentRungCostNs, currentRungSamples,
 			richerRungCostNs, richerRungSamples, budgetNs ) )

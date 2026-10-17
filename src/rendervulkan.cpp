@@ -8154,9 +8154,11 @@ struct FramegenHistory_t
 	// multiplier notch). Never
 	// reaches "stop generating" — that is left to the reactive pacing gate below.
 	// nDegradeHold is a post-step cooldown so the new rung's cost folds into the
-	// measurement before the next step decision. Recovery is scene-local, climbs
-	// one adjacent rung only after sustained headroom, and exponentially backs off
-	// when a probe falls back during probation.
+	// measurement before the next step decision. Recovery climbs only after
+	// sustained headroom and exponentially backs off when a probe falls back
+	// during probation; a rung that fails k_uDeadlineRecoveryMaxFailedProbes
+	// probes is held out of reach until the next full reset (scene resets keep
+	// the back-off and the hold).
 	uint32_t nDegradeSteps = 0;
 	uint32_t nDegradeHold = 0;
 	gamescope::framegen::RecoveryState_t recovery;
@@ -8788,9 +8790,17 @@ static void framegen_recovery_note_degradation()
 {
 	if ( !framegen_recovery_active_for_path() )
 		return;
+	const uint32_t uPreviousFloor = g_framegenHistory.recovery.holdFloor;
 	g_framegenHistory.recovery =
 		gamescope::framegen::note_ladder_recovery_degradation(
 			g_framegenHistory.recovery );
+	// The floor only rises until the full reset, so this logs once per hold.
+	const uint32_t uFloor = g_framegenHistory.recovery.holdFloor;
+	if ( uFloor > uPreviousFloor )
+		vk_log.infof( "framegen: ladder holds rung %u: rung %u failed %u recovery probes",
+			uFloor, uFloor - 1u,
+			static_cast<uint32_t>(
+				g_framegenHistory.recovery.failedProbes[ uFloor - 1u ] ) );
 }
 
 static void framegen_log_ladder_recovery( uint32_t nMaxDegradeSteps,
@@ -8987,11 +8997,24 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.lastCompositeSeqNo = 0;
 	g_framegenHistory.nLastGeneratedSlot = 0;
 	g_framegenHistory.nLastGenerationGapVblanks = 0;
-	// Re-probe the configured pipeline from the top on a fresh scene and restore the base recovery
-	// delay; neither stale rung costs nor a prior scene's failed probes carry over.
-	g_framegenHistory.nDegradeSteps = 0;
+	// Re-probe from the richest rung that is not held on a fresh scene. Stale
+	// rung costs do not carry over; the escalated back-off and the failed-probe
+	// hold do, so scene cuts cannot re-arm a quality toggle. Only the full reset
+	// (vulkan_framegen_reset: resize, format, mode or output remake) clears them.
+	if ( framegen_recovery_active_for_path() )
+	{
+		const gamescope::framegen::LadderSceneReset_t scene =
+			gamescope::framegen::reset_ladder_recovery_scene(
+				g_framegenHistory.recovery, g_framegenHistory.nDegradeSteps );
+		g_framegenHistory.nDegradeSteps = scene.startRung;
+		g_framegenHistory.recovery = scene.state;
+	}
+	else
+	{
+		g_framegenHistory.nDegradeSteps = 0;
+		g_framegenHistory.recovery = {};
+	}
 	g_framegenHistory.nDegradeHold = 0;
-	g_framegenHistory.recovery = {};
 	// Forget learned per-rung costs so the new scene is measured afresh rather than
 	// inheriting the old scene's "this rung overruns" verdicts.
 	g_device.framegenResetRungCosts();
@@ -11267,6 +11290,7 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 			g_framegenHistory.recovery.probationRemaining,
 		.ladderRecoveryDecisionsSinceClimb =
 			g_framegenHistory.recovery.decisionsSinceClimb,
+		.ladderRecoveryHoldFloor = g_framegenHistory.recovery.holdFloor,
 		.biasTenthsMs = static_cast<int32_t>( std::llround( flBiasTenths ) ),
 		.deadlineHitPercent = uHitPercent,
 		.pacingSdTenthsMs = static_cast<uint32_t>( std::llround( flPacingSdTenths ) ),
@@ -13640,7 +13664,8 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 			}
 			const gamescope::framegen::LadderRecoveryTarget_t recoveryTarget =
 				gamescope::framegen::select_ladder_recovery_target(
-					rungCosts, nCurrentRung, ulRecoveryBudgetNs );
+					rungCosts, nCurrentRung, ulRecoveryBudgetNs,
+					g_framegenHistory.recovery.holdFloor );
 			const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
 				gamescope::framegen::evaluate_ladder_recovery(
 					g_framegenHistory.recovery, nCurrentRung,
@@ -13660,7 +13685,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				g_framegenHistory.nDegradeSteps = recoveryTarget.rung;
 				g_framegenHistory.recovery =
 					gamescope::framegen::commit_ladder_recovery(
-						g_framegenHistory.recovery );
+						g_framegenHistory.recovery, recoveryTarget.rung );
 				framegen_log_ladder_recovery(
 					nMaxCausalDegradeSteps, nCurrentRung,
 					uEvidenceDecisions );
@@ -15582,7 +15607,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		}
 		const gamescope::framegen::LadderRecoveryTarget_t recoveryTarget =
 			gamescope::framegen::select_ladder_recovery_target(
-				rungCosts, nCurrentRung, ulRecoveryBudgetNs );
+				rungCosts, nCurrentRung, ulRecoveryBudgetNs,
+				g_framegenHistory.recovery.holdFloor );
 
 		const gamescope::framegen::LadderRecoveryEvaluation_t recovery =
 			gamescope::framegen::evaluate_ladder_recovery(
@@ -15602,7 +15628,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			g_framegenHistory.nDegradeSteps = recoveryTarget.rung;
 			g_framegenHistory.recovery =
 				gamescope::framegen::commit_ladder_recovery(
-					g_framegenHistory.recovery );
+					g_framegenHistory.recovery, recoveryTarget.rung );
 			framegen_log_ladder_recovery(
 				nMaxDegradeSteps, nCurrentRung, uEvidenceDecisions );
 		}
