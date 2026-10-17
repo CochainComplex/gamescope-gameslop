@@ -187,11 +187,11 @@ static uint32_t framegen_hud_level()
 
 static bool framegen_hud_cga()
 {
-	static const bool enabled = []()
-	{
-		const char *style = getenv( "GAMESCOPE_FRAMEGEN_HUD_STYLE" );
-		return style != nullptr && strcmp( style, "cga" ) == 0;
-	}();
+	// Quiet and Mallsoft share the shader's muted palette; only CGA differs.
+	static const bool enabled = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD_STYLE",
+		gamescope::framegen::FramegenHudStyle::Quiet,
+		gamescope::framegen::parse_hud_style_setting, "quiet" )
+		== gamescope::framegen::FramegenHudStyle::Cga;
 	return enabled;
 }
 
@@ -15238,6 +15238,29 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	return true;
 }
 
+// The HUD-free history split in vulkan_composite is inactive under bidir, while
+// the colour probe records, with GAMESCOPE_FRAMEGEN_CURSOR=0, when the owned
+// pool is busy or when the ring image lacks transferSrc. The composited HUD
+// then becomes output-space history: motion estimation, generated frames and
+// online training see it. Not redesigned here (bidir flips its history
+// images); documented, and said once so a quality capture can be judged.
+static void framegen_note_hud_in_history()
+{
+	static bool s_bLogged = false;
+	if ( s_bLogged )
+		return;
+	s_bLogged = true;
+	const char *pszReason = vulkan_framegen_bidir_active()
+		? "bidirectional interpolation flips its history images"
+		: framegen_color_record_dir() != nullptr
+			? "the colour probe is recording"
+			: !framegen_cursor_split_enabled()
+				? "GAMESCOPE_FRAMEGEN_CURSOR=0 disables the split"
+				: "the history pool was busy or the output image lacks transferSrc";
+	vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
+		pszReason );
+}
+
 // bCursorFreeRealFrame: output-space mode only — pRealFrame carries no cursor,
 // either because the composite split it out (vulkan_composite) or because the
 // stack had no cursor layer to begin with. It is the caller's verdict, not a
@@ -15674,6 +15697,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		g_framegenHistory.bCursorFreeCurrent = bCursorFreeRealFrame;
 		g_framegenHistory.bHudFreePrevious = g_framegenHistory.bHudFreeCurrent;
 		g_framegenHistory.bHudFreeCurrent = bHudFreeRealFrame;
+		if ( !bHudFreeRealFrame && framegen_hud_level() != 0u )
+			framegen_note_hud_in_history();
 	}
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 

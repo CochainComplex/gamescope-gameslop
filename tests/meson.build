@@ -55,7 +55,9 @@ test_framegen_deadline = executable(
 	['framegen_deadline.cpp'],
 	include_directories: [srcdir],
 	dependencies: [catch2_dep],
-	cpp_args: gamescope_cpp_args,
+	# The CGA Bayer test compares hud.hpp with the shader source itself.
+	cpp_args: gamescope_cpp_args + ['-DFRAMEGEN_HUD_SHADER_PATH="@0@"'.format(
+		meson.project_source_root() / 'src' / 'shaders' / 'cs_framegen_hud.comp')],
 )
 test('framegen_deadline', test_framegen_deadline)
 

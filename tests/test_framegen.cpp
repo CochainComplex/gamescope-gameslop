@@ -589,6 +589,20 @@ static void test_numeric_settings_contract()
 	CHECK( parse_color_probe_sweep_setting( "endpoint-trace" ) == FramegenColorProbeSweep::EndpointTrace );
 	CHECK( std::string_view{ color_probe_sweep_name( FramegenColorProbeSweep::Occlusion ) } == "occlusion" );
 	CHECK( std::string_view{ color_probe_sweep_name( FramegenColorProbeSweep::EndpointTrace ) } == "endpoint-trace" );
+
+	// HUD style: the three launcher values, case-insensitive; typos are
+	// rejected so the renderer keeps Quiet and logs the value once.
+	CHECK( !parse_hud_style_setting( nullptr ).has_value() );
+	CHECK( !parse_hud_style_setting( "" ).has_value() );
+	CHECK( parse_hud_style_setting( "quiet" ) == FramegenHudStyle::Quiet );
+	CHECK( parse_hud_style_setting( "mallsoft" ) == FramegenHudStyle::Mallsoft );
+	CHECK( parse_hud_style_setting( "cga" ) == FramegenHudStyle::Cga );
+	CHECK( parse_hud_style_setting( "CGA" ) == FramegenHudStyle::Cga );
+	CHECK( parse_hud_style_setting( "Cga" ) == FramegenHudStyle::Cga );
+	CHECK( parse_hud_style_setting( "QUIET" ) == FramegenHudStyle::Quiet );
+	CHECK( parse_hud_style_setting( "MallSoft" ) == FramegenHudStyle::Mallsoft );
+	for ( const char *pszInvalid : { "cg", "cgaa", " cga", "cga ", "ega", "1", "quiet\n", "mall soft" } )
+		CHECK( !parse_hud_style_setting( pszInvalid ).has_value() );
 }
 
 static void test_adaptation_policy()

@@ -288,7 +288,7 @@ gamescope command (for example `GAMESCOPE_FRAMEGEN_HUD=2 gamescope ...`).
 | `GAMESCOPE_FRAMEGEN_BIDIR` | on/off (off) | Bidirectional interpolation. Needs motion mode on a backend that owns its output images (DRM, nested Wayland); excluded by VRR hybrid; with `_BASE`, decided per scene. |
 | `GAMESCOPE_FRAMEGEN_BASE` | on/off (off; forced on, whatever you set, on Vulkan-swapchain backends such as SDL) | Base-layer generation with late overlay composite. With `_BIDIR`, decided per scene: base-layer scenes run causal, the others bidirectional. |
 | `GAMESCOPE_FRAMEGEN_VRR_HYBRID` | on/off (off) | Keeps adaptive sync with frame generation. Needs a dedicated framegen queue; on a shared queue it is ignored and the log says so. |
-| `GAMESCOPE_FRAMEGEN_CURSOR` | on/off (on) | Keeps the cursor out of generated history and draws the current cursor on every generated frame. Off bakes the cursor into history, so it moves only with real composites. |
+| `GAMESCOPE_FRAMEGEN_CURSOR` | on/off (on) | Keeps the cursor out of generated history and draws the current cursor on every generated frame. Off bakes the cursor (and the HUD, see [HUD rows](#hud-rows)) into history, so it moves only with real composites. |
 | `GAMESCOPE_FRAMEGEN_RECOVER` | on/off (on) | Lets the degradation ladder step back up after sustained headroom. Off holds a stepped-down rung until the history is invalidated. No effect with `GAMESCOPE_FRAMEGEN_BIDIR` or VRR hybrid. |
 | `GAMESCOPE_FRAMEGEN_SHARP_FALLBACK` | on/off (on) | Where the motion evidence is weak, moves the real frame only as far as the confidence allows instead of crossfading the motion warp with the color extrapolation; `0` restores the crossfade (double edges and blur at confidence changes). Applies to the motion-mode pipelines `warp`, `checked` and `learned` (and to `predict` only until it has history). `guided` and bidirectional mode use their own shaders and are not affected. Shows only real pixels, so HDR is unaffected; about 10% cheaper per generated frame at 1440p and 2160p, equal at 1080p (Radeon 890M); frays edges on dense particle swarms. |
 | `GAMESCOPE_FRAMEGEN_FIELD_FINE` | on/off (off; only has an effect with `warp` and `checked`) | Uses a finer motion field, 1/4 of the output size instead of 1/8: one more pyramid level, 4x the field texels and one more pyramid dispatch and refinement per direction. Ignored for `learned`, `predict`, `guided` and `spatial`, and `GAMESCOPE_FRAMEGEN_RECORD` is ignored while it is on. Looked crisper on a sharp-edged shooter but blocky on dense particle swarms, so it stays opt-in. |
@@ -303,7 +303,7 @@ Tuning and experimental variables (`FB_TOL`, `DEBUG_EVERY`, `NET_LR`, `BIDIR_OCC
 | `GAMESCOPE_FRAMEGEN_HUD` | 0 to 2 (0) | On-screen HUD detail. See [HUD rows](#hud-rows). |
 | `GAMESCOPE_FRAMEGEN_HUD_SCALE` | 0 to 6 (0) | HUD scale. `0` means automatic: 2 to 3 based on output height (height / 720, clamped); explicit `1` is available for smaller text. |
 | `GAMESCOPE_FRAMEGEN_HUD_CORNER` | `tl`/`tr`/`bl`/`br`/`bc` (`br`) | HUD position. |
-| `GAMESCOPE_FRAMEGEN_HUD_STYLE` | `quiet`/`mallsoft`/`cga` (`quiet`) | HUD appearance at launch. Quiet/Mallsoft use the muted translucent palette; CGA uses cyan-to-magenta ordered pixel dithering with black/white lettering and the same text/graphs. Also set by the menu preset launcher. |
+| `GAMESCOPE_FRAMEGEN_HUD_STYLE` | `quiet`/`mallsoft`/`cga`, any case (`quiet`) | HUD appearance at launch. Quiet/Mallsoft use the muted translucent palette; CGA uses cyan-to-magenta ordered pixel dithering with black/white lettering and the same text/graphs. Also set by the menu preset launcher. |
 | `GAMESCOPE_FRAMEGEN_NET` | path | Offline weights for the learned refiner: a bare GSFR blob from `scripts/framegen-net-train.py`. It is the starting point for every input encoding the profile has no set for. A per-game profile is rejected here; pass it as `NET_PROFILE`. |
 | `GAMESCOPE_FRAMEGEN_NET_EVERY` | >= 1 (1) | Train on every Nth real frame. Use `2` on an iGPU-class present GPU (pacing stays equal; it played best in the real-game test) and `1` on a desktop card. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE` | path | Per-game profile the in-situ net loads and, with `NET_ONLINE`, saves. Without `NET_ONLINE` it is served read-only. Give each game its own file. It holds one weight set per input encoding: the composited output in SDR, in HDR10 (PQ), or with colour management off, or the game's base layer by colourspace. A set is only served and trained under its own encoding. Spatial uses a separate role-keyed set inside this same file; the other learned pipelines share the legacy set. Format GSFP v1; any other file, including profiles from builds before 2026-10-17, is ignored and replaced by a fresh profile on the first save. |
@@ -384,9 +384,37 @@ places it (bottom right by default). The violet backing is only 14% opaque (86% 
 
 `GAMESCOPE_FRAMEGEN_HUD_OPACITY=0..100` overrides background opacity only;
 0 makes the backing clear, 100 makes it solid, and an unset value uses the style
-default (14% Quiet/Mallsoft, 36% CGA). Text remains independently readable.
-CGA uses white lettering with a black pixel outline, wider row spacing, and a
-cyan-to-magenta ordered dither. HUD Text Size in the menu offers Auto or 1–6×.
+default (14% Quiet/Mallsoft, 36% CGA). CGA uses white lettering with wider row
+spacing and a cyan-to-magenta ordered dither. Its 1-pixel black outline is
+always present. Quiet and Mallsoft lettering gets the same 1-pixel dark outline
+when the effective backing opacity is below 10% (`GAMESCOPE_FRAMEGEN_HUD_OPACITY`
+0 to 9; 0% in the menu), so it stays readable over bright scenes. At 10% and
+above (including the automatic 14%), Quiet and Mallsoft lettering has no outline
+and relies on the backing. The outline colour goes through the same HDR colour
+path as the rest of the HUD (blended in linear light, PQ-encoded on HDR
+outputs). HUD Text Size in the menu offers Auto or 1–6×.
+`GAMESCOPE_FRAMEGEN_HUD_STYLE` is case-insensitive; an unknown value keeps
+Quiet and is logged once.
+
+**HUD and generation history.** Normally the HUD is kept out of the frames that
+frame generation learns from and warps ("history"): the real frame is copied
+before the HUD is drawn, and the live HUD is drawn onto every generated frame.
+This HUD-free history is not available, and the HUD is part of the real frame's
+history, in these cases: bidirectional interpolation
+(`GAMESCOPE_FRAMEGEN_BIDIR`; its history images are the flipped output images),
+while the colour probe records (`GAMESCOPE_FRAMEGEN_RECORD_COLOR`), with
+`GAMESCOPE_FRAMEGEN_CURSOR=0` (the HUD split rides on the cursor split), for a
+frame where the owned history image pool is busy, and when the output image
+does not support transfer-source copies. Base-layer scenes
+(`GAMESCOPE_FRAMEGEN_BASE`) are not affected: they take history from the game
+layer, which never contains the HUD. When the HUD is in history, motion
+estimation, generated frames, and the learned net's online training see the HUD
+box. The text changes at most once per second, so it reads as a static overlay,
+but a large or opaque HUD (for example CGA at 36% or a high
+`GAMESCOPE_FRAMEGEN_HUD_OPACITY`) covers more of the scene that the estimator
+sees. gamescope logs one info line ("framegen: HUD is in real-frame history
+...") the first time this happens, naming the reason. For quality measurements
+under bidir or the colour probe, keep the HUD off or small.
 
 Compact fields use cyan labels, colons and bright measured values. Spatial is
 marked `[EXP]` when shown. The built-in `spatial-experimental` menu preset

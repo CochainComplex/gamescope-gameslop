@@ -9,7 +9,9 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
@@ -221,6 +223,15 @@ TEST_CASE( "CGA HUD uses the matching bounded ABI and ordered two-color fade", "
 	CHECK( clear.text == solid.text );
 	CHECK( clear.font == solid.font );
 	CHECK( make_framegen_hud_uniform( text, false, false, 50u ).style == ( 51u << 8u ) );
+	// Outline: always for CGA; Quiet/Mallsoft only below 10% backing, never
+	// for the automatic 14%.
+	CHECK( framegen_hud_outlined( true ) );
+	CHECK( framegen_hud_outlined( true, 100u ) );
+	CHECK( framegen_hud_outlined( false, 0u ) );
+	CHECK( framegen_hud_outlined( false, 9u ) );
+	CHECK_FALSE( framegen_hud_outlined( false, 10u ) );
+	CHECK_FALSE( framegen_hud_outlined( false, 100u ) );
+	CHECK_FALSE( framegen_hud_outlined( false ) );
 
 }
 
@@ -301,6 +312,17 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	buildIdentity.version = "0.1.0+96ad25e89+";
 	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
 		"GIT: 96ad25e89+" ) != std::string_view::npos );
+	// A reachable tag makes describe longer than 16 characters; the tail
+	// (hash and dirty marker) is what names the binary, so it is kept.
+	buildIdentity.version = "3.16.14+v3.16.1-120-gabcdef123+";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).ends_with(
+		"| GIT: -120-gabcdef123+" ) );
+	buildIdentity.version = "3.16.14+v3.16.1-120-gabcdef123";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).ends_with(
+		"| GIT: 1-120-gabcdef123" ) );
+	buildIdentity.version = "0123456789abcdef";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).ends_with(
+		"| GIT: 0123456789abcdef" ) );
 	buildIdentity.version = nullptr;
 	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
 		"GIT: unknown" ) != std::string_view::npos );
@@ -332,6 +354,51 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	CHECK( training.lines[4].data() ==
 		"HIT: " + std::string( 12, '\x08' ) + " | JITTER: " + std::string( 12, '\x08' ) );
 	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
+}
+
+TEST_CASE( "CGA HUD Bayer table matches cs_framegen_hud.comp", "[framegen][hud]" )
+{
+	// The shader keeps its own copy of the table; read it from the source so
+	// changing either copy alone fails here.
+	std::ifstream shader( FRAMEGEN_HUD_SHADER_PATH );
+	REQUIRE( shader.is_open() );
+	const std::string source( ( std::istreambuf_iterator<char>( shader ) ),
+		std::istreambuf_iterator<char>() );
+	const std::string_view marker = "uint[16](";
+	const size_t first = source.find( marker );
+	REQUIRE( first != std::string::npos );
+	REQUIRE( source.find( marker, first + marker.size() ) == std::string::npos );
+
+	std::vector<uint32_t> parsed;
+	size_t pos = first + marker.size();
+	for ( ;; )
+	{
+		while ( pos < source.size() && ( source[pos] == ' ' || source[pos] == '\t' ) )
+			++pos;
+		REQUIRE( pos < source.size() );
+		REQUIRE( ( source[pos] >= '0' && source[pos] <= '9' ) );
+		uint32_t value = 0u;
+		while ( pos < source.size() && source[pos] >= '0' && source[pos] <= '9' )
+			value = value * 10u + static_cast<uint32_t>( source[pos++] - '0' );
+		if ( pos < source.size() && ( source[pos] == 'u' || source[pos] == 'U' ) )
+			++pos;
+		REQUIRE( pos < source.size() );
+		REQUIRE( ( source[pos] == ',' || source[pos] == ')' ) );
+		parsed.push_back( value );
+		if ( source[pos++] == ')' )
+			break;
+	}
+
+	REQUIRE( parsed.size() == k_uFramegenHudCgaBayer.size() );
+	for ( size_t i = 0u; i < parsed.size(); ++i )
+	{
+		CAPTURE( i );
+		CHECK( parsed[i] == k_uFramegenHudCgaBayer[i] );
+	}
+	std::vector<uint32_t> sorted = parsed;
+	std::sort( sorted.begin(), sorted.end() );
+	for ( uint32_t i = 0u; i < sorted.size(); ++i )
+		CHECK( sorted[i] == i );
 }
 
 TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
