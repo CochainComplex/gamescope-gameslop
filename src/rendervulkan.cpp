@@ -13687,7 +13687,7 @@ struct FramegenCausalRungSelection_t
 static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs,
 	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline,
-	uint64_t ulNativeSlotBudgetNs )
+	uint64_t ulNativeSlotBudgetNs, uint64_t ulShortfallSlotBudgetNs )
 {
 	FramegenCausalRungSelection_t result;
 	// A multiplier notch cannot reduce a one-slot submission. Stop this ladder
@@ -13820,30 +13820,37 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	}
 
 	// The admission gate above remains tied to this decision's actual remaining
-	// time. If the mature rung fits a normally planned native slot, a late-phase
-	// decision is not capacity evidence: skip it without degrading or resetting
-	// the recovery streak, and try again at the normal phase.
+	// time. If the mature rung fits a normally planned slot (native: the KMS
+	// commit budget; nested: the refresh interval less the compositor's wake
+	// lead), a late-phase decision is not capacity evidence: skip it without
+	// degrading or resetting the recovery streak, and try again at the normal
+	// phase. Nested decisions hit this when the learned present bias moves the
+	// slot's wake towards the provisional (raw-vblank) start bound.
+	//
+	// Otherwise retain the existing post-degradation hold. Known work that
+	// misses this slot's actual remaining budget is skipped rather than
+	// submitted late; each such decision still advances the hold just as the
+	// old per-frame evaluator did, so the ladder cannot deadlock at an
+	// over-budget rung.
 	const uint64_t ulDecisionStartNs = std::max(
 		ulNowNs, ulStartEstimateNs );
 	const uint64_t ulRemainingBudgetNs = plan.wakeNs > ulDecisionStartNs
 		? gamescope::framegen::deadline_budget_ns(
 			plan.wakeNs - ulDecisionStartNs )
 		: 0u;
-	if ( !bDegradeForPriorMiss && ulNativeSlotBudgetNs != 0u
-		&& gamescope::framegen::deadline_shortfall_is_phase_only(
-			result.ulCostNs, result.uSamples,
-			ulRemainingBudgetNs, ulNativeSlotBudgetNs ) )
-		return result;
-
-	// Retain the existing post-degradation hold. Known work that misses this
-	// slot's actual remaining budget is skipped rather than submitted late; each
-	// such decision still advances the hold just as the old per-frame evaluator
-	// did, so the ladder cannot deadlock at an over-budget rung.
-	if ( !bDegradeForPriorMiss && g_framegenHistory.nDegradeHold > 0u )
+	switch ( gamescope::framegen::causal_shortfall_action(
+		bDegradeForPriorMiss, result.ulCostNs, result.uSamples,
+		ulRemainingBudgetNs, ulShortfallSlotBudgetNs,
+		g_framegenHistory.nDegradeHold ) )
 	{
-		g_framegenHistory.nDegradeHold--;
-		framegen_recovery_note_capacity_failure();
-		return result;
+		case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly:
+			return result;
+		case gamescope::framegen::CausalShortfallAction_t::SkipHeld:
+			g_framegenHistory.nDegradeHold--;
+			framegen_recovery_note_capacity_failure();
+			return result;
+		case gamescope::framegen::CausalShortfallAction_t::Degrade:
+			break;
 	}
 
 	// Select one new monotonic rung for this decision. Mature non-fitting rungs
@@ -14045,9 +14052,17 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			// subtract. Keep native miss hysteresis active against the maximum
 			// refresh-slot budget; warm-up is far shorter than recovery evidence.
 			: gamescope::framegen::deadline_budget_ns( ulVblankIntervalNs );
+	// Capacity reference for classifying a budget shortfall. Nested keeps its
+	// immediate miss handling and remaining-time recovery budget; only the
+	// phase-only skip gains a slot reference (its wake lead, see
+	// nested_slot_budget_ns).
+	const uint64_t ulShortfallSlotBudgetNs = bNativeKmsTiming
+		? ulNativeSlotBudgetNs
+		: gamescope::framegen::nested_slot_budget_ns( ulVblankIntervalNs,
+			rawGrid.D0 > rawGrid.W0 ? rawGrid.D0 - rawGrid.W0 : 0u );
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
 		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,
-		ulNativeSlotBudgetNs );
+		ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );
 	if ( !rung.bAdmit )
 	{
 		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
