@@ -2961,7 +2961,7 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 	assert(src->width() == dst->width());
 	assert(src->height() == dst->height());
 
-	VkImageCopy region = {
+	std::array<VkImageCopy, 2> regions = {{ {
 		.srcSubresource = {
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.layerCount = 1
@@ -2975,9 +2975,21 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 			.height = src->height(),
 			.depth = 1
 		},
-	};
+	} }};
+	uint32_t nRegions = 1;
+	if ( src->isYcbcr() )
+	{
+		regions[0].srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+		regions[0].dstSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+		regions[1] = regions[0];
+		regions[1].srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+		regions[1].dstSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+		regions[1].extent.width = div_roundup( src->width(), 2u );
+		regions[1].extent.height = div_roundup( src->height(), 2u );
+		nRegions = 2;
+	}
 
-	copyImageRegions(std::move(src), std::move(dst), std::span<const VkImageCopy>(&region, 1));
+	copyImageRegions(std::move(src), std::move(dst), std::span<const VkImageCopy>(regions.data(), nRegions));
 }
 
 void CVulkanCmdBuffer::copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions)

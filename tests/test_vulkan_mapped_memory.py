@@ -12,6 +12,95 @@ def between(source, start, end):
     return source[begin:source.index(end, begin)]
 
 
+def check_copy_image_contracts(source, header, directory):
+    """Execute production region selection; record its region/owner handoff."""
+    body = between(source, "void CVulkanCmdBuffer::copyImage(",
+                   "\nvoid CVulkanCmdBuffer::copyImageRegions(")
+    (directory / "copy_image.inc").write_text(body)
+    roundup = between(header, "static inline uint32_t div_roundup(", "\n}") + "\n}\n"
+    (directory / "copy_roundup.inc").write_text(roundup)
+    fixture = r'''
+#include <vulkan/vulkan.h>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <utility>
+#include <vector>
+namespace gamescope { template<class T> using Rc = std::shared_ptr<T>; }
+#include "copy_roundup.inc"
+constexpr uint32_t DRM_FORMAT_NV12 = 842094158;
+struct CVulkanTexture {
+    VkFormat pixel_format;
+    uint32_t w, h;
+    // Deliberately unrelated byte pitches: VkImageCopy uses texel extents.
+    uint32_t luma_pitch, chroma_pitch;
+    uint32_t width() const { return w; }
+    uint32_t height() const { return h; }
+    VkFormat format() const { return pixel_format; }
+    bool isYcbcr() const { return pixel_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM; }
+    uint32_t drmFormat() const { return isYcbcr() ? DRM_FORMAT_NV12 : 0; }
+};
+struct CVulkanCmdBuffer {
+    unsigned calls = 0;
+    std::vector<VkImageCopy> regions;
+    std::vector<gamescope::Rc<CVulkanTexture>> owners;
+    void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
+    void copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst,
+                          std::span<const VkImageCopy> copies) {
+        ++calls;
+        regions.assign(copies.begin(), copies.end());
+        owners.emplace_back(std::move(src)); owners.emplace_back(std::move(dst));
+    }
+};
+#include "copy_image.inc"
+int main() {
+    for (VkFormat format : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT,
+                            VK_FORMAT_R32_SFLOAT, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM}) {
+        for (const auto size : {std::array<uint32_t, 2>{800, 600}, {801, 601}, {1, 1}, {2, 3}}) {
+            for (uint32_t padding : {0u, 96u}) {
+                auto src = std::make_shared<CVulkanTexture>(CVulkanTexture{format, size[0], size[1], size[0]+padding, size[0]+2*padding});
+                auto dst = std::make_shared<CVulkanTexture>(CVulkanTexture{format, size[0], size[1], size[0]+3*padding, size[0]+4*padding});
+                std::weak_ptr<CVulkanTexture> src_owner = src, dst_owner = dst;
+                CVulkanCmdBuffer cmd;
+                cmd.copyImage(src, dst);
+                assert(cmd.calls == 1 && cmd.owners.size() == 2);
+                assert(cmd.owners[0].get() == src.get() && cmd.owners[1].get() == dst.get());
+                const bool nv12 = format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+                assert(cmd.regions.size() == (nv12 ? 2u : 1u));
+                for (size_t i = 0; i < cmd.regions.size(); ++i) {
+                    const auto &region = cmd.regions[i];
+                    const VkImageAspectFlags aspect = nv12 ? (i ? VK_IMAGE_ASPECT_PLANE_1_BIT : VK_IMAGE_ASPECT_PLANE_0_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+                    for (const auto &subresource : {region.srcSubresource, region.dstSubresource}) {
+                        assert(subresource.aspectMask == aspect);
+                        assert(subresource.mipLevel == 0 && subresource.baseArrayLayer == 0 && subresource.layerCount == 1);
+                    }
+                    for (const auto &offset : {region.srcOffset, region.dstOffset})
+                        assert(offset.x == 0 && offset.y == 0 && offset.z == 0);
+                    assert(region.extent.width == (i ? (size[0]+1)/2 : size[0]));
+                    assert(region.extent.height == (i ? (size[1]+1)/2 : size[1]));
+                    assert(region.extent.depth == 1);
+                }
+                src.reset(); dst.reset();
+                assert(!src_owner.expired() && !dst_owner.expired());
+                cmd.owners.clear();
+                assert(src_owner.expired() && dst_owner.expired());
+            }
+        }
+    }
+}
+'''
+    path = directory / "copy_image.cpp"
+    path.write_text(fixture)
+    binary = directory / "copy_image"
+    subprocess.run(shlex.split(os.environ.get("CXX", "c++"))
+                   + ["-std=c++20", "-Wall", "-Wextra", "-Werror",
+                      "-Wno-missing-field-initializers", "-I", str(directory), str(path),
+                      "-o", str(binary)], check=True, timeout=60)
+    subprocess.run([str(binary)], check=True, timeout=10)
+
+
 def check_nv12_contracts(source, header, directory):
     """Execute production view/export/pool branches with real Vulkan ABI types."""
     init = between(source, "bool CVulkanTexture::BInit(", "bool CVulkanTexture::BInitFromSwapchain(")
@@ -410,6 +499,7 @@ def main():
                           "-o", str(binary)], check=True, timeout=60)
         subprocess.run([str(binary)], check=True, timeout=10)
         check_nv12_contracts(source, header, directory)
+        check_copy_image_contracts(source, header, directory)
 
 
 if __name__ == "__main__":
