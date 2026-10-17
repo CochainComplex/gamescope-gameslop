@@ -1667,6 +1667,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 		}
 	}
 
+	// An 8-bit pick silently costs HDR output and the 10-bit dithering above, so say what was picked.
+	drm_log.infof( "scanout formats: primary %.4s (0x%08" PRIX32 "), overlay %.4s (0x%08" PRIX32 ")",
+		(const char *)&g_nDRMFormat, g_nDRMFormat, (const char *)&g_nDRMFormatOverlay, g_nDRMFormatOverlay );
+
 	// Create a pipe to wake the flip handler poll for immediate exit.
 	// Closing the write end will cause the read end to get POLLHUP.
 	if ( pipe2( g_page_flip_pipe_fds, O_CLOEXEC ) != 0 ) {
