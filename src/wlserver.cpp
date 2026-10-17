@@ -1568,7 +1568,13 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 static void create_gamescope_control( void )
 {
 	wl_global_create( wlserver.display, &gamescope_control_interface, gamescope_control_interface.version, NULL, gamescope_control_bind );
-	gamescope::create_gpu_diagnostics_global(wlserver.display);
+	// GPU identity diagnostics are opt-in (GAMESCOPE_GPU_DIAGNOSTICS=1); by
+	// default games and other clients cannot read GPU, PCI, node or build data.
+	const char *pszGpuDiagnostics = getenv( "GAMESCOPE_GPU_DIAGNOSTICS" );
+	if ( gamescope::create_gpu_diagnostics_global_if_requested( wlserver.display, pszGpuDiagnostics ) )
+		wl_log.infof( "GAMESCOPE_GPU_DIAGNOSTICS: gamescope_gpu_diagnostics_v1 is advertised to every Wayland client (GPU names, PCI addresses, render nodes, drivers, build)" );
+	else if ( pszGpuDiagnostics != nullptr && !gamescope::framegen::parse_bool_setting( pszGpuDiagnostics ).has_value() )
+		wl_log.errorf( "ignoring invalid GAMESCOPE_GPU_DIAGNOSTICS=\"%s\" (using off)", pszGpuDiagnostics );
 }
 
 ////////////////////////

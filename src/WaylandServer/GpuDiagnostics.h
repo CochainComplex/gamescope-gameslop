@@ -3,6 +3,7 @@
 #include <wayland-server.h>
 #include "gamescope-control-protocol.h"
 #include "framegen/gpu_diagnostics.hpp"
+#include "framegen/settings.hpp"
 
 // Read-only CPU snapshot transport; independent of renderer and backend APIs.
 namespace gamescope {
@@ -32,5 +33,15 @@ static void gpu_diagnostics_bind(wl_client *client, void *, uint32_t version, ui
 
 inline void create_gpu_diagnostics_global(wl_display *display) {
     wl_global_create(display,&gamescope_gpu_diagnostics_v1_interface,1,nullptr,gpu_diagnostics_bind);
+}
+
+// Opt-in: the global is visible to every Wayland client (games included) and
+// names GPUs, PCI addresses, render nodes, drivers and the build. It is
+// advertised only when GAMESCOPE_GPU_DIAGNOSTICS is on (1/true/yes/on); unset,
+// off or an invalid value keeps it hidden. Returns whether it was created.
+inline bool create_gpu_diagnostics_global_if_requested(wl_display *display, const char *value) {
+    if (!gamescope::framegen::parse_bool_setting(value).value_or(false)) return false;
+    create_gpu_diagnostics_global(display);
+    return true;
 }
 } // namespace gamescope

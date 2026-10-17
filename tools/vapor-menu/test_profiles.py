@@ -65,6 +65,7 @@ class Profiles(unittest.TestCase):
             self.assertEqual(env["GAMESCOPE_FRAMEGEN_HUD_OPACITY"], "70")
             self.assertEqual(env["GAMESCOPE_FRAMEGEN_HUD_SCALE"], "3")
             self.assertEqual(env["GAMESCOPE_FRAMEGEN_NET_ONLINE"], "0")
+            self.assertEqual(env["GAMESCOPE_GPU_DIAGNOSTICS"], "1")  # GPU DETAILS page.
             self.assertNotIn("LD_LIBRARY_PATH", env)
             self.assertIn("LD_LIBRARY_PATH=/old/prefix", command)  # Restored only for the game.
             self.assertFalse(Path(args.net_profile).exists())

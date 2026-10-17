@@ -168,7 +168,7 @@ static Artwork paint(int width, int height, int selected, bool mallsoft, int opa
             text(px,70,heading,rose);
             if (!gpu || index>=gpu->cards.size()) {
                 text(px,92,"Not identified",ink);
-                text(px,118,gpu ? "No reliable device address" : "Host diagnostics unavailable",secondary);
+                text(px,118,gpu ? "No reliable device address" : "GPU diagnostics disabled",secondary);
                 if (gpu) {
                     text(px,152,"VISIBLE GPU CANDIDATES",rose);
                     for (size_t i=0;i<std::min<size_t>(gpu->cards.size(),4);++i)
@@ -186,8 +186,8 @@ static Artwork paint(int width, int height, int selected, bool mallsoft, int opa
         };
         card(22,"PRESENTER / COMPOSITOR",gpu ? gpu->presenter : UINT32_MAX);
         card(322,gpu && gpu->renderer<gpu->cards.size() ? "GAME RENDER / INFERRED" : "GAME RENDER / UNKNOWN",gpu ? gpu->renderer : UINT32_MAX);
-        text(18,258,shortened(gpu ? gpu->scope : "This host does not expose GPU diagnostics",71),secondary);
-        text(18,274,shortened(gpu ? gpu->evidence : "Use a host built with the optional diagnostics interface",71),rose);
+        text(18,258,shortened(gpu ? gpu->scope : "GPU diagnostics disabled on this host (opt-in)",71),secondary);
+        text(18,274,shortened(gpu ? gpu->evidence : "Set GAMESCOPE_GPU_DIAGNOSTICS=1 for gamescope (vapor-profile.py does)",71),rose);
         text(18,290,shortened("BUFFER PATH: "+(gpu ? gpu->transport : "unknown"),71),ink);
         text(18,310,"ENTER REFRESH   ESC SETTINGS   CTRL+SHIFT+F12 CLOSE",accent);
         text(18,325,shortened("BUILD: "+(gpu ? gpu->build : "unknown"),71),secondary);

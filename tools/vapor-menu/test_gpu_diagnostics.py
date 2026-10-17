@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise production GPU diagnostics transport without Vulkan or a GPU."""
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -18,4 +19,9 @@ with tempfile.TemporaryDirectory(prefix="gameslop-gpu-ipc-") as directory:
     subprocess.run(["c++", "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I", str(work),
                     "-I", str(ROOT / "src"), str(ROOT / "tools/vapor-menu/test_gpu_diagnostics.cpp"),
                     str(work / "protocol.o"), "-o", str(work / "test"), *flags], check=True)
-    subprocess.run([str(work / "test")], check=True, timeout=20)
+    # Opt-in: absent by default and for off/invalid values, present when on.
+    base = {k: v for k, v in os.environ.items() if k != "GAMESCOPE_GPU_DIAGNOSTICS"}
+    for value, expectation in ((None, "--expect-absent"), ("0", "--expect-absent"),
+                               ("bogus", "--expect-absent"), ("1", "--expect-present")):
+        env = dict(base) if value is None else dict(base, GAMESCOPE_GPU_DIAGNOSTICS=value)
+        subprocess.run([str(work / "test"), expectation], check=True, timeout=20, env=env)

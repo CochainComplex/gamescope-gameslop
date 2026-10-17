@@ -10,7 +10,8 @@ import sys
 repo = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix="vapor-smoke-", dir="/tmp") as runtime:
     env = os.environ.copy()
-    env.update(XDG_RUNTIME_DIR=runtime, GAMESCOPE_ZENITY_DISABLE="1")
+    # The smoke opens GPU DETAILS, which needs the opt-in diagnostics global.
+    env.update(XDG_RUNTIME_DIR=runtime, GAMESCOPE_ZENITY_DISABLE="1", GAMESCOPE_GPU_DIAGNOSTICS="1")
     env["XDG_CONFIG_HOME"] = str(Path(runtime) / "config")
     env.pop("VAPOR_PROFILE_ROOT", None)
     env.pop("VAPOR_GAME", None)
