@@ -204,7 +204,7 @@ GAMESCOPE_FRAMEGEN_HUD=2 gamescope \
 
 ### Step 3. Confirm it works
 
-The HUD is a small block of text, by default at the bottom centre of the gamescope window (`GAMESCOPE_FRAMEGEN_HUD_CORNER` moves it). `GAMESCOPE_FRAMEGEN_HUD=1` shows these rows: `gameslop`, `present`, `modes`, `rates` and `ladder`. `GAMESCOPE_FRAMEGEN_HUD=2` adds `pace` (how many frames met their deadline, and timing jitter) and `net` (the learned refiner, when active). The first tests use `2`.
+The HUD defaults to a small, translucent status panel at the bottom right (`GAMESCOPE_FRAMEGEN_HUD_CORNER` moves it). `GAMESCOPE_FRAMEGEN_HUD=1` shows four concise lines for source/generated rates, mode/pipeline/multiplier, learning/profile status, and recovery/deadline/jitter; requested-but-inactive features add a fifth line. `GAMESCOPE_FRAMEGEN_HUD=2` shows full device, mode, rates, ladder, pacing and training diagnostics. The first tests use `2`. An optional [native Wayland settings menu](tools/vapor-menu/README.md) edits per-game presets for the next launch.
 
 | Look at this | Healthy | Not healthy: what to do |
 |---|---|---|
@@ -235,7 +235,7 @@ GAMESCOPE_FRAMEGEN_HUD=1 gamescope --prefer-vk-device <PRESENT_ID> -W 2560 -H 14
 - On a single GPU, drop `--prefer-vk-device ...` and the `env MESA_VK_DEVICE_SELECT=... ` part.
 - If you did not install, start it through the environment script so the WSI layer is found: `/path/to/this/repo/scripts/env-gamescope-local.sh /path/to/this/repo/build/src/gamescope ...` (see [Install](#install)).
 
-Expected: the game opens fullscreen with a small text HUD at the bottom centre. Frame generation only has an effect when the game runs below the display refresh rate (see [Choosing settings](#choosing-settings)). The command above is a safe start. For the recommended real-game command, which uses the `learned` pipeline, go to [A good start for most games](#a-good-start-for-most-games).
+Expected: the game opens fullscreen with a small text HUD at the bottom right. Frame generation only has an effect when the game runs below the display refresh rate (see [Choosing settings](#choosing-settings)). The command above is a safe start. For the recommended real-game command, which uses the `learned` pipeline, go to [A good start for most games](#a-good-start-for-most-games).
 
 ### Step 5 (optional). Native mode, for judging smoothness
 

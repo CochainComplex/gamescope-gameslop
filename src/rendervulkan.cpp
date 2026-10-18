@@ -200,9 +200,9 @@ static uint32_t framegen_hud_scale( uint32_t uOutputHeight )
 		{
 			const auto nValue = gamescope::framegen::parse_uint32_setting( pszValue, false );
 			return nValue && *nValue <= 6u ? nValue : std::nullopt;
-		}, "automatic scale (2-4, based on output height)" );
+		}, "automatic scale (2-3, based on output height)" );
 	return s_uOverride != 0u ? s_uOverride
-		: std::clamp( uOutputHeight / 720u, 2u, 4u );
+		: std::clamp( uOutputHeight / 720u, 2u, 3u );
 }
 
 static FramegenHudCorner framegen_hud_corner()
@@ -218,7 +218,9 @@ static FramegenHudCorner framegen_hud_corner()
 			return FramegenHudCorner::BottomLeft;
 		if ( pszCorner != nullptr && strcmp( pszCorner, "br" ) == 0 )
 			return FramegenHudCorner::BottomRight;
-		return FramegenHudCorner::BottomCenter;
+		if ( pszCorner != nullptr && strcmp( pszCorner, "bc" ) == 0 )
+			return FramegenHudCorner::BottomCenter;
+		return FramegenHudCorner::BottomRight;
 	}();
 	return s_eCorner;
 }
