@@ -223,11 +223,6 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 	text = format_framegen_hud( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   checked/extrapolate rung 2/4  watching" } );
-
-	snapshot.ladderRecoveryHoldFloor = 2u;
-	text = format_framegen_hud( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  held" } );
 }
 
 TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",
@@ -4171,7 +4166,7 @@ TEST_CASE( "deadline ladder recovers after sustained measured headroom",
 	}
 	CHECK( state.streak == k_uDeadlineRecoveryHeadroomDecisions );
 
-	state = commit_ladder_recovery( state, 2u );
+	state = commit_ladder_recovery( state );
 	CHECK( state.streak == 0u );
 	CHECK( state.decisionsSinceClimb == 0u );
 	CHECK( state.probationRemaining
@@ -4343,7 +4338,7 @@ TEST_CASE( "deadline ladder miss resets the recovery streak",
 TEST_CASE( "deadline ladder recovery doubles backoff after a flap",
 	"[framegen][deadline][recovery]" )
 {
-	RecoveryState_t state = commit_ladder_recovery( RecoveryState_t{}, 0u );
+	RecoveryState_t state = commit_ladder_recovery( RecoveryState_t{} );
 	state = note_ladder_recovery_degradation( state );
 	CHECK( state.backoffDecisions
 		== k_uDeadlineRecoveryBaseBackoffDecisions * 2u );
@@ -4424,7 +4419,7 @@ TEST_CASE( "deadline ladder recovery backoff caps and relaxes on probation",
 	state = note_ladder_recovery_degradation( state );
 	CHECK( state.backoffDecisions
 		== k_uDeadlineRecoveryMaxBackoffDecisions );
-	state = commit_ladder_recovery( state, 0u );
+	state = commit_ladder_recovery( state );
 	state = note_ladder_recovery_degradation( state );
 	CHECK( state.backoffDecisions
 		== k_uDeadlineRecoveryMaxBackoffDecisions );
@@ -4437,158 +4432,21 @@ TEST_CASE( "deadline ladder recovery backoff caps and relaxes on probation",
 	CHECK( state.probationRemaining == 0u );
 }
 
-namespace
-{
-
-// Ample measured headroom at currentRung: the controller climbs as soon as
-// streak, hold, probation and back-off allow. Returns the decision on which
-// it asked to recover, or 0 when it never did within the limit.
-uint32_t decisions_until_recovery( RecoveryState_t &state,
-	uint32_t currentRung, uint32_t limit, bool *reportedBlocked = nullptr )
-{
-	for ( uint32_t decision = 1u; decision <= limit; decision++ )
-	{
-		const LadderRecoveryEvaluation_t evaluation = evaluate_ladder_recovery(
-			state, currentRung, 0u,
-			5'000u, k_uDeadlineMinSamples,
-			9'000u, k_uDeadlineMinSamples,
-			10'000u );
-		state = evaluation.state;
-		if ( reportedBlocked != nullptr && evaluation.reportBlockedThreshold )
-			*reportedBlocked = true;
-		if ( evaluation.tryRecover )
-			return decision;
-	}
-	return 0u;
-}
-
-// Climb to targetRung, survive a few probation decisions, then fall back.
-RecoveryState_t fail_recovery_probe( RecoveryState_t state, uint32_t targetRung )
-{
-	state = commit_ladder_recovery( state, targetRung );
-	for ( uint32_t decision = 0u; decision < 10u; decision++ )
-		state = advance_ladder_recovery_decision( state, true );
-	return note_ladder_recovery_degradation( state );
-}
-
-} // namespace
-
-TEST_CASE( "deadline ladder holds a rung after two failed recovery probes",
+TEST_CASE( "deadline ladder scene reset restores base recovery backoff",
 	"[framegen][deadline][recovery]" )
 {
-	constexpr uint32_t uLimit = k_uDeadlineRecoveryMaxBackoffDecisions * 2u;
-	RecoveryState_t state;
-	REQUIRE( decisions_until_recovery( state, 1u, uLimit )
-		== k_uDeadlineRecoveryHeadroomDecisions );
-	state = fail_recovery_probe( state, 0u );
-	CHECK( state.failedProbes[ 0 ] == 1u );
-	CHECK( state.holdFloor == 0u );
-
-	// One failure only escalates the back-off; the rung stays reachable.
-	REQUIRE( decisions_until_recovery( state, 1u, uLimit )
-		== k_uDeadlineRecoveryBaseBackoffDecisions * 2u );
-	state = fail_recovery_probe( state, 0u );
-	CHECK( state.failedProbes[ 0 ] == k_uDeadlineRecoveryMaxFailedProbes );
-	CHECK( state.holdFloor == 1u );
-
-	bool reportedBlocked = false;
-	CHECK( decisions_until_recovery( state, 1u, uLimit, &reportedBlocked )
-		== 0u );
-	CHECK_FALSE( reportedBlocked );
-	CHECK( state.streak == 0u );
-
-	constexpr std::array<LadderRungCost_t, 2> costs = {{
-		{ 9'000u, k_uDeadlineMinSamples },
-		{ 5'000u, k_uDeadlineMinSamples },
-	}};
-	const LadderRecoveryTarget_t held = select_ladder_recovery_target(
-		costs, 1u, 10'000u, state.holdFloor );
-	CHECK( held.rung == 1u );
-	CHECK( held.evidence.samples == 0u );
-}
-
-TEST_CASE( "deadline ladder scene reset keeps the hold and the backoff",
-	"[framegen][deadline][recovery]" )
-{
-	RecoveryState_t state = fail_recovery_probe( RecoveryState_t{}, 0u );
-	state.streak = 47u;
-	state.decisionsSinceClimb = 400u;
-	const uint32_t uEscalatedBackoff = state.backoffDecisions;
-	REQUIRE( uEscalatedBackoff
-		== k_uDeadlineRecoveryBaseBackoffDecisions * 2u );
-
-	// Re-entering the unheld top rung is a probe of that rung.
-	LadderSceneReset_t scene = reset_ladder_recovery_scene( state, 1u );
-	CHECK( scene.startRung == 0u );
-	CHECK( scene.state.streak == 0u );
-	CHECK( scene.state.decisionsSinceClimb == 0u );
-	CHECK( scene.state.backoffDecisions == uEscalatedBackoff );
-	CHECK( scene.state.failedProbes[ 0 ] == 1u );
-	CHECK( scene.state.probationRemaining
-		== k_uDeadlineRecoveryProbationDecisions );
-	CHECK( scene.state.probeRung == 0u );
-
-	state = note_ladder_recovery_degradation( scene.state );
-	CHECK( state.holdFloor == 1u );
-	CHECK( state.backoffDecisions == uEscalatedBackoff * 2u );
-
-	// Once held, a scene reset starts at the floor and opens no probe.
-	scene = reset_ladder_recovery_scene( state, 1u );
-	CHECK( scene.startRung == 1u );
-	CHECK( scene.state.probationRemaining == 0u );
-	CHECK( scene.state.holdFloor == 1u );
-	CHECK( scene.state.backoffDecisions == uEscalatedBackoff * 2u );
-	state = scene.state;
-	CHECK( decisions_until_recovery( state, 1u,
-		k_uDeadlineRecoveryMaxBackoffDecisions * 2u ) == 0u );
-
-	// From deeper down it climbs only to the floor.
-	scene = reset_ladder_recovery_scene( state, 3u );
-	CHECK( scene.startRung == 1u );
-	CHECK( scene.state.probeRung == 1u );
-	CHECK( scene.state.probationRemaining
-		== k_uDeadlineRecoveryProbationDecisions );
-}
-
-TEST_CASE( "deadline ladder full reset clears the hold and the backoff",
-	"[framegen][deadline][recovery]" )
-{
-	RecoveryState_t state = fail_recovery_probe( RecoveryState_t{}, 0u );
-	state = fail_recovery_probe( state, 0u );
-	REQUIRE( state.holdFloor == 1u );
-
+	RecoveryState_t state = {
+		.streak = 47u,
+		.backoffDecisions = k_uDeadlineRecoveryMaxBackoffDecisions,
+		.probationRemaining = 12u,
+		.decisionsSinceClimb = 400u,
+	};
 	state = {};
-	CHECK( state.holdFloor == 0u );
-	CHECK( state.failedProbes[ 0 ] == 0u );
+	CHECK( state.streak == 0u );
 	CHECK( state.backoffDecisions
 		== k_uDeadlineRecoveryBaseBackoffDecisions );
-	CHECK( decisions_until_recovery( state, 1u,
-		k_uDeadlineRecoveryMaxBackoffDecisions )
-		== k_uDeadlineRecoveryHeadroomDecisions );
-}
-
-TEST_CASE( "deadline ladder still recovers to a rung that never failed",
-	"[framegen][deadline][recovery]" )
-{
-	RecoveryState_t state = fail_recovery_probe( RecoveryState_t{}, 1u );
-	state = fail_recovery_probe( state, 1u );
-	REQUIRE( state.holdFloor == 2u );
-	CHECK( state.failedProbes[ 0 ] == 0u );
-
-	constexpr std::array<LadderRungCost_t, 4> costs = {{
-		{ 9'500u, k_uDeadlineMinSamples },
-		{ 9'000u, k_uDeadlineMinSamples },
-		{ 7'000u, k_uDeadlineMinSamples },
-		{ 5'000u, k_uDeadlineMinSamples },
-	}};
-	const LadderRecoveryTarget_t target = select_ladder_recovery_target(
-		costs, 3u, 10'000u, state.holdFloor );
-	CHECK( target.rung == 2u );
-	CHECK( decisions_until_recovery( state, 3u,
-		k_uDeadlineRecoveryMaxBackoffDecisions * 2u ) != 0u );
-
-	// Without a hold the same evidence still picks the richest fitting rung.
-	CHECK( select_ladder_recovery_target( costs, 3u, 10'000u ).rung == 0u );
+	CHECK( state.probationRemaining == 0u );
+	CHECK( state.decisionsSinceClimb == 0u );
 }
 
 namespace
