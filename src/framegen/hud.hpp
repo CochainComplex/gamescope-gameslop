@@ -304,7 +304,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	return "watching";
 }
 
-[[nodiscard]] inline FramegenHudText_t format_framegen_hud(
+[[nodiscard]] inline FramegenHudText_t format_framegen_hud_detailed(
 	uint32_t level, const FramegenHudSnapshot_t &snapshot )
 {
 	FramegenHudText_t result;
@@ -435,6 +435,54 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		framegen_hud_add_line( result, line );
 	}
 
+	return result;
+}
+
+// The everyday HUD keeps rates and effective quality visible without the
+// device/version inventory. Requested-but-inactive features remain explicit.
+[[nodiscard]] inline FramegenHudText_t format_framegen_hud(
+	uint32_t level, const FramegenHudSnapshot_t &snapshot )
+{
+	if ( level != 1u )
+		return format_framegen_hud_detailed( level, snapshot );
+	FramegenHudText_t result;
+	const uint32_t source = static_cast<uint32_t>( std::min<uint64_t>(
+		999u, ( snapshot.real + snapshot.delayedReal ) / 5u ) );
+	const uint32_t generated = static_cast<uint32_t>( std::min<uint64_t>(
+		999u, snapshot.generated / 5u ) );
+	const uint64_t fresh = snapshot.real + snapshot.delayedReal + snapshot.generated;
+	const uint64_t total = fresh + snapshot.repeats;
+	const uint32_t fill = total != 0u ? ( fresh * 100u + total / 2u ) / total : 0u;
+	char line[128] = {};
+	std::snprintf( line, sizeof( line ), "source %ufps | generated %ufps | fill %u%%",
+		source, generated, fill );
+	framegen_hud_add_line( result, line );
+	char steps[24] = {}, state[24] = {};
+	framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
+	std::snprintf( line, sizeof( line ), "%s / %s x%u | %uHz%s",
+		mode_name( snapshot.mode ), pipeline_name( snapshot.pipeline ),
+		std::clamp( snapshot.multiplier, 2u, 4u ),
+		std::min( 999u, ( snapshot.refreshMilliHz + 500u ) / 1000u ),
+		snapshot.vrrActive ? " VRR" : "" );
+	framegen_hud_add_line( result, line );
+	std::snprintf( line, sizeof( line ), "learning %s%s%s | profile %s",
+		snapshot.netActive ? ( snapshot.netOnline ? "online " : "frozen " ) : "off",
+		snapshot.netActive ? steps : "", snapshot.netActive ? " steps" : "",
+		snapshot.netProfileLoaded ? "loaded" : "not loaded" );
+	framegen_hud_add_line( result, line );
+	const uint32_t jitter = std::min( snapshot.pacingSdTenthsMs, 9999u );
+	std::snprintf( line, sizeof( line ), "%s | deadline %u%% | jitter %u.%ums",
+		framegen_hud_ladder_state( state, sizeof( state ), snapshot ),
+		std::min( snapshot.deadlineHitPercent, 100u ), jitter / 10u, jitter % 10u );
+	framegen_hud_add_line( result, line );
+	line[0] = '\0';
+	if ( snapshot.netRequested && !snapshot.netActive )
+		framegen_hud_append( line, sizeof( line ), "net:requested(OFF) " );
+	if ( snapshot.bidirRequested && !snapshot.bidirActive )
+		framegen_hud_append( line, sizeof( line ), "bidir:requested(OFF) " );
+	if ( snapshot.vrrRequested && !snapshot.vrrActive )
+		framegen_hud_append( line, sizeof( line ), "vrr:requested(off)" );
+	if ( line[0] ) framegen_hud_add_line( result, line );
 	return result;
 }
 

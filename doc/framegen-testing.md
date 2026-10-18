@@ -1742,3 +1742,46 @@ third-party files; the final build and test suite passed. An initial runtime
 harness attempt launched the client from the wrong directory and was excluded,
 then rerun successfully from its required directory. Native KMS pacing,
 physical input response and the player's visual verdict remain pending.
+
+
+## Native preset menu integration (2026-10-18)
+
+The refined Vapor menu is integrated on `feat/framegen-spatial`, on top of
+Spatial d3d144d48. The companion stages per-game settings for the next launch;
+it never replaces live renderer resources or writes learned weights. Spatial
+is selectable in both preset readers and still uses its own set inside the
+selected GSFP file. Preset clones retain the same learned-file reference.
+
+Integration review fixed a stale learned-path display when `--net-profile`
+overrides a saved preset, and prevented explicit preset selection from reading
+a broken `.active` marker. Such file overrides become an unsaved draft when
+they differ from the stored reference. The launcher prefers this checkout's
+build when present, with explicit host overrides supported. Native overlay
+references are rebuilt on unmap/destruction; the rebased window-list destroy
+notification was already present and did not need the old-tree patch.
+
+Validation on the combined source:
+
+- Release host build and optional companion build pass; 79/79 Meson tests pass.
+- Four standalone storage/launcher tests pass, including C++/Python schema
+  agreement, Spatial selection, override persistence and weight-file isolation.
+- Headless menu lifecycle passes configure/render/edit Spatial/hide/reopen,
+  retaining the unsaved draft and exiting 0. Wrapper retains game exit 37 and
+  reaps its companion. Shellcheck, bash syntax and diff checks pass.
+- Private GravityMark integration through the actual preset launcher, Spatial
+  x2, online training and compact HUD: exit 0, menu lifecycle PASS, 511 real
+  and 831 generated frames; 43 trained steps saved to the one GSFP set 0x100f0.
+  Preset and weight files are under the private test directory only. This is
+  a functional run including overlay creation and removal, not a pacing or
+  latency benchmark.
+- Production Spatial shader guards pass again on AMD 890M and NVIDIA RTX PRO
+  500: five phases, max error 0.0000204, 228 boundary differences, alpha/HDR
+  preserved. Those guards exercise frame generation, not HUD colour accuracy.
+
+Evidence is in `.claude/reviews/tools/menu-integration/` in the primary
+checkout; lifecycle log and CPU menu/HUD layout previews are in this worktree's
+`build-vapor-menu/`. The preview is not a GPU capture. Native-game keyboard
+injection, HDR appearance and perceptual quality remain unverified. An initial
+headless guard invocation inherited WAYLAND_DISPLAY and failed before GPU
+initialization; the clean-environment rerun passed on both GPUs. Original
+playable builds, source-session changes and user training files are preserved.

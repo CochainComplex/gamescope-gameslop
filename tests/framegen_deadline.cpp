@@ -134,7 +134,7 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 		.generated = 390u,
 		.repeats = 10u,
 	};
-	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+	const FramegenHudText_t text = format_framegen_hud_detailed( 1u, snapshot );
 
 	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[1].data() == std::string_view{
@@ -144,18 +144,18 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 	auto netOnly = snapshot;
 	netOnly.bidirRequested = false;
 	netOnly.netRequested = true;
-	const FramegenHudText_t netText = format_framegen_hud( 1u, netOnly );
+	const FramegenHudText_t netText = format_framegen_hud_detailed( 1u, netOnly );
 	CHECK( netText.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:requested(OFF)  adapt:off" } );
 	auto bothRequested = snapshot;
 	bothRequested.netRequested = true;
-	const FramegenHudText_t bothText = format_framegen_hud( 1u, bothRequested );
+	const FramegenHudText_t bothText = format_framegen_hud_detailed( 1u, bothRequested );
 	CHECK( bothText.lines[2].data() == std::string_view{
 		"modes    bidir:requested(OFF)  base:off  net:requested(OFF)  adapt:off" } );
 	auto vrrOnly = snapshot;
 	vrrOnly.bidirRequested = false;
 	vrrOnly.vrrRequested = true;
-	const FramegenHudText_t vrrText = format_framegen_hud( 1u, vrrOnly );
+	const FramegenHudText_t vrrText = format_framegen_hud_detailed( 1u, vrrOnly );
 	CHECK( vrrText.lines[2].data() == std::string_view{
 		"modes    bidir:off  base:off  net:off  adapt:off  vrr:requested(off)" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
@@ -177,15 +177,30 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	};
 	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
 
-	REQUIRE( text.lineCount == 5u );
+	REQUIRE( text.lineCount == 4u );
+	CHECK( text.lines[0].data() == std::string_view{
+		"source 40fps | generated 78fps | fill 98%" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon 890M     render n/a                 buffers local" } );
+		"motion / learned x2 | 120Hz" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:off  adapt:off" } );
+		"learning off | profile not loaded" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 98%" } );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   learned/motion rung 0/0  full" } );
+		"full | deadline 0% | jitter 0.0ms" } );
+	auto warning = snapshot;
+	warning.netRequested = true;
+	warning.bidirRequested = true;
+	warning.vrrRequested = true;
+	const auto compact = format_framegen_hud( 1u, warning );
+	REQUIRE( compact.lineCount == 5u );
+	const std::string_view status = compact.lines[4].data();
+	CHECK( status.find( "net:requested(OFF)" ) != std::string_view::npos );
+	CHECK( status.find( "bidir:requested(OFF)" ) != std::string_view::npos );
+	CHECK( status.find( "vrr:requested(off)" ) != std::string_view::npos );
+	warning.netActive = true;
+	warning.netOnline = true;
+	warning.netTrainedSteps = 1200u;
+	const auto training = format_framegen_hud( 1u, warning );
+	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
 }
 
 TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
@@ -201,7 +216,7 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 		.ladderHold = 3u,
 		.ladderRecoveryBackoffDecisions = 90u,
 	};
-	FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+	FramegenHudText_t text = format_framegen_hud_detailed( 1u, snapshot );
 	CHECK( text.lines[3].data() == std::string_view{
 		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 100%" } );
 	CHECK( text.lines[4].data() == std::string_view{
@@ -209,18 +224,18 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 
 	snapshot.ladderHold = 0u;
 	snapshot.ladderRecoveryProbationRemaining = 46u;
-	text = format_framegen_hud( 1u, snapshot );
+	text = format_framegen_hud_detailed( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   checked/extrapolate rung 2/4  probation 2s" } );
 
 	snapshot.ladderRecoveryProbationRemaining = 0u;
 	snapshot.ladderRecoveryDecisionsSinceClimb = 44u;
-	text = format_framegen_hud( 1u, snapshot );
+	text = format_framegen_hud_detailed( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   checked/extrapolate rung 2/4  recover in 2s" } );
 
 	snapshot.ladderRecoveryDecisionsSinceClimb = 90u;
-	text = format_framegen_hud( 1u, snapshot );
+	text = format_framegen_hud_detailed( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
 		"ladder   checked/extrapolate rung 2/4  watching" } );
 }
