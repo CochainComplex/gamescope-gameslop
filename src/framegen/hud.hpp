@@ -197,8 +197,6 @@ struct FramegenHudSnapshot_t
 	uint32_t ladderRecoveryBackoffDecisions = 0u;
 	uint32_t ladderRecoveryProbationRemaining = 0u;
 	uint32_t ladderRecoveryDecisionsSinceClimb = 0u;
-	// Richest rung recovery may still reach (failed-probe hold); 0 = none.
-	uint32_t ladderRecoveryHoldFloor = 0u;
 	int32_t biasTenthsMs = 0;
 	uint32_t deadlineHitPercent = 0u;
 	uint32_t pacingSdTenthsMs = 0u;
@@ -294,8 +292,6 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		std::snprintf( dst, capacity, "probation %us", seconds );
 		return dst;
 	}
-	if ( snapshot.ladderSteps <= snapshot.ladderRecoveryHoldFloor )
-		return "held";
 	if ( snapshot.ladderRecoveryDecisionsSinceClimb
 		< snapshot.ladderRecoveryBackoffDecisions )
 	{
