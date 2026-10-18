@@ -24,23 +24,30 @@ namespace gamescope::framegen
 // effective output transfer (0 = Gamma22, 1 = PQ, 2 = none — colour management
 // off). The same path always yields the same key. Algorithms share a set: they
 // see the same features, and the train shader already confines each mode to
-// the outputs it serves.
-[[nodiscard]] constexpr uint32_t net_input_key( bool bBaseLayer, uint32_t baseColorspace, uint32_t outputTf )
+// the outputs it serves. Spatial is an explicit exception: a separate role bit
+// keeps its experiments/training inside the same GSFP without changing old keys.
+inline constexpr uint32_t k_uNetSpatialProfileBit = 1u << 16;
+
+[[nodiscard]] constexpr uint32_t net_input_key( bool bBaseLayer, uint32_t baseColorspace,
+	uint32_t outputTf, bool bSpatial = false )
 {
-	return bBaseLayer ? ( 1u << 8 ) | ( baseColorspace << 4 ) | outputTf
+	const uint32_t input = bBaseLayer ? ( 1u << 8 ) | ( baseColorspace << 4 ) | outputTf
 		: ( 0xFu << 4 ) | outputTf;
+	return input | ( bSpatial ? k_uNetSpatialProfileBit : 0u );
 }
 
 inline void net_input_key_name( uint32_t key, char *buf, size_t size )
 {
 	constexpr const char *colorspaces[] = { "linear", "srgb", "scrgb", "hdr10_pq", "passthru" };
 	constexpr const char *transfers[] = { "gamma22", "pq", "none" };
-	const uint32_t cs = ( key >> 4 ) & 0xFu;
+	const uint32_t input = key & ~k_uNetSpatialProfileBit;
+	const char *prefix = ( key & k_uNetSpatialProfileBit ) != 0u ? "spatial " : "";
+	const uint32_t cs = ( input >> 4 ) & 0xFu;
 	const uint32_t tf = key & 0xFu;
-	if ( key == net_input_key( false, 0u, tf ) && tf < 3u )
-		std::snprintf( buf, size, "output tf=%s", transfers[ tf ] );
-	else if ( cs < 5u && tf < 3u && key == net_input_key( true, cs, tf ) )
-		std::snprintf( buf, size, "base cs=%s tf=%s", colorspaces[ cs ], transfers[ tf ] );
+	if ( input == net_input_key( false, 0u, tf ) && tf < 3u )
+		std::snprintf( buf, size, "%soutput tf=%s", prefix, transfers[ tf ] );
+	else if ( cs < 5u && tf < 3u && input == net_input_key( true, cs, tf ) )
+		std::snprintf( buf, size, "%sbase cs=%s tf=%s", prefix, colorspaces[ cs ], transfers[ tf ] );
 	else
 		std::snprintf( buf, size, "unknown key=0x%08x", key );
 }

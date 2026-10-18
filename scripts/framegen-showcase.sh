@@ -111,6 +111,7 @@ RUNS=(
 	"learned x2 + net|predictive, online-trained refiner|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline learned|GAMESCOPE_FRAMEGEN_NET_ONLINE=1 GAMESCOPE_FRAMEGEN_NET_EVERY=2"
 	"guided x2|predictive, guided pipeline|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline guided|"
 	"base layer|predictive on the game layer, overlays live|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline checked|GAMESCOPE_FRAMEGEN_BASE=1"
+	"spatial x2 + net|predictive, spatial boundaries with an independent profile set|--experimental-framegen --framegen-mode motion --framegen-multiplier 2 --framegen-pipeline spatial|GAMESCOPE_FRAMEGEN_NET_ONLINE=1"
 )
 
 die() { echo "framegen-showcase: $*" >&2; exit 2; }

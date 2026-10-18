@@ -282,7 +282,7 @@ const char usage[] =
 	"                                 forward modes fill every free slot anyway, bidirectional makes at most N-1\n"
 	"  --framegen-mode MODE           generated-frame algorithm: 'extrapolate' (default, low latency),\n"
 	"                                 'motion' (motion-compensated, higher quality/cost) or 'blend' (debug)\n"
-	"  --framegen-pipeline NAME       generation pipeline: 'warp' (default), 'checked', 'learned', 'predict', 'guided'\n"
+	"  --framegen-pipeline NAME       generation pipeline: 'warp' (default), 'checked', 'learned', 'predict', 'guided', 'spatial'\n"
 	"                                 each adds passes and cost; in real-game tests 'learned' with\n"
 	"                                 GAMESCOPE_FRAMEGEN_NET_ONLINE=1 felt best (README: Choosing settings)\n"
 	"  --framegen-strength 0.5        extrapolation step for 'extrapolate'/'motion' modes (0.0-1.0); lower reduces ghosting\n"
@@ -931,9 +931,11 @@ int main(int argc, char **argv)
 						g_eFramegenPipeline = GamescopeFramegenPipeline::Predict;
 					else if ( strcmp( optarg, "guided" ) == 0 )
 						g_eFramegenPipeline = GamescopeFramegenPipeline::Guided;
+					else if ( strcmp( optarg, "spatial" ) == 0 )
+						g_eFramegenPipeline = GamescopeFramegenPipeline::Spatial;
 					else
 					{
-						fprintf( stderr, "gamescope: --framegen-pipeline must be 'warp', 'checked', 'learned', 'predict' or 'guided'\n" );
+						fprintf( stderr, "gamescope: --framegen-pipeline must be 'warp', 'checked', 'learned', 'predict', 'guided' or 'spatial'\n" );
 						return 1;
 					}
 				} else if (strcmp(opt_name, "framegen-strength") == 0) {
@@ -1174,6 +1176,9 @@ int main(int argc, char **argv)
 		fprintf( stderr, "vulkan_init_formats failed\n" );
 		gamescope_exit( 1 );
 	}
+
+	if ( framegen_bool_setting( "GAMESCOPE_FRAMEGEN_SPATIAL_GUARD", false ) )
+		gamescope_exit( vulkan_framegen_spatial_guard() ? 0 : 1 );
 
 	// Frame-generation GPU microbenchmark: with a Vulkan device and the framegen
 	// pipelines available, time the generation dispatches in isolation and exit

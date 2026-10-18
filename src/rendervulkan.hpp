@@ -636,6 +636,7 @@ void vulkan_framegen_cancel_vrr_hybrid_slot( const char *reason );
 // prints a table. Used by the gamescope_framegen_microbench executable; needs a
 // headless device (vulkan_init) but no compositor.
 void vulkan_framegen_benchmark();
+bool vulkan_framegen_spatial_guard();
 
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
@@ -855,6 +856,7 @@ enum ShaderType {
 	SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
 	SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK,
 	SHADER_TYPE_FRAMEGEN_MOTION_WARP,
+	SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL,
 	SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL,
 	SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
 	SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,

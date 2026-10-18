@@ -5,6 +5,9 @@
 
 #include "descriptor_set.h"
 
+// Slot 6 is shader-specific: endpoint trace in bidir, spatial reconstruction here.
+layout(constant_id = 6) const bool c_spatialReconstruction = false;
+
 // Motion-compensated warp. Reprojects the current frame forward along the
 // estimated motion field. Where the match is unconfident it either moves the
 // frame only as far as the confidence allows (default), or blends toward the
@@ -37,6 +40,8 @@ uniform motion_warp_t {
 // s_samplers[0] = previousReal, [1] = currentReal, [2] = motion field
 // (.rg = mv in low-res texels, .b = confidence), sampled bilinearly.
 
+#include "framegen_reconstruct.h"
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 outSize = imageSize(dst);
@@ -51,6 +56,8 @@ void main() {
     vec3 currentFrame = currentSample.rgb;
 
     vec4 mvSample = texture(s_samplers[2], uv);
+    if (c_spatialReconstruction)
+        mvSample = reconstructField(uv, currentFrame, invOutSize, u_lowResScale, true, true);
     if (mvSample.a < -0.5f) {
         imageStore(dst, coord, currentSample);
         return;

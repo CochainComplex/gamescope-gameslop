@@ -152,6 +152,75 @@ static void test_degradation_policy()
 	}
 }
 
+static void test_spatial_profile_isolation()
+{
+	using namespace gamescope::framegen;
+	const uint32_t originalKey = net_input_key( false, 0u, 0u );
+	const uint32_t spatialKey = net_input_key( false, 0u, 0u, true );
+	CHECK( originalKey == 0xf0u && spatialKey == 0x100f0u );
+	std::vector<NetProfileSet> sets = {
+		{ originalKey, std::vector<float>( k_uFramegenNetFloats, 0.125f ) },
+		{ spatialKey, std::vector<float>( k_uFramegenNetFloats, 0.25f ) },
+	};
+	for ( uint32_t cs = 0; cs < 5u; cs++ )
+		for ( uint32_t tf = 0; tf < 3u; tf++ )
+			CHECK( net_input_key( true, cs, tf, true ) != net_input_key( true, cs, tf ) );
+	char name[64];
+	net_input_key_name( spatialKey, name, sizeof( name ) );
+	CHECK( std::string_view( name ) == "spatial output tf=gamma22" );
+	net_input_key_name( net_input_key( true, 2u, 2u, true ), name, sizeof( name ) );
+	CHECK( std::string_view( name ) == "spatial base cs=scrgb tf=none" );
+	// Updating Spatial and encoding the shared file preserves the original set.
+	sets[1].weights[17] = -0.75f;
+	const auto bytes = encode_net_profile( sets );
+	CHECK( bytes.has_value() );
+	const auto decoded = bytes ? decode_net_profile( *bytes ) : std::nullopt;
+	CHECK( decoded && decoded->size() == 2u );
+	if ( !decoded || decoded->size() != 2u )
+		return;
+	CHECK( (*decoded)[0].weights == sets[0].weights );
+	CHECK( (*decoded)[1].weights == sets[1].weights );
+	CHECK( net_profile_prior( spatialKey, *decoded, {}, {} )[17] == -0.75f );
+	CHECK( net_profile_prior( originalKey, *decoded, {}, {} )[17] == 0.125f );
+	CHECK( net_profile_prior( net_input_key( false, 0u, 1u, true ), *decoded, {}, {} ).empty() );
+}
+
+static void test_spatial_pipeline_policy()
+{
+	using P = GamescopeFramegenPipeline;
+	using M = GamescopeFramegenMode;
+	using gamescope::framegen::pipeline_uses_motion_history;
+	static_assert( static_cast<uint32_t>( P::Predict ) == 3u );
+	static_assert( static_cast<uint32_t>( P::Guided ) == 4u );
+	CHECK( std::string_view( gamescope::framegen::pipeline_name( P::Spatial ) ) == "spatial" );
+	CHECK( !pipeline_uses_motion_history( P::Spatial ) );
+	CHECK( !pipeline_uses_motion_history( P::Learned ) );
+	CHECK( pipeline_uses_motion_history( P::Predict ) );
+	CHECK( pipeline_uses_motion_history( P::Guided ) );
+	CHECK( gamescope::framegen::motion_field_scale( true, P::Spatial ) == 8u );
+	const std::array expected = { P::Spatial, P::Learned, P::Checked, P::Warp };
+	for ( int multiplier = 2; multiplier <= 4; multiplier++ )
+	{
+		const uint32_t last = max_degrade_steps( M::Motion, P::Spatial, multiplier );
+		CHECK( last == 4u + static_cast<uint32_t>( multiplier - 2 ) );
+		CHECK( last < 8u ); // The existing GPU cost/recovery rings have eight rungs.
+		for ( uint32_t i = 0; i < expected.size(); i++ )
+		{
+			const auto config = effective_config( M::Motion, P::Spatial, multiplier, i );
+			CHECK( config.mode == M::Motion && config.pipeline == expected[i] );
+			CHECK( config.multiplier == static_cast<uint32_t>( multiplier ) );
+		}
+		CHECK( effective_config( M::Motion, P::Spatial, multiplier, 4u ).mode == M::Extrapolate );
+		CHECK( effective_config( M::Motion, P::Spatial, multiplier, last ).multiplier == 2u );
+		for ( const M mode : { M::Blend, M::Extrapolate } )
+		{
+			CHECK( max_degrade_steps( mode, P::Spatial, multiplier ) == static_cast<uint32_t>( multiplier - 2 ) );
+			const auto config = effective_config( mode, P::Spatial, multiplier, 20u );
+			CHECK( config.mode == mode && config.multiplier == 2u );
+		}
+	}
+}
+
 static void test_learned_net_layout()
 {
 	CHECK( k_uFramegenNetLayerCount == 3u );
@@ -1341,6 +1410,8 @@ int main()
 	test_fps_limit_policy();
 	test_dormancy_policy();
 	test_degradation_policy();
+	test_spatial_pipeline_policy();
+	test_spatial_profile_isolation();
 	test_learned_net_layout();
 	test_names();
 	test_net_profile_contract();
