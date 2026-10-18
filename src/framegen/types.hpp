@@ -31,6 +31,9 @@ enum class GamescopeFramegenPipeline : uint32_t
 	// Add full-resolution color-guided reconstruction, the three-frame
 	// disocclusion reservoir, and the shading-persistence head.
 	Guided,
+	// Learned constant-velocity warp with spatial RGB-guided boundary reconstruction.
+	// Kept outside the legacy ordinal ladder; its fallback is explicitly Learned.
+	Spatial,
 };
 
 namespace gamescope::framegen
@@ -65,9 +68,18 @@ namespace gamescope::framegen
 			return "predict";
 		case GamescopeFramegenPipeline::Guided:
 			return "guided";
+		case GamescopeFramegenPipeline::Spatial:
+			return "spatial";
 		default:
 			return "unknown";
 	}
+}
+
+// Spatial is intentionally independent of temporal acceleration/history.
+[[nodiscard]] constexpr bool pipeline_uses_motion_history( GamescopeFramegenPipeline pipeline )
+{
+	return pipeline == GamescopeFramegenPipeline::Predict
+		|| pipeline == GamescopeFramegenPipeline::Guided;
 }
 
 } // namespace gamescope::framegen

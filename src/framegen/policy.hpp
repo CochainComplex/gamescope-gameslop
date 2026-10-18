@@ -105,7 +105,9 @@ inline constexpr uint32_t k_uMotionMaxCoarseLevels = motion_coarse_levels( k_uMo
 	GamescopeFramegenPipeline pipeline, int multiplier )
 {
 	const uint32_t nMotionRungs = mode == GamescopeFramegenMode::Motion
-		? static_cast<uint32_t>( pipeline ) + 1u : 0u;
+		? ( pipeline == GamescopeFramegenPipeline::Spatial
+			? static_cast<uint32_t>( GamescopeFramegenPipeline::Learned ) + 2u
+			: static_cast<uint32_t>( pipeline ) + 1u ) : 0u;
 	const uint32_t nMultiplierRungs =
 		static_cast<uint32_t>( std::max( 0, multiplier - 2 ) );
 	return nMotionRungs + nMultiplierRungs;
@@ -122,6 +124,15 @@ inline constexpr uint32_t k_uMotionMaxCoarseLevels = motion_coarse_levels( k_uMo
 		pipeline,
 	};
 	uint32_t n = nDegradeSteps;
+
+	// Opt-in spatial reconstruction sheds directly to Learned. The established
+	// Guided/Predict ladder and enum values remain unchanged.
+	if ( n > 0 && mode == GamescopeFramegenMode::Motion
+		&& config.pipeline == GamescopeFramegenPipeline::Spatial )
+	{
+		config.pipeline = GamescopeFramegenPipeline::Learned;
+		n--;
+	}
 
 	while ( n > 0 && config.mode == GamescopeFramegenMode::Motion
 		&& config.pipeline > GamescopeFramegenPipeline::Warp )

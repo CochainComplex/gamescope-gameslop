@@ -1664,3 +1664,81 @@ pairs or longer gaps around the intended four-vblank cadence. At x4 a five-vblan
 gap necessarily leaves one repeat, because only three generated frames are
 available. Treat the limiter as a controlled pacing test, not as the frozen
 visual baseline or a guaranteed stutter fix.
+
+
+## Spatial pipeline experiment (2026-10-18)
+
+Opt in with `--framegen-mode motion --framegen-pipeline spatial`.
+Spatial uses Learned's constant-velocity output path and shared Guided RGB
+boundary reconstruction. It does not add acceleration, a luma reservoir,
+shading history, or bidirectional buffering. It is an experimental alternative,
+not a new default. The fallback ladder is Spatial → Learned → Checked → Warp
+→ Extrapolate, then multiplier reduction. Other pipelines retain their ladders.
+
+### Correctness guards
+
+Build and run the regular Meson suite, then the GPU contract guard:
+
+```sh
+GAMESCOPE_LOCAL_PREFIX=/path/to/the/matching/prefix \
+  GAMESCOPE_FRAMEGEN_SPATIAL_GUARD=1 scripts/env-gamescope-local.sh \
+  build/src/gamescope --backend headless -- true
+```
+
+The guard runs both production constant-velocity warp specializations on
+known translation, cut, disagreement and two-motion-boundary inputs at phases
+1/3, 1/2, 2/3, 1 and 1.5. It checks finite output, preservation of current alpha,
+HDR values above one and below zero, analytical translation/cut/fallback
+results, and that the spatial specialization actually affects a boundary.
+It does not duplicate the reconstruction algorithm as its own oracle.
+
+Both Radeon 890M and NVIDIA RTX PRO 500 Blackwell passed: maximum analytical
+RGB error 0.0000204 and 228 boundary pixel differences; current alpha preserved.
+These are float-image shader invariants, not an HDR display or native quality
+certification. The full Meson suite passed 79/79, including new policy and
+profile-isolation contracts.
+
+### Independent training in one profile file
+
+Spatial sets the role bit 0x10000 in each existing encoding key. For output
+Gamma22 the shared GSFP contains legacy key 0xf0 and Spatial key 0x100f0.
+The GSFP version/shape and eight-set cap are unchanged, and existing keys do
+not change. A profile round-trip test checks both sets and separate priors.
+
+A private copy of a pre-existing one-set profile was used in a live headless
+GravityMark run (game on NVIDIA, compositor on Radeon 890M, 2048x1280@120):
+Spatial trained 755 steps in 30 seconds and saved its new key while preserving
+all legacy weight bytes. An 18-second Learned run then preserved Spatial's
+weight bytes. Frozen Spatial x3/x4 and Guided x2 runs reloaded the appropriate
+set without changing either saved set. Source profiles were not modified.
+An additional frozen Spatial x2 run with bidir requested emitted the causal-only
+diagnostic and preserved both sets. This confirms training/persistence isolation
+and routing, not a comparative quality win.
+
+### Preliminary GPU timing
+
+Production GPU microbenchmark, Radeon 890M, mean of 200 dispatches per pass:
+
+| Target / resolution | Learned warp ms | Spatial warp ms | Guided warp ms |
+|---|---:|---:|---:|
+| 10-bit integer, 1080p | 0.278 | 0.300 | 0.427 |
+| 10-bit integer, 1440p | 0.527 | 0.569 | 0.769 |
+| 10-bit integer, 2160p | 1.408 | 1.450 | 2.161 |
+| Float scRGB, 1080p | 0.636 | 0.723 | 0.753 |
+| Float scRGB, 1440p | 1.275 | 1.268 | 1.316 |
+| Float scRGB, 2160p | 2.847 | 2.978 | 2.809 |
+
+One sequential synthetic sweep; shader timestamps exclude CPU submission and
+presentation. The existing benchmark uses synthetic history without a
+controlled scene, so these are preliminary cost observations, not a guarantee
+for complex boundaries. Spatial was cheaper than Guided in this integer sweep;
+the 4K float result was worse. Do not generalize a uniform cost ordering or a
+quality win from these numbers. Complete held-out full-color causal sequence
+and randomized native game comparisons before promoting the mode. Existing
+E2 hidden-B interpolation captures do not validate causal Spatial prediction.
+
+The development release build emitted warnings in unchanged upstream and
+third-party files; the final build and test suite passed. An initial runtime
+harness attempt launched the client from the wrong directory and was excluded,
+then rerun successfully from its required directory. Native KMS pacing,
+physical input response and the player's visual verdict remain pending.

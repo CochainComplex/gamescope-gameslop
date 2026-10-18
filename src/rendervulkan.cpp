@@ -1663,6 +1663,7 @@ bool CVulkanDevice::createShaders()
 	SHADER(FRAMEGEN_MOTION_MATCH_REFINE, cs_framegen_motion_match_refine);
 	SHADER(FRAMEGEN_MOTION_FBCHECK, cs_framegen_motion_fbcheck);
 	SHADER(FRAMEGEN_MOTION_WARP, cs_framegen_motion_warp);
+	SHADER(FRAMEGEN_MOTION_WARP_SPATIAL, cs_framegen_motion_warp);
 	SHADER(FRAMEGEN_MOTION_WARP_ACCEL, cs_framegen_motion_warp_accel);
 	SHADER(FRAMEGEN_MOTION_BIDIR, cs_framegen_motion_bidir);
 	SHADER(FRAMEGEN_MOTION_BIDIR_TRACE, cs_framegen_motion_bidir);
@@ -1922,7 +1923,7 @@ VkSampler CVulkanDevice::sampler( SamplerState key )
 VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable)
 {
 	// Keep these IDs aligned with descriptor_set.h and the framegen shaders.
-	// Slot 6 is the bidir trace variant; ITM remains slot 7.
+	// Slot 6 selects the shader-specific framegen variant; ITM remains slot 7.
 	const std::array<VkSpecializationMapEntry, 8> specializationEntries = {{
 		{
 			.constantID = 0,
@@ -1984,7 +1985,8 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.blur_layer_count = blur_layer_count,
 		.colorspace_mask = colorspace_mask,
 		.output_eotf = output_eotf,
-		.endpoint_trace = type == SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
+		.endpoint_trace = type == SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE
+			|| type == SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL,
 		.itm_enable = itm_enable,
 	};
 
@@ -2071,6 +2073,7 @@ void CVulkanDevice::compileFramegenPipelines()
 		SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
 		SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK,
 		SHADER_TYPE_FRAMEGEN_MOTION_WARP,
+		SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL,
 		SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL,
 		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
 		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
@@ -8683,6 +8686,7 @@ static bool framegen_bidir_requested()
 {
 	return vulkan_framegen_is_enabled()
 		&& framegen_bidir_enabled()
+		&& g_eFramegenPipeline != GamescopeFramegenPipeline::Spatial
 		// Bidir substitutes vulkan_get_last_output_image() into the flip, i.e. it
 		// presents ring images directly. On a swapchain backend those are
 		// presentation-engine-owned and there is no flip to substitute into.
@@ -10812,7 +10816,7 @@ static void framegen_net_store_put( uint32_t uKey, const std::vector<float> &wei
 		static bool s_bLoggedFull = false;
 		if ( !s_bLoggedFull )
 		{
-			vk_log.errorf( "framegen: net profile already holds %zu input encodings; not persisting another", store.sets.size() );
+			vk_log.errorf( "framegen: net profile already holds %zu weight sets; not persisting another", store.sets.size() );
 			s_bLoggedFull = true;
 		}
 		return;
@@ -10937,7 +10941,8 @@ static void framegen_net_note_input_key( const struct FrameInfo_t *pFrameInfo, b
 	const uint32_t uOutputTf = pFrameInfo->applyOutputColorMgmt
 		? (uint32_t)pFrameInfo->outputEncodingEOTF : (uint32_t)EOTF_Count;
 	const uint32_t uKey = gamescope::framegen::net_input_key( bBaseLayer,
-		bBaseLayer ? (uint32_t)pFrameInfo->layers.get( 0 ).colorspace : 0u, uOutputTf );
+		bBaseLayer ? (uint32_t)pFrameInfo->layers.get( 0 ).colorspace : 0u, uOutputTf,
+		g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial );
 	if ( g_bFramegenNetKeyActive && uKey == g_uFramegenNetActiveKey )
 		return;
 	const bool bSwitch = g_bFramegenNetKeyActive;
@@ -10970,8 +10975,8 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	// Dataset capture copies the lumas and fields out to mapped readbacks.
 	// Predict and Guided also rotate the final field into a retained transfer destination.
 	createFlags.bTransferSrc = framegen_record_dir() != nullptr
-		|| g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
-	createFlags.bTransferDst = g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
+		|| gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline );
+	createFlags.bTransferDst = gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline );
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
@@ -12068,7 +12073,7 @@ static bool framegen_motion_history_valid( GamescopeFramegenPipeline ePipeline )
 	// the newly stored field immediately re-primes the next batch.
 	const bool bComparableIntervals = gamescope::framegen::motion_intervals_comparable(
 		ulCurrentIntervalNs, ulHistoryIntervalNs );
-	return ePipeline >= GamescopeFramegenPipeline::Predict
+	return gamescope::framegen::pipeline_uses_motion_history( ePipeline )
 		&& g_framegenMotion.mvFieldHistory != nullptr
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
 		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId
@@ -12252,7 +12257,7 @@ static void framegen_net_profile_write_file( std::vector<uint8_t> bytes, uint64_
 		g_ulFramegenNetSavedRevision = ulRevision;
 		static std::atomic<bool> s_bLoggedFirstSave = { false };
 		if ( !s_bLoggedFirstSave.exchange( true ) || g_bFramegenDebug )
-			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps, %zu input encoding%s)",
+			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps, %zu weight set%s)",
 				pszPath, ulProgress, uSets, uSets == 1u ? "" : "s" );
 	}
 	if ( bFromWorker )
@@ -12418,7 +12423,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	// zero-latency forward-prediction path. Both therefore require the reverse
 	// chain and symmetric consistency check, overriding GAMESCOPE_FRAMEGEN_FB=0.
 	const bool bBidir = vulkan_framegen_bidir_active();
-	const bool bNeedMotionHistory = ePipeline >= GamescopeFramegenPipeline::Predict && !bBidir;
+	const bool bNeedMotionHistory = gamescope::framegen::pipeline_uses_motion_history( ePipeline ) && !bBidir;
 	const bool bNeedLumaReservoir = framegen_reservoir_enabled( ePipeline ) && !bBidir;
 	const bool bCaptureNeedsReverse = framegen_record_dir() != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
@@ -12797,7 +12802,9 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	const bool bAccelPipeline = bHistoryValid || bGuided;
 
 	pCmdBuffer->bindPipeline( g_device.pipeline( bAccelPipeline
-		? SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL : SHADER_TYPE_FRAMEGEN_MOTION_WARP ) );
+		? SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL
+		: ePipeline == GamescopeFramegenPipeline::Spatial
+			? SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL : SHADER_TYPE_FRAMEGEN_MOTION_WARP ) );
 	pCmdBuffer->bindTarget( pTarget );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
 	pCmdBuffer->setTextureSrgb( 0, true );
@@ -13205,7 +13212,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// physical acceleration. The copy and later history reads are ordered in
 	// this same command buffer.
 	if ( !bReuseMotion && pColorProbe == nullptr && bMotionRequested && !bBidir
-		&& eff.pipeline >= GamescopeFramegenPipeline::Predict )
+		&& gamescope::framegen::pipeline_uses_motion_history( eff.pipeline ) )
 	{
 		const bool bHistorySourceValid = g_framegenMotion.mvFieldHistory != nullptr
 			&& g_framegenMotion.uMotionFieldFrameId != 0
@@ -14572,6 +14579,123 @@ static gamescope::OwningRc<CVulkanTexture> framegen_bench_make_image( uint32_t n
 
 } // namespace
 
+// GPU contract guard for the opt-in spatial shader. Uses known translations,
+// cuts and disagreement rather than another implementation of its algorithm.
+bool vulkan_framegen_spatial_guard()
+{
+	constexpr uint32_t W = 64, H = 32, S = 8;
+	using Pixels = std::vector<glm::vec4>;
+	const auto makeImage = []( uint32_t w, uint32_t h, bool mapped ) {
+		CVulkanTexture::createFlags flags;
+		flags.bSampled = !mapped;
+		flags.bStorage = !mapped;
+		flags.bTransferSrc = !mapped;
+		flags.bTransferDst = true;
+		flags.bMappable = mapped;
+		gamescope::OwningRc<CVulkanTexture> tex = new CVulkanTexture();
+		if ( !tex->BInit( w, h, 1u, DRM_FORMAT_ABGR32323232F, flags ) )
+			tex = nullptr;
+		return tex;
+	};
+	auto previous = makeImage( W, H, false );
+	auto current = makeImage( W, H, false );
+	auto field = makeImage( W / S, H / S, false );
+	auto output = makeImage( W, H, false );
+	auto readback = makeImage( W, H, true );
+	if ( !previous || !current || !field || !output || !readback )
+		return false;
+	const auto color = []( float x, float y ) {
+		return glm::vec4( 1.5f + x / 64.0f, -0.5f + y / 128.0f,
+			0.125f + x / 128.0f, 0.25f + x / 256.0f );
+	};
+	const auto upload = [&]( CVulkanCmdBuffer *cmd, const auto &texture, const Pixels &pixels ) {
+		const uint32_t size = static_cast<uint32_t>( pixels.size() * sizeof( glm::vec4 ) );
+		auto [data, offset] = g_device.uploadBufferData( size );
+		memcpy( data, pixels.data(), size );
+		cmd->copyBufferToImage( g_device.uploadBuffer(), offset, texture->width(), texture );
+	};
+	uint32_t boundaryDifferences = 0;
+	float maxTranslationError = 0.0f;
+	for ( uint32_t scene = 0; scene < 4u; scene++ )
+	{
+		Pixels prev( W * H ), cur( W * H ), mv( W / S * H / S );
+		for ( uint32_t y = 0; y < H; y++ )
+			for ( uint32_t x = 0; x < W; x++ )
+			{
+				cur[y * W + x] = color( float(x), float(y) );
+				const float shift = scene == 3u && x < W / 2u ? -4.0f : 4.0f;
+				prev[y * W + x] = color( std::clamp( float(x) + shift, 0.0f, float(W - 1u) ), float(y) );
+				if ( scene == 2u )
+					prev[y * W + x] += glm::vec4( 4.0f, 4.0f, 4.0f, 0.0f );
+			}
+		for ( uint32_t y = 0; y < H / S; y++ )
+			for ( uint32_t x = 0; x < W / S; x++ )
+				mv[y * ( W / S ) + x] = glm::vec4(
+					scene == 3u && x < W / S / 2u ? -0.5f : 0.5f,
+					0.0f, 1.0f, scene == 0u ? -1.0f : 0.0f );
+		{
+			auto cmd = g_device.commandBuffer();
+			upload( cmd.get(), previous, prev );
+			upload( cmd.get(), current, cur );
+			upload( cmd.get(), field, mv );
+			g_device.submit( std::move( cmd ) );
+			g_device.waitIdle();
+		}
+		for ( float phase : { 1.0f / 3.0f, 0.5f, 2.0f / 3.0f, 1.0f, 1.5f } )
+		{
+			Pixels baseline;
+			for ( const ShaderType shader : { SHADER_TYPE_FRAMEGEN_MOTION_WARP, SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL } )
+			{
+				auto cmd = g_device.commandBuffer();
+				cmd->bindPipeline( g_device.pipeline( shader ) );
+				cmd->bindTarget( output );
+				framegen_motion_bind_sampler( cmd.get(), 0, previous, false );
+				framegen_motion_bind_sampler( cmd.get(), 1, current, false );
+				framegen_motion_bind_sampler( cmd.get(), 2, field, false );
+				cmd->pushConstants<FramegenMotionWarpPush_t>( phase, k_flFramegenSuppressLo,
+					k_flFramegenSuppressHi, float(S), 0.03f, 0.10f, 1.0f );
+				cmd->dispatch( W / 8u, H / 8u );
+				cmd->copyImage( output, readback );
+				cmd->hostReadBarrier();
+				g_device.submit( std::move( cmd ) );
+				g_device.waitIdle();
+				// Address the queried subresource origin explicitly in this guard.
+				const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
+				VkSubresourceLayout layout;
+				g_device.vk.GetImageSubresourceLayout( g_device.device(), readback->vkImage(), &subresource, &layout );
+				Pixels actual( W * H );
+				for ( uint32_t y = 0; y < H; y++ )
+					memcpy( actual.data() + y * W, readback->mappedData() + layout.offset + y * layout.rowPitch, W * sizeof(glm::vec4) );
+				for ( uint32_t y = 0; y < H; y++ )
+					for ( uint32_t x = 0; x < W; x++ )
+					{
+						const glm::vec4 a = actual[y * W + x];
+						for ( uint32_t c = 0; c < 4u; c++ )
+							if ( !std::isfinite( a[c] ) )
+								return false;
+						if ( std::abs( a.a - cur[y * W + x].a ) > 1e-5f )
+							return false;
+						if ( scene < 3u && x >= 12u && x < W - 12u )
+						{
+							const auto expected = scene == 1u ? color( float(x) - phase * 4.0f, float(y) ) : cur[y * W + x];
+							for ( uint32_t c = 0; c < 3u; c++ )
+								maxTranslationError = std::max( maxTranslationError, std::abs( a[c] - expected[c] ) );
+						}
+						if ( !baseline.empty() && scene == 3u
+							&& glm::length( glm::vec3(a - baseline[y * W + x]) ) > 1e-4f )
+							boundaryDifferences++;
+					}
+				if ( shader == SHADER_TYPE_FRAMEGEN_MOTION_WARP )
+					baseline = std::move( actual );
+			}
+		}
+	}
+	const bool passed = maxTranslationError < 0.002f && boundaryDifferences != 0u;
+	printf( "framegen-spatial-guard: %s translation/cut/disagreement_max_error=%.7f boundary_differences=%u alpha=preserved HDR=unclamped phases=5\n",
+		passed ? "PASS" : "FAIL", maxTranslationError, boundaryDifferences );
+	return passed;
+}
+
 void vulkan_framegen_benchmark()
 {
 	VkPhysicalDeviceProperties props = {};
@@ -14726,7 +14850,7 @@ void vulkan_framegen_benchmark()
 			{
 				auto cmd = g_device.commandBuffer();
 				framegen_prepare_motion( cmd.get(), res.nWidth, res.nHeight, dispatch, g_eFramegenPipeline );
-				if ( g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict
+				if ( gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline )
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 					cmd->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
 				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
@@ -14734,7 +14858,7 @@ void vulkan_framegen_benchmark()
 					cmd->copyImage( g_framegenMotion.lumaPrev, g_framegenMotion.lumaReservoir[0] );
 				g_device.submit( std::move( cmd ) );
 				g_device.waitIdle();
-				if ( g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict
+				if ( gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline )
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 				{
 					g_framegenMotion.uMotionHistoryFrameId = 2;
@@ -14799,7 +14923,9 @@ void vulkan_framegen_benchmark()
 				g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
 					? "motion guided warp (per gen)"
 					: g_eFramegenPipeline == GamescopeFramegenPipeline::Predict
-						? "motion accel warp (per gen)" : "motion warp (per gen)",
+						? "motion accel warp (per gen)"
+						: g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial
+							? "motion spatial warp (gen)" : "motion warp (per gen)",
 				msMotionWarp );
 
 			if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
@@ -15065,7 +15191,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_CLASSIC=1 selected the classic batch path" );
 		if ( framegen_bidir_enabled() )
 		{
-			if ( !framegen_owns_output_ring() )
+			if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial )
+				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored (spatial is a causal-only pipeline)" );
+			else if ( !framegen_owns_output_ring() )
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored on a Vulkan-swapchain backend — bidir presents output-ring images directly by flip substitution, and swapchain images are owned by the presentation engine between present and re-acquire" );
 			else if ( !framegen_bidir_requested() )
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored (requires motion mode and is incompatible with VRR-hybrid pacing)" );
@@ -15095,6 +15223,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: warp pipeline — forward matcher + constant-velocity warp only" );
 			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Checked )
 				vk_log.infof( "framegen: checked pipeline — reverse consistency + full-resolution agreement enabled" );
+			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial )
+				vk_log.infof( "framegen: spatial pipeline: learned constant-velocity warp with RGB-guided boundaries; no acceleration, reservoir or shading history" );
 			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Predict )
 				vk_log.infof( "framegen: predict pipeline — confidence-gated causal temporal acceleration enabled after one consecutive field warm-up" );
 			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided )

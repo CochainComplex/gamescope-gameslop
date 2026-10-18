@@ -101,7 +101,7 @@ and exit.
 | `--experimental-framegen` | none (off) | Turns frame generation on. Forces the composite path and disables adaptive sync (VRR) and tearing flips while active, so on a VRR monitor you get a fixed refresh unless you use `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1` with `--adaptive-sync`. Ignored, with a log line, on backends that do not present generated frames (headless, OpenVR). |
 | `--framegen-multiplier N` | `2`, `3`, `4` (`2`) | Frame multiplier. Default forward generation fills every free display slot whatever N; bidirectional mode makes at most N − 1 frames per real pair. Use `2` at half the refresh rate or more, otherwise `4`; see [Multipliers](#multipliers). |
 | `--framegen-mode MODE` | `extrapolate`, `motion`, `blend` (`extrapolate`) | Generation algorithm. See [Modes](#modes). |
-| `--framegen-pipeline NAME` | `warp`, `checked`, `learned`, `predict`, `guided` (`warp`) | Amount of work done per generated frame. Has an effect only with `--framegen-mode motion`. Gamescope does not reject the combination: the startup line `framegen: enabled mode=extrapolate pipeline=checked ...` still prints the pipeline, so check the `mode=` part. See [Pipelines](#pipelines). |
+| `--framegen-pipeline NAME` | `warp`, `checked`, `learned`, `predict`, `guided`, `spatial` (`warp`) | Amount of work done per generated frame. Has an effect only with `--framegen-mode motion`. Gamescope does not reject the combination: the startup line `framegen: enabled mode=extrapolate pipeline=checked ...` still prints the pipeline, so check the `mode=` part. See [Pipelines](#pipelines). |
 | `--framegen-strength S` | 0.0 to 1.0 (`0.5`) | How far a forward-predicted frame is pushed ahead of the real one. `0.5` is the neutral value. Lower means less ghosting (trails behind moving objects) but less prediction, so motion can look less smooth. Applies to forward frames in `extrapolate` and `motion` modes, on the default deadline path as well as classic pacing; not used by `blend`. Bidirectional interpolation takes its phases from the real frames' timestamps instead (see [Pipelines](#pipelines)). |
 | `--framegen-debug` | none (off) | Logs framegen history, dispatch and present cadence. `GAMESCOPE_FRAMEGEN_DEBUG_EVERY` throttles repeated lines. Also enables the quality meter behind the `q_*` metrics fields. |
 | `--framerate-limit N` | integer (`0`, off) | Upstream gamescope flag, useful for cadence-locked tests: a divisor of the refresh rate, rounded down (60 / 59 gives 60 fps, 60 / 25 gives 30 fps). Releases client frame callbacks on every Nth vblank. Also adjustable through the `GAMESCOPE_FPS_LIMIT` X11 property. |
@@ -141,7 +141,7 @@ path is active.
 
 ## Pipelines
 
-The pipelines are cumulative: each one includes every layer of the pipelines
+The original five pipelines are cumulative: each one includes every layer of the pipelines
 before it and adds work on top, in the order `warp`, `checked`, `learned`,
 `predict`, `guided`. Gamescope steps down automatically when measured GPU time
 misses the display deadline (one rung of the degradation ladder at a time,
@@ -156,6 +156,32 @@ architecture document describes the ladder.
 | `learned` | Self-supervised adaptation and the optional learned refiner | Best real-game start so far, with in-game learning on (see the notes). Not the default yet. |
 | `predict` | Bounded acceleration prediction from the preceding checked field | Experimental. Its acceleration alters motion; it felt choppy in a real game and looks net negative so far. |
 | `guided` | Color-guided motion-layer reconstruction, a three-real-frame disocclusion resolver and the shading-persistence head | Close second to `learned` in the real-game tests; most passes and the highest GPU cost. Experimental. |
+| `spatial` | Learned constant-velocity warp plus RGB-guided motion-boundary reconstruction | Opt-in causal experiment. No acceleration, retained motion/luma history, reservoir or shading correction. Quality and latency need game validation. |
+
+`spatial` is a separate branch of the pipeline choices, rather than another
+step above Guided. It keeps the optional learned refiner and adaptation, and
+shares Guided's four-candidate RGB boundary verdict. Smooth fields skip the
+full-resolution correspondence reads. Its overload fallback is
+`spatial → learned → checked → warp → extrapolate`, then multiplier reduction.
+Existing pipeline ladders are unchanged. `GAMESCOPE_FRAMEGEN_BIDIR=1` is ignored
+with a diagnostic for Spatial, which stays causal; `GAMESCOPE_FRAMEGEN_FIELD_FINE=1`
+retains the /8 field because Spatial uses Learned's model contract.
+
+Spatial uses its **own weight set inside the same per-game GSFP file**. A
+Spatial role bit is combined with each existing input-encoding key (e.g.
+`0x100f0` for Spatial output gamma22, versus legacy `0xf0`). Switching back to
+Learned preserves and reloads the legacy set. A new Spatial set starts neutral,
+or from an explicitly supplied `GAMESCOPE_FRAMEGEN_NET` prior, and never
+implicitly borrows the legacy learned set. The file format and eight-set limit
+are unchanged; the log/HUD identifies the Spatial role. Use a copy of an existing
+profile while evaluating this experimental branch.
+
+Example (learning remains optional):
+
+```sh
+GAMESCOPE_FRAMEGEN_NET_ONLINE=1 gamescope --experimental-framegen \
+  --framegen-mode motion --framegen-pipeline spatial --framegen-multiplier 2 -- game
+```
 
 The Status column is a short verdict from a few real-game tests. The User Guide
 keeps the practical advice in one place: [Which one should I
@@ -265,7 +291,7 @@ gamescope command (for example `GAMESCOPE_FRAMEGEN_HUD=2 gamescope ...`).
 | `GAMESCOPE_FRAMEGEN_CURSOR` | on/off (on) | Keeps the cursor out of generated history and draws the current cursor on every generated frame. Off bakes the cursor into history, so it moves only with real composites. |
 | `GAMESCOPE_FRAMEGEN_RECOVER` | on/off (on) | Lets the degradation ladder step back up after sustained headroom. Off holds a stepped-down rung until the history is invalidated. No effect with `GAMESCOPE_FRAMEGEN_BIDIR` or VRR hybrid. |
 | `GAMESCOPE_FRAMEGEN_SHARP_FALLBACK` | on/off (on) | Where the motion evidence is weak, moves the real frame only as far as the confidence allows instead of crossfading the motion warp with the color extrapolation; `0` restores the crossfade (double edges and blur at confidence changes). Applies to the motion-mode pipelines `warp`, `checked` and `learned` (and to `predict` only until it has history). `guided` and bidirectional mode use their own shaders and are not affected. Shows only real pixels, so HDR is unaffected; about 10% cheaper per generated frame at 1440p and 2160p, equal at 1080p (Radeon 890M); frays edges on dense particle swarms. |
-| `GAMESCOPE_FRAMEGEN_FIELD_FINE` | on/off (off; only has an effect with `warp` and `checked`) | Uses a finer motion field, 1/4 of the output size instead of 1/8: one more pyramid level, 4x the field texels and one more pyramid dispatch and refinement per direction. Ignored for `learned`, `predict` and `guided`, and `GAMESCOPE_FRAMEGEN_RECORD` is ignored while it is on. Looked crisper on a sharp-edged shooter but blocky on dense particle swarms, so it stays opt-in. |
+| `GAMESCOPE_FRAMEGEN_FIELD_FINE` | on/off (off; only has an effect with `warp` and `checked`) | Uses a finer motion field, 1/4 of the output size instead of 1/8: one more pyramid level, 4x the field texels and one more pyramid dispatch and refinement per direction. Ignored for `learned`, `predict`, `guided` and `spatial`, and `GAMESCOPE_FRAMEGEN_RECORD` is ignored while it is on. Looked crisper on a sharp-edged shooter but blocky on dense particle swarms, so it stays opt-in. |
 | `GAMESCOPE_FRAMEGEN_NET_ONLINE` | on/off (off) | Trains the learned refiner while you play. `learned` and above use the net only with this or a `GAMESCOPE_FRAMEGEN_NET` blob; without either they run without it (checked plus self-calibration only). Pair it with `GAMESCOPE_FRAMEGEN_NET_PROFILE`, one file per game, to keep what it learned. |
 
 #### Values
@@ -311,6 +337,7 @@ workflow, see [`framegen-testing.md`](framegen-testing.md).
 |---|---|---|
 | `GAMESCOPE_FRAMEGEN_CLASSIC` | on/off (off; validation) | Selects the classic batch scheduling path instead of deadline scheduling on a dedicated queue. |
 | `GAMESCOPE_FRAMEGEN_BENCHMARK` | on/off (off; developer) | Runs the generation microbenchmark and exits. |
+| `GAMESCOPE_FRAMEGEN_SPATIAL_GUARD` | off (validation) | Run the production warp/Spatial shaders on known translations, cuts, disagreement and a motion boundary, checking HDR/alpha at five phases; exits success/failure. Headless backend is sufficient. |
 | `GAMESCOPE_FRAMEGEN_COMMIT_LEAD_MS` | > 0 (unset: automatic) | Experiment, native DRM only: replaces the learned generated-frame commit lead after its normal warm-up. |
 | `GAMESCOPE_FRAMEGEN_BATCH_REPAINT` | on/off (off; experiment) | Requests a composite after each generated batch instead of only waking the compositor. Causal mode only: ignored in bidirectional mode and with VRR hybrid. On a GPU-bound client (GravityMark 1M, 2048x1280 at 120 Hz) real frames rose from 34 to 44 FPS with steadier flips, but the source-to-flip p95 grew from about 11 to 25 ms, and a blind A/B rated it laggier, so it is off. |
 | `GAMESCOPE_FRAMEGEN_RECORD` | directory (developer) | Writes field-resolution training samples. Ignored while `GAMESCOPE_FRAMEGEN_FIELD_FINE=1`, because the samples hold 1/8-scale fields. |
