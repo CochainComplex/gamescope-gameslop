@@ -906,7 +906,10 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 				}
 			}
 #endif
-			if (driver.driverName[0]) card.driver=std::string(driver.driverName)+" / "+driver.driverInfo;
+			if (driver.driverName[0]) {
+				card.driver=driver.driverName;
+				if (driver.driverInfo[0]) card.driver+=std::string(" / ")+driver.driverInfo;
+			}
 			else { std::snprintf(value,sizeof(value),"driver version 0x%x",properties.driverVersion); card.driver=value; }
 			if (physical==m_physDev) inventory.presenter=inventory.cards.size();
 			inventory.cards.push_back(std::move(card));
@@ -15238,27 +15241,19 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	return true;
 }
 
-// The HUD-free history split in vulkan_composite is inactive under bidir, while
-// the colour probe records, with GAMESCOPE_FRAMEGEN_CURSOR=0, when the owned
-// pool is busy or when the ring image lacks transferSrc. The composited HUD
-// then becomes output-space history: motion estimation, generated frames and
-// online training see it. Not redesigned here (bidir flips its history
-// images); documented, and said once so a quality capture can be judged.
-static void framegen_note_hud_in_history()
+// The HUD-free history split in vulkan_composite is not always available
+// (vulkan_composite names the reason). The composited HUD then becomes
+// output-space history: motion estimation, generated frames and online
+// training see it. Not redesigned here (bidir flips its history images);
+// documented, and said once so a quality capture can be judged.
+static void framegen_note_hud_in_history( const char *pszReason )
 {
 	static bool s_bLogged = false;
 	if ( s_bLogged )
 		return;
 	s_bLogged = true;
-	const char *pszReason = vulkan_framegen_bidir_active()
-		? "bidirectional interpolation flips its history images"
-		: framegen_color_record_dir() != nullptr
-			? "the colour probe is recording"
-			: !framegen_cursor_split_enabled()
-				? "GAMESCOPE_FRAMEGEN_CURSOR=0 disables the split"
-				: "the history pool was busy or the output image lacks transferSrc";
 	vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
-		pszReason );
+		pszReason != nullptr ? pszReason : "the HUD-free split conditions were not met" );
 }
 
 // bCursorFreeRealFrame: output-space mode only — pRealFrame carries no cursor,
@@ -15267,7 +15262,8 @@ static void framegen_note_hud_in_history()
 // property recomputable here: pFrameInfo still describes the FULL stack.
 // bHudFreeRealFrame: likewise for the framegen HUD — pRealFrame is a composite
 // the HUD was not drawn into, while the scanout image carries it.
-static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame, bool bHudFreeRealFrame )
+// pszHudInHistoryReason: when it is not HUD-free, why (for the one-time note).
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame, bool bHudFreeRealFrame, const char *pszHudInHistoryReason )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
 		return;
@@ -15698,7 +15694,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		g_framegenHistory.bHudFreePrevious = g_framegenHistory.bHudFreeCurrent;
 		g_framegenHistory.bHudFreeCurrent = bHudFreeRealFrame;
 		if ( !bHudFreeRealFrame && framegen_hud_level() != 0u )
-			framegen_note_hud_in_history();
+			framegen_note_hud_in_history( pszHudInHistoryReason );
 	}
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 
@@ -16361,6 +16357,27 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	const bool bHudFreeHistory = bHudSplitCandidate
 		&& ( bCursorSplit || pHudFreeHistoryImage != nullptr );
+	// Why the HUD stays in this frame's history: the first reason that holds,
+	// for framegen_record_real_frame's one-time note. Side composites never
+	// reach it, and base-layer scenes or repaints are not output-space history.
+	const char *pszHudInHistoryReason = nullptr;
+	if ( !bHudFreeHistory && vulkan_framegen_is_enabled() && framegen_hud_level() != 0u )
+	{
+		if ( !framegen_owns_output_ring() )
+			pszHudInHistoryReason = "a Vulkan-swapchain backend (nested SDL) has no compositor-owned output ring";
+		else if ( !framegen_cursor_split_enabled() )
+			pszHudInHistoryReason = "GAMESCOPE_FRAMEGEN_CURSOR=0 disables the split";
+		else if ( vulkan_framegen_bidir_active() )
+			pszHudInHistoryReason = "bidirectional interpolation flips its history images";
+		else if ( framegen_color_record_dir() != nullptr )
+			pszHudInHistoryReason = "the colour probe is recording";
+		else if ( bHudSplitCandidate && compositeImage != nullptr && !compositeImage->transferSrc() )
+			pszHudInHistoryReason = "the output image lacks transferSrc";
+		else if ( bHudSplitCandidate )
+			pszHudInHistoryReason = "the owned history pool was busy";
+		else
+			pszHudInHistoryReason = "the HUD-free split conditions were not met";
+	}
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 	// Off the real-frame critical path: the staging copy goes out as its own
@@ -16696,7 +16713,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// swapchain backend must key on. It early-outs when framegen is disabled, and
 	// refuses output-space history when the compositor does not own the ring.
 	if ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory, bHudFreeHistory );
+		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory, bHudFreeHistory,
+			pszHudInHistoryReason );
 
 	if ( framegen_owns_output_ring() && pOutputOverride == nullptr && increment )
 	{
