@@ -14,6 +14,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -356,14 +357,64 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
 }
 
+// The HUD shader keeps its own copies of hud.hpp's contracts; the tests below
+// read them from the source so changing either side alone fails here.
+static std::string framegen_hud_shader_source()
+{
+	std::ifstream shader( FRAMEGEN_HUD_SHADER_PATH );
+	return std::string( ( std::istreambuf_iterator<char>( shader ) ),
+		std::istreambuf_iterator<char>() );
+}
+
+// The single unsigned capture of `pattern`, which must match exactly once.
+static std::optional<uint32_t> framegen_hud_shader_uint( const std::string &source, const char *pattern )
+{
+	const std::regex expression( pattern );
+	auto match = std::sregex_iterator( source.begin(), source.end(), expression );
+	if ( match == std::sregex_iterator() || std::next( match ) != std::sregex_iterator() )
+		return std::nullopt;
+	return static_cast<uint32_t>( std::stoul( ( *match )[1].str() ) );
+}
+
+TEST_CASE( "HUD UBO declaration and outline threshold match cs_framegen_hud.comp", "[framegen][hud]" )
+{
+	const std::string source = framegen_hud_shader_source();
+	REQUIRE_FALSE( source.empty() );
+
+	// Scalar-layout block: member order and array sizes give the offsets that
+	// the static_asserts in hud.hpp pin on the C++ side.
+	const std::regex block(
+		R"(uniform\s+framegen_hud_t\s*\{\s*)"
+		R"(uint\s+u_lineCount\s*;\s*uint\s+u_widthChars\s*;\s*)"
+		R"(uint\s+u_hdr\s*;\s*uint\s+u_style\s*;\s*)"
+		R"(uint\s+u_lineLengths\s*\[\s*(\d+)\s*\]\s*;\s*)"
+		R"(uint\s+u_text\s*\[\s*(\d+)\s*\]\s*;\s*)"
+		R"(uint\s+u_font\s*\[\s*(\d+)\s*\]\s*;\s*\})" );
+	std::smatch members;
+	REQUIRE( std::regex_search( source, members, block ) );
+	const FramegenHudUniform_t uniform{};
+	CHECK( std::stoul( members[1].str() ) == uniform.lineLengths.size() );
+	CHECK( std::stoul( members[1].str() ) == k_uFramegenHudMaxLines );
+	CHECK( std::stoul( members[2].str() ) == uniform.text.size() );
+	CHECK( std::stoul( members[2].str() ) == k_uFramegenHudPackedTextWords );
+	CHECK( std::stoul( members[3].str() ) == uniform.font.size() );
+
+	// text_byte's row stride is the packed column count.
+	CHECK( framegen_hud_shader_uint( source, R"(byteIndex\s*=\s*line\s*\*\s*(\d+)u\s*\+\s*column)" )
+		== k_uFramegenHudMaxColumns );
+
+	// The outline threshold compares the encoded percent (opacity + 1) as an
+	// integer, exactly as framegen_hud_outlined.
+	CHECK( framegen_hud_shader_uint( source,
+		R"(encodedOpacity\s*!=\s*0u\s*&&\s*encodedOpacity\s*-\s*1u\s*<\s*(\d+)u)" )
+		== k_uFramegenHudOutlineBelowPercent );
+	CHECK( std::regex_search( source, std::regex( R"(if\s*\(\s*cga\s*\|\|\s*lowBacking\s*\))" ) ) );
+}
+
 TEST_CASE( "CGA HUD Bayer table matches cs_framegen_hud.comp", "[framegen][hud]" )
 {
-	// The shader keeps its own copy of the table; read it from the source so
-	// changing either copy alone fails here.
-	std::ifstream shader( FRAMEGEN_HUD_SHADER_PATH );
-	REQUIRE( shader.is_open() );
-	const std::string source( ( std::istreambuf_iterator<char>( shader ) ),
-		std::istreambuf_iterator<char>() );
+	const std::string source = framegen_hud_shader_source();
+	REQUIRE_FALSE( source.empty() );
 	const std::string_view marker = "uint[16](";
 	const size_t first = source.find( marker );
 	REQUIRE( first != std::string::npos );
