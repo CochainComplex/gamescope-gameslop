@@ -592,26 +592,6 @@ struct DeadlineMissEvaluation_t
 		&& costNs > remainingBudgetNs && costNs <= slotBudgetNs;
 }
 
-// Nested backends have no KMS commit reservation: a generated slot is
-// composited at the compositor's own wake, which leads its vblank by the
-// vblank timer's draw-time reservation. The slot right after its real frame
-// therefore offers at most one refresh interval minus that wake lead. This is
-// the nested counterpart of fixed_refresh_slot_budget_ns and, like it, only
-// classifies a shortfall; admission still uses the decision's remaining time.
-[[nodiscard]] constexpr uint64_t nested_slot_budget_ns(
-	uint64_t vblankIntervalNs, uint64_t wakeLeadNs )
-{
-	return fixed_refresh_slot_budget_ns( vblankIntervalNs, wakeLeadNs, 0u );
-}
-
-[[nodiscard]] constexpr uint64_t causal_shortfall_slot_budget_ns(
-	bool nativeKmsTiming, uint64_t nativeSlotBudgetNs,
-	uint64_t vblankIntervalNs, uint64_t wakeLeadNs )
-{
-	return nativeKmsTiming ? nativeSlotBudgetNs
-		: nested_slot_budget_ns( vblankIntervalNs, wakeLeadNs );
-}
-
 enum class CausalShortfallAction_t : uint8_t
 {
 	// The mature rung fits a normally planned slot: skip this decision

@@ -13930,7 +13930,8 @@ static void framegen_record_causal_anchor( uint64_t ulRealFrameId,
 static uint64_t framegen_nested_slot_wake_ns( uint64_t ulSlotVBlankNs )
 {
 	const gamescope::VBlankScheduleTime schedule = GetVBlankTimer().CalcNextWakeupTime( true ); // preemptive: no side effect
-	const uint64_t ulOffsetNs = schedule.ulTargetVBlank - schedule.ulScheduledWakeupPoint;
+	const uint64_t ulOffsetNs = gamescope::framegen::compositor_wake_lead_ns(
+		schedule.ulTargetVBlank, schedule.ulScheduledWakeupPoint );
 	return ulSlotVBlankNs > ulOffsetNs ? ulSlotVBlankNs - ulOffsetNs : 0u;
 }
 
@@ -14054,12 +14055,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			: gamescope::framegen::deadline_budget_ns( ulVblankIntervalNs );
 	// Capacity reference for classifying a budget shortfall. Nested keeps its
 	// immediate miss handling and remaining-time recovery budget; only the
-	// phase-only skip gains a slot reference (its wake lead, see
-	// nested_slot_budget_ns).
+	// phase-only skip gains a slot reference (causal_shortfall_slot_budget_ns).
 	const uint64_t ulShortfallSlotBudgetNs =
 		gamescope::framegen::causal_shortfall_slot_budget_ns(
-			bNativeKmsTiming, ulNativeSlotBudgetNs, ulVblankIntervalNs,
-			rawGrid.D0 > rawGrid.W0 ? rawGrid.D0 - rawGrid.W0 : 0u );
+			bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
 		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,
 		ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );

@@ -7018,24 +7018,54 @@ constexpr uint64_t recorded_remaining_budget_ns( const RecordedCausalDecision_t 
 
 constexpr uint64_t recorded_nested_slot_budget_ns( const RecordedCausalDecision_t &d )
 {
-	// The compositor wake lead is target - wake (the bias shifts both equally).
-	return causal_shortfall_slot_budget_ns( false, 0u,
-		k_ulRecordedIntervalNs, d.targetNs - d.wakeNs );
+	// The bias shifts target and wake equally, so the recorded pair carries the
+	// raw grid's wake lead.
+	return causal_shortfall_slot_budget_ns( false, 0u, DisplayGrid_t{
+		.D0 = d.targetNs, .W0 = d.wakeNs, .T = k_ulRecordedIntervalNs } );
 }
+
+constexpr DisplayGrid_t k_nestedTestGrid = {
+	.D0 = 100'000'000u, .W0 = 97'000'000u, .T = 8'000'000u };
 
 } // namespace
 
-TEST_CASE( "causal shortfall reference selection is wired into the renderer",
+TEST_CASE( "causal shortfall reference: native keeps its budget, nested uses the wake lead",
 	"[framegen][deadline][nested][reference-wiring]" )
 {
-	const auto assignments = framegen_source_statements(
-		framegen_rendervulkan_source(), "const uint64_t ulShortfallSlotBudgetNs=", ";" );
-	REQUIRE( assignments.size() == 1u );
-	CHECK( assignments.front().find( "=gamescope::framegen::causal_shortfall_slot_budget_ns(" )
-		!= std::string::npos );
-	CHECK( causal_shortfall_slot_budget_ns( true, 123u, 8'000'000u, 3'000'000u ) == 123u );
-	CHECK( causal_shortfall_slot_budget_ns( false, 0u, 8'000'000u, 3'000'000u )
-		== 4'250'000u );
+	STATIC_REQUIRE( compositor_wake_lead_ns( 100'000'000u, 97'000'000u ) == 3'000'000u );
+	STATIC_REQUIRE( compositor_wake_lead_ns( 97'000'000u, 100'000'000u ) == 0u );
+	// Native: its own commit budget, never the nested reference.
+	STATIC_REQUIRE( causal_shortfall_slot_budget_ns( true, 123u, k_nestedTestGrid ) == 123u );
+	// Nested: one refresh interval less the raw grid's wake lead, at 85 %.
+	STATIC_REQUIRE( causal_shortfall_slot_budget_ns( false, 0u, k_nestedTestGrid )
+		== deadline_budget_ns( 5'000'000u ) );
+	// A wake lead of a whole interval or more leaves no reference.
+	STATIC_REQUIRE( causal_shortfall_slot_budget_ns( false, 0u, DisplayGrid_t{
+		.D0 = 100'000'000u, .W0 = 91'000'000u, .T = 8'000'000u } ) == 0u );
+}
+
+// rendervulkan.cpp is not compiled by any test: pin only its call into the
+// seams above, so the behaviour stays defined (and tested) in the headers.
+TEST_CASE( "the renderer classifies causal shortfalls through the shared seams",
+	"[framegen][deadline][nested][reference-wiring]" )
+{
+	const std::string source = framegen_rendervulkan_source();
+	REQUIRE_FALSE( source.empty() );
+	const auto statements = [&]( std::string_view start, std::string_view end )
+	{
+		return framegen_source_statements( source, framegen_canonical( start ), end );
+	};
+	// The renderer passes its own native flag, native budget and raw grid.
+	CHECK( statements( "const uint64_t ulShortfallSlotBudgetNs =", ";" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const uint64_t ulShortfallSlotBudgetNs ="
+			" gamescope::framegen::causal_shortfall_slot_budget_ns("
+			" bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );" ) } );
+	// A phase-only skip returns at once: it writes no rung, hold or recovery
+	// evidence.
+	CHECK( statements( "case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly:", ";" )
+		== std::vector<std::string>{ framegen_canonical(
+			"case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly: return result;" ) } );
 }
 
 TEST_CASE( "nested late-phase decisions are not ladder capacity evidence",
@@ -7071,9 +7101,6 @@ TEST_CASE( "nested slot reference still degrades on real capacity evidence",
 	const RecordedCausalDecision_t &d = k_recordedFalseDegrades[ 0 ];
 	const uint64_t remainingNs = recorded_remaining_budget_ns( d );
 	const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
-	STATIC_REQUIRE( nested_slot_budget_ns( 8'000'000u, 3'000'000u )
-		== deadline_budget_ns( 5'000'000u ) );
-	STATIC_REQUIRE( nested_slot_budget_ns( 8'000'000u, 9'000'000u ) == 0u );
 
 	// A mature rung which cannot fit even a normally planned slot degrades.
 	CHECK( causal_shortfall_action( false, slotNs + 1u, k_uDeadlineMinSamples,
@@ -7091,6 +7118,24 @@ TEST_CASE( "nested slot reference still degrades on real capacity evidence",
 	// No slot reference (lead >= interval) keeps the previous behaviour.
 	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
 		remainingNs, 0u, 0u ) == CausalShortfallAction_t::Degrade );
+	// Phase-only outranks the post-degradation hold, as on the native path.
+	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
+		remainingNs, slotNs, 2u ) == CausalShortfallAction_t::SkipPhaseOnly );
+}
+
+TEST_CASE( "a nested phase-only shortfall is skipped even when a cheaper rung fits",
+	"[framegen][deadline][recovery][nested]" )
+{
+	// Review counterexample: T = 8 ms, wake lead 3 ms, bias -3.5 ms. The current
+	// rung (1.5 ms) misses the 1.275 ms provisional window while a cheaper one
+	// (0.3 ms) would fit. The ladder must not learn from it: committing the
+	// cheaper rung would bring back the false degradation and its back-off
+	// ratchet. Whether such slots are still generated (by the anchor-correction
+	// replan) is a measured gate, not a ladder decision.
+	const uint64_t slotNs = causal_shortfall_slot_budget_ns( false, 0u, k_nestedTestGrid );
+	CHECK( causal_shortfall_action( false, 1'500'000u, k_uDeadlineMinSamples,
+		deadline_budget_ns( 1'500'000u ), slotNs, 0u )
+		== CausalShortfallAction_t::SkipPhaseOnly );
 }
 
 TEST_CASE( "false nested degradations inside probation ratchet the recovery back-off",
