@@ -8,11 +8,13 @@
 #include <fstream>
 #include <map>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
+#include "framegen/net_profile.hpp"
 
 namespace vapor {
 namespace fs = std::filesystem;
@@ -27,6 +29,9 @@ inline const std::map<std::string, std::vector<std::string>> choices{
     {"bidir", {"off", "on"}},
     {"hud", {"1", "2", "0"}},
     {"corner", {"br", "bl", "tr", "tl", "bc"}},
+    {"style", {"quiet", "mallsoft", "cga"}},
+    {"hud_opacity", {"auto", "0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"}},
+    {"hud_scale", {"auto", "1", "2", "3", "4", "5", "6"}},
 };
 inline bool identifier(const std::string &s) {
     return !s.empty() && s.size()<=64 && s!="." && s!=".." &&
@@ -35,11 +40,45 @@ inline bool identifier(const std::string &s) {
                 (c>='0' && c<='9') || c=='-' || c=='_' || c=='.';
         });
 }
+struct Context {
+    // Passed by the launcher, before Gamescope replaces DISPLAY/WAYLAND_DISPLAY.
+    std::string backend="unknown";
+    bool base=false, vrrHybrid=false;
+    std::string orientation="normal", outputs="SingleApplication";
+    std::vector<std::string> pipelines=choices.at("pipeline");
+    bool supportsPipeline(const std::string &name) const {
+        return std::find(pipelines.begin(),pipelines.end(),name)!=pipelines.end();
+    }
+    std::string framegenReason() const {
+        if (backend=="headless" || backend=="openvr") return "This backend cannot present generated frames";
+        if (orientation!="normal") return "Output rotation makes frame generation dormant";
+        if (outputs!="SingleApplication" && outputs!="SteamControlled")
+            return "Frame generation requires a single output";
+        return "";
+    }
+    std::string bidirReason() const {
+        if (!framegenReason().empty()) return framegenReason();
+        if (backend=="sdl") return "SDL cannot present bidirectional frames";
+        if (base) return "Base-layer scenes use causal generation";
+        if (vrrHybrid) return "VRR hybrid requires causal generation";
+        return "";
+    }
+};
+inline void validateLearned(const fs::path &path) {
+    if (path.empty() || !fs::exists(path)) return;
+    const auto fail=[&] { throw std::runtime_error("Incompatible training file / choose valid GSFP or new path"); };
+    if (!fs::is_regular_file(path) || fs::file_size(path)>gamescope::framegen::k_uFramegenNetProfileMaxBytes) fail();
+    std::ifstream in(path,std::ios::binary);
+    std::vector<uint8_t> bytes(gamescope::framegen::k_uFramegenNetProfileMaxBytes+1);
+    in.read(reinterpret_cast<char *>(bytes.data()),bytes.size());
+    bytes.resize(static_cast<size_t>(in.gcount()));
+    if (in.bad() || !gamescope::framegen::decode_net_profile(bytes)) fail();
+}
 struct Profile {
     std::map<std::string,std::string> values{
         {"framegen","on"}, {"mode","motion"}, {"pipeline","learned"},
         {"multiplier","2"}, {"online","on"}, {"bidir","off"},
-        {"hud","1"}, {"corner","br"}, {"net_profile",""},
+        {"hud","1"}, {"corner","br"}, {"net_profile",""}, {"style","quiet"}, {"hud_opacity","auto"}, {"hud_scale","auto"},
     };
     void set(const std::string &key, const std::string &value) {
         if (key=="net_profile") {
@@ -56,6 +95,36 @@ struct Profile {
         const auto &list=choices.at(key);
         int at=int(std::find(list.begin(),list.end(),values.at(key))-list.begin());
         values[key]=list[(at+int(list.size())+delta)%int(list.size())];
+    }
+    bool motion() const { return values.at("framegen")=="on" && values.at("mode")=="motion"; }
+    bool usesNet() const {
+        auto &p=values.at("pipeline");
+        return motion() && (p=="learned" || p=="predict" || p=="guided" || p=="spatial");
+    }
+    std::string bidirReason(const Context &context={}) const {
+        if (!motion()) return "Bidirectional needs active motion mode";
+        if (values.at("pipeline")=="spatial") return "Spatial is causal only";
+        return context.bidirReason();
+    }
+    std::string disabledReason(const std::string &key, const Context &context={}) const {
+        if (key=="style") return "";
+        if (key=="framegen") return values.at("framegen")=="on" ? "" : context.framegenReason();
+        if (values.at("framegen")=="off") return "Enable frame generation first";
+        if (key=="pipeline" && !motion()) return "Pipelines apply to motion mode only";
+        if ((key=="online" || key=="net_profile") && !usesNet())
+            return "Learned profiles need a learned motion pipeline";
+        if (key=="bidir") return values.at("bidir")=="on" ? "" : bidirReason(context);
+        if (key=="corner" && values.at("hud")=="0") return "Enable the HUD first";
+        return "";
+    }
+    void validate(const Context &context={}) const {
+        if (values.at("framegen")=="off") return; // Retain inactive preferences.
+        auto reason=context.framegenReason();
+        if (!reason.empty()) throw std::runtime_error(reason);
+        if (motion() && !context.supportsPipeline(values.at("pipeline")))
+            throw std::runtime_error("Selected host does not support this pipeline");
+        if (values.at("bidir")=="on" && !(reason=bidirReason(context)).empty())
+            throw std::runtime_error(reason);
     }
 };
 inline Profile load(const fs::path &path) {
@@ -79,6 +148,7 @@ inline Profile load(const fs::path &path) {
         else p.set(key,value);
     }
     if (!version) throw std::runtime_error("Missing profile version");
+    p.validate();
     return p;
 }
 inline void writeAtomic(const fs::path &path, const std::string &bytes) {
@@ -104,6 +174,8 @@ inline void save(const fs::path &path, const Profile &p) {
     // Validate even when the caller constructed values directly.
     Profile checked;
     for (auto &[key,value] : p.values) checked.set(key,value);
+    checked.validate();
+    if (checked.usesNet()) validateLearned(checked.values.at("net_profile"));
     std::string bytes="version=1\n";
     for (auto &[key,value] : checked.values) bytes+=key+"="+value+"\n";
     writeAtomic(path,bytes);
@@ -123,11 +195,26 @@ struct Store {
     std::vector<std::string> learnedPaths;
     std::string name="default", status="Saved settings apply next launch";
     Profile draft;
+    Context context;
     bool dirty=false;
     static std::string environment(const char *key, const std::string &fallback) {
         auto value=std::getenv(key); return value && *value ? value : fallback;
     }
     Store() {
+        context.backend=environment("VAPOR_BACKEND","unknown");
+        context.base=environment("VAPOR_BASE","0")=="1";
+        context.vrrHybrid=environment("VAPOR_VRR_HYBRID","0")=="1";
+        context.orientation=environment("VAPOR_ORIENTATION","normal");
+        context.outputs=environment("VAPOR_OUTPUTS","SingleApplication");
+        auto supported=environment("VAPOR_PIPELINES","");
+        if (!supported.empty()) {
+            context.pipelines.clear(); std::istringstream input(supported); std::string name;
+            while (std::getline(input,name,',')) {
+                if (std::find(choices.at("pipeline").begin(),choices.at("pipeline").end(),name)==choices.at("pipeline").end())
+                    throw std::runtime_error("Invalid host pipeline capability");
+                context.pipelines.push_back(name);
+            }
+        }
         auto game=environment("VAPOR_GAME","default");
         if (!identifier(game)) throw std::runtime_error("Invalid game identifier");
         auto config=environment("XDG_CONFIG_HOME",environment("HOME",".")+"/.config");
@@ -148,22 +235,53 @@ struct Store {
             draft.set("net_profile",(directory/"learned.bin").string());
         refreshLearned();
     }
+    void edit(const std::string &key, int delta) {
+        auto reason=draft.disabledReason(key,context);
+        if (!reason.empty()) { status=reason; return; }
+        draft.cycle(key,delta); dirty=true;
+        if (key=="pipeline") {
+            for (size_t i=0; i<choices.at(key).size() && !context.supportsPipeline(draft.values.at(key)); ++i)
+                draft.cycle(key,delta);
+        }
+        status="Unsaved / changes apply next launch";
+        if (key=="bidir" && draft.values.at("bidir")=="on")
+            status="Bidir adds real-frame delay / next launch";
+        if (draft.motion() && !context.supportsPipeline(draft.values.at("pipeline"))) {
+            if (context.pipelines.empty()) throw std::runtime_error("Host has no supported motion pipelines");
+            draft.set("pipeline",context.pipelines.front());
+            status="Pipeline changed / unsupported by selected host";
+        }
+        // A deliberate parent-setting change also retires incompatible bidir.
+        // Training/pipeline preferences remain remembered while inactive.
+        if (draft.values.at("bidir")=="on" && !draft.bidirReason(context).empty()) {
+            draft.set("bidir","off");
+            status="Bidir disabled / "+draft.bidirReason(context);
+        }
+    }
     void refreshLearned() {
         learnedPaths={draft.values.at("net_profile")};
         fs::path parent=fs::path(draft.values.at("net_profile")).parent_path();
         if (fs::is_directory(parent)) for (auto &file : fs::directory_iterator(parent)) {
             if (learnedPaths.size()>=256) break;
-            if (file.is_regular_file() && !file.is_symlink() && file.path().extension()==".bin")
+            if (file.is_regular_file() && !file.is_symlink() && file.path().extension()==".bin") {
+                try { validateLearned(file.path()); }
+                catch (const std::exception &) { continue; }
                 learnedPaths.push_back(file.path().string());
+            }
         }
         std::sort(learnedPaths.begin(),learnedPaths.end());
         learnedPaths.erase(std::unique(learnedPaths.begin(),learnedPaths.end()),learnedPaths.end());
     }
     void cycleLearned(int delta) {
+        auto reason=draft.disabledReason("net_profile",context);
+        if (!reason.empty()) { status=reason; return; }
         refreshLearned();
         int at=int(std::find(learnedPaths.begin(),learnedPaths.end(),draft.values.at("net_profile"))-learnedPaths.begin());
-        draft.set("net_profile",learnedPaths[(at+int(learnedPaths.size())+delta)%int(learnedPaths.size())]);
+        auto next=learnedPaths[(at+int(learnedPaths.size())+delta)%int(learnedPaths.size())];
+        validateLearned(next);
+        draft.set("net_profile",next);
         dirty=true;
+        status="Unsaved / learned file unchanged";
     }
     void refresh() {
         names={name};
@@ -182,11 +300,13 @@ struct Store {
         refreshLearned(); status="Editing "+name+" / next launch";
     }
     void persist() {
+        draft.validate(context);
         save(directory/(name+".ini"),draft);
         writeAtomic(directory/".active",name+"\n");
         dirty=false; status="Saved "+name+" / next launch"; refresh();
     }
     void clone() {
+        draft.validate(context);
         for (int n=1;n<=999;++n) {
             auto next="custom-"+std::to_string(n);
             if (!fs::exists(directory/(next+".ini"))) {
