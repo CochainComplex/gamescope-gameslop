@@ -79,13 +79,12 @@ static constexpr std::array<const char *, 19> labels = {
     "FRAME GENERATION", "ONLINE TRAINING", "BIDIRECTIONAL", "LEARNED PROFILE",
     "HUD", "HUD POSITION", "SAVE PRESET", "SAVE AS NEW PRESET", "TAKE SCREENSHOT", "MENU STYLE", "HUD BG OPACITY", "HUD TEXT SIZE", "NPU TRAINING [EXPERIMENTAL]", "GPU DETAILS"
 };
-static constexpr std::array<const char *,9> settingKeys{
-    "pipeline","multiplier","mode","framegen","online","bidir","net_profile","hud","corner"};
 static std::string disabledReason(int row, const vapor::Store *store) {
     if (row==18) return "";
     if (row==17) return "NPU training unavailable / offline inference only";
-    return store && row>=2 && row<=10
-        ? store->draft.disabledReason(settingKeys[row-2],store->context) : "";
+    auto key=vapor::menuRowKeys.find(row);
+    return store && key!=vapor::menuRowKeys.end()
+        ? store->draft.disabledReason(key->second,store->context) : "";
 }
 static std::string rowValue(int row, const vapor::Store *store) {
     if (row==18) return "";
@@ -95,6 +94,7 @@ static std::string rowValue(int row, const vapor::Store *store) {
         return preview[row];
     }
     if (row==15 || row==16) {
+        if (!disabledReason(row,store).empty()) return "inactive";
         const auto &value=store->draft.values.at(row==15 ? "hud_opacity" : "hud_scale");
         return value=="auto" ? value : value+(row==15 ? "%" : "x");
     }
@@ -102,7 +102,7 @@ static std::string rowValue(int row, const vapor::Store *store) {
     if (row==1) return store->name+(store->name=="spatial-experimental" ? " [EXPERIMENTAL]" : "")+(store->dirty ? " *" : "");
     if (row>=2 && row<=10) {
         if (!disabledReason(row,store).empty()) return "inactive";
-        auto value=store->draft.values.at(settingKeys[row-2]);
+        auto value=store->draft.values.at(vapor::menuRowKeys.at(row));
         if (row==2 && value=="spatial") return "spatial [EXPERIMENTAL]";
         if (row==6) return value=="on" ? "GPU / on" : "off";
         if (row==3) return "x"+value;
@@ -362,14 +362,7 @@ struct App {
             }
             if (selected==17) { profiles.status="NPU training unavailable / offline inference only"; dirty=true; return; }
             if (selected == 1) profiles.select(delta);
-            if (selected>=2 && selected<=10 && selected!=8) {
-                profiles.edit(settingKeys[selected-2],delta);
-            }
-            if (selected==14) {
-                profiles.draft.cycle("style",delta); profiles.dirty=true;
-                profiles.status="Menu preview / save; HUD on next launch";
-            }
-            if (selected==8) profiles.cycleLearned(delta);
+            profiles.editRow(selected,delta);
             if (index==6 && selected==11) profiles.persist();
             if (index==6 && selected==12) profiles.clone();
             if (index == 6 && selected == 0) toggle();
@@ -574,7 +567,7 @@ int main(int argc, char **argv) {
                 image.blendRect(x,y+fontScale,fontScale,h-fontScale,cgaHud ? 0xffffff : 0xe066b8,97);
                 for (uint32_t i=0;i<text.lineCount;++i) {
                     const int tx=x+4*fontScale, ty=y+(4+int(i)*pitch)*fontScale;
-                    if (cgaHud) {
+                    if (gamescope::framegen::framegen_hud_outlined(cgaHud,opacity)) {
                         image.text(tx-fontScale,ty,text.lines[i].data(),0x000000,fontScale,250);
                         image.text(tx+fontScale,ty,text.lines[i].data(),0x000000,fontScale,250);
                         image.text(tx,ty-fontScale,text.lines[i].data(),0x000000,fontScale,250);
@@ -645,6 +638,27 @@ int main(int argc, char **argv) {
                     require(a.profiles.draft.values.at("online")==online,"Inactive training was editable");
                     a.selected=4; a.action(4); // Restore motion.
                     std::puts("Smoke: configuration dependencies PASS");
+                    // Every HUD/appearance row edits through the same actions;
+                    // RIGHT then LEFT restores the value.
+                    for (int row : {9,10,14,15,16}) {
+                        const auto &key=vapor::menuRowKeys.at(row);
+                        const auto before=a.profiles.draft.values.at(key);
+                        a.selected=row; a.action(5);
+                        require(a.profiles.draft.values.at(key)!=before,"HUD row was not editable");
+                        a.action(4);
+                        require(a.profiles.draft.values.at(key)==before,"HUD row did not cycle back");
+                    }
+                    const auto hud=a.profiles.draft.values.at("hud");
+                    a.profiles.draft.set("hud","0");
+                    for (int row : {10,15,16}) {
+                        const auto &key=vapor::menuRowKeys.at(row);
+                        const auto before=a.profiles.draft.values.at(key);
+                        a.selected=row; a.action(5);
+                        require(a.profiles.draft.values.at(key)==before && rowValue(row,&a.profiles)=="inactive",
+                            "HUD setting was editable with the HUD off");
+                    }
+                    a.profiles.draft.set("hud",hud);
+                    std::puts("Smoke: HUD rows PASS");
                     a.selected=18; a.action(6);
                     require(a.diagnosticsOpen,"GPU diagnostics did not open");
                     smokeStep=1;
