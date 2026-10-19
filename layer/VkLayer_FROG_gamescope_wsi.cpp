@@ -1050,11 +1050,13 @@ namespace GamescopeWSILayer {
       deviceCreateInfo.ppEnabledExtensionNames = extensions.data();
       deviceCreateInfo.enabledExtensionCount   = uint32_t(extensions.size());
 
-      vkroots::ChainPatcher<VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT>
-        maintenance1Patcher(&deviceCreateInfo, [&](VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *pMaintenance1)
+      // Build the patcher only when it will insert its struct: vkroots' ChainPatcher
+      // asserts on destruction that its own struct is still in the chain, so a
+      // patcher whose callback declines (and found none) aborts the app.
+      std::optional<vkroots::ChainPatcher<VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT>> maintenance1Patcher;
+      if (bSupportsSwapchainMaintenance1)
+        maintenance1Patcher.emplace(&deviceCreateInfo, [&](VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *pMaintenance1)
       {
-        if (!bSupportsSwapchainMaintenance1)
-          return false;
         fprintf(stderr, "[Gamescope WSI] Forcing on VK_EXT_swapchain_maintenance1.\n");
         pMaintenance1->swapchainMaintenance1 = VK_TRUE;
         return true;
@@ -1624,11 +1626,11 @@ namespace GamescopeWSILayer {
 
       // We yolo to 3 min images always in Gamescope WSI, regardless of the underlying implementation.
       // Anyway, deal with present modes passed in...
-      vkroots::ChainPatcher<VkSwapchainPresentModesCreateInfoEXT>
-        presentModePatcher(&swapchainInfo, [&](VkSwapchainPresentModesCreateInfoEXT *pPresentModesCreateInfo)
+      // As in CreateDevice: no patcher at all unless it inserts its struct.
+      std::optional<vkroots::ChainPatcher<VkSwapchainPresentModesCreateInfoEXT>> presentModePatcher;
+      if (bSupportsSwapchainMaintenance1)
+        presentModePatcher.emplace(&swapchainInfo, [&](VkSwapchainPresentModesCreateInfoEXT *pPresentModesCreateInfo)
       {
-        if (!bSupportsSwapchainMaintenance1)
-          return false;
         // Always send MAILBOX as the mode to the driver, as we implement FIFO ourselves -- using the
         // Gamescope swapchain protocol.
         static constexpr std::array<VkPresentModeKHR, 1> s_MailboxMode = {{
