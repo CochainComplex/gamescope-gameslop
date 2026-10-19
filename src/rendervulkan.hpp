@@ -607,6 +607,10 @@ void vulkan_present_wait_shutdown();
 // profile writer.
 // Must run before the backend is destroyed: framegen textures own backend FBs.
 void vulkan_framegen_shutdown();
+// Persists unsaved online learning (CPU only, no GPU or backend access). For exit
+// paths that bypass vulkan_framegen_shutdown, e.g. the X11 I/O error during a
+// process-group interrupt.
+void vulkan_framegen_flush_profile();
 // Cheap compositor-thread counter hook used by the repeat arbiter. Aggregation
 // and reporting remain in vulkan_framegen_drain_present_feedback().
 void vulkan_framegen_metrics_note_repeat();
