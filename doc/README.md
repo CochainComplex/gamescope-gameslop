@@ -38,6 +38,8 @@ Read in this order:
 3. One mechanism you care about: bidirectional interpolation (3.3), the degradation ladder (4.4), or the learned refiner (3.5).
 4. [Maintenance](framegen-maintenance.md), "Source map": which file owns what, plus invariants and validation by change class.
 5. [Testing](framegen-testing.md), "Overview and quick commands": the test harnesses and A/B tooling.
+6. [Quality roadmap](framegen-quality-roadmap.md): five actionable quality experiments, evaluation prerequisites, architecture constraints and implementation order. This is a plan, not a claim that the proposed improvements have shipped.
+7. [Experimental NPU assistance](framegen-npu-experiment.md): spike review, isolated CPU-learning/NPU-inference prototype, generic adapter boundaries and gates before live integration. Results and the fast-path roadmap: [NPU findings](framegen-npu-findings.md).
 
 Build and run the contract tests. The README Install step configured `build/` with tests off, so turn them on in the same directory (`enable_tests` is a Meson option in [`meson_options.txt`](../meson_options.txt)):
 
@@ -73,6 +75,9 @@ You can skip these. They explain how the design came to be and are not needed to
 | [framegen-architecture.md](framegen-architecture.md) | Developers | How generation, scheduling, and presentation work. |
 | [framegen-maintenance.md](framegen-maintenance.md) | Developers | Source map, invariants and what to validate for each kind of change. |
 | [framegen-testing.md](framegen-testing.md) | Developers | Test harnesses, A/B tooling and recorded results. |
+| [framegen-quality-roadmap.md](framegen-quality-roadmap.md) | Developers | Current Spatial baseline and five quality workstreams: cheaper reconstruction, displayed-motion training, robust matching, informative updates/priors, and bounded visibility/history. Includes experiment gates and a resumable backlog. |
+| [framegen-npu-experiment.md](framegen-npu-experiment.md) | Developers | Optional NPU companion design, spike limitations, CPU training/export and AMD/Intel adapters. Offline experiment; no renderer integration or demonstrated quality gain. |
+| [framegen-npu-findings.md](framegen-npu-findings.md) | Developers | NPU campaign results (latency, BF16 parity, compile cost vs CPU/GPU), data lessons, where iGPU time goes, ranked offload ideas, zero-copy/sync fast paths, experiment plan E-A–E-C with go/no-go. |
 | [framegen-proposals/](framegen-proposals/README.md) | Developers | Design proposals 01-07: historical design records. |
 | [../scripts/README.md](../scripts/README.md) | Players (first sections), developers | Players: read only "If something is wrong", "For players" and "Hybrid laptops". The rest is developer tooling. |
 | [research-framegen.md](research-framegen.md) | Developers, curious readers | Background research. Not needed to play. |
