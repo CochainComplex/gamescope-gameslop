@@ -45,6 +45,61 @@ CausalPlanOptions_t dedicated_backup_options( uint64_t nowNs, uint64_t epoch )
 
 } // namespace
 
+
+TEST_CASE("GPU diagnostics distinguish candidates from verified device inventory", "[framegen][hud][gpu-diagnostics]")
+{
+    GpuDiagnostics inventory;
+    inventory.cards={
+        {"AMD integrated", "0000:66:00.0", "/dev/dri/renderD128", "RADV", 0x1002,0x150e,false},
+        {"NVIDIA discrete", "0000:01:00.0", "/dev/dri/renderD129", "NVIDIA",0x10de,0x2db9,false},
+        {"CPU Vulkan", "", "", "software",0x10005,0,true}};
+    inventory.presenter=0;
+    inventory.scope="Nested swapchain: outer display GPU unknown";
+    inventory.build="0.1.0+abc123+";
+    const auto inferred=resolve_gpu_diagnostics(inventory,gpu_buffer_observation("NVIDIA",true));
+    REQUIRE(inferred.renderer==1u);
+    CHECK(inferred.cards[inferred.presenter].pci=="0000:66:00.0");
+    CHECK(inferred.cards[inferred.renderer].pci=="0000:01:00.0");
+    CHECK(inferred.evidence.find("Inferred")!=std::string::npos);
+    CHECK(inferred.transport=="staged / copied");
+    CHECK(inferred.scope.find("outer display GPU unknown")!=std::string::npos);
+    CHECK(inferred.build==inventory.build);
+
+    const auto linear=resolve_gpu_diagnostics(inventory,gpu_buffer_observation("linear",false));
+    CHECK(linear.renderer==kUnknownGpu); // Importability is not producer identity.
+    CHECK(linear.evidence.find("no GPU identity")!=std::string::npos);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("cpu",false)).renderer==kUnknownGpu);
+    CHECK(resolve_gpu_diagnostics(inventory,0).renderer==kUnknownGpu);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("AMD",false)).renderer==0u);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("linear",true)).renderer==1u);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("vendor0xaa",true)).renderer==kUnknownGpu);
+
+    auto multiple=inventory;
+    multiple.cards.push_back({"Second NVIDIA", "0000:02:00.0", "", "",0x10de,0x2db9,false});
+    const auto ambiguous=resolve_gpu_diagnostics(multiple,gpu_buffer_observation("NVIDIA",true));
+    CHECK(ambiguous.renderer==kUnknownGpu);
+    CHECK(ambiguous.evidence.find("multiple")!=std::string::npos);
+    CHECK(resolve_gpu_diagnostics(multiple,gpu_buffer_observation("linear",true)).renderer==kUnknownGpu);
+
+    GpuDiagnosticsStore cache;
+    cache.initialize(inventory);
+    cache.observe("NVIDIA",true);
+    CHECK(cache.snapshot().renderer==1u);
+    cache.initialize(multiple); // Reinitialization must not reuse an old observation.
+    CHECK(cache.snapshot().renderer==kUnknownGpu);
+
+    FramegenHudSnapshot_t snapshot;
+    snapshot.gpu=inferred;
+    snapshot.clientBuffersStaged=true;
+    const auto hud=format_framegen_hud(2u,snapshot);
+    CHECK(std::string_view(hud.lines[1].data()).find("COMPOSE: AMD integrated @ 0000:66:00.0")!=std::string_view::npos);
+    CHECK(std::string_view(hud.lines[2].data()).find("RENDER?: NVIDIA discrete @ 0000:01:00.0")!=std::string_view::npos);
+    CHECK(std::string_view(hud.lines[2].data()).find("[staged]")!=std::string_view::npos);
+    snapshot.gpu=ambiguous;
+    CHECK(std::string_view(format_framegen_hud(2u,snapshot).lines[2].data()).find("@ unknown")!=std::string_view::npos);
+    for (uint32_t i=0;i<hud.lineCount;++i) CHECK(std::strlen(hud.lines[i].data())<=k_uFramegenHudMaxColumns);
+}
+
 TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]" )
 {
 	const FramegenHudSnapshot_t snapshot = {
@@ -76,30 +131,32 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	};
 	const FramegenHudText_t text = format_framegen_hud( 2u, snapshot );
 
-	REQUIRE( text.lineCount == 7u );
+	REQUIRE( text.lineCount == 8u );
 	CHECK( text.lines[0].data() == std::string_view{
 		"gameslop 0.1.0+76e6d5         motion x2 . learned . 120Hz fixed" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics render NVIDIA GeForce RTX  buffers xGPU" } );
+		"PRESENT: AMD Radeon Graphics @ unknown" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:online  adapt:on" } );
+		"RENDER?: NVIDIA GeForce RTX 3070 @ unknown [staged]" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 98%" } );
+		"BIDIR: off | BASE: off | NET: online | ADAPT: on" } );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   learned/motion rung 0/0  full" } );
-	std::string paceLine = "pace     hit 99%  ";
+		"SOURCE: 40fps[200] | GEN: 78fps[390] | REPEAT: 2fps | FILL: 98%" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: learned/motion rung 0/0 | STATE: full" } );
+	std::string paceLine = "HIT: 99% ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x08' );
-	paceLine += "   jitter +/-0.7ms  ";
+	paceLine += " | JITTER: +/-0.7ms ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x02' );
-	CHECK( text.lines[5].data() == paceLine );
-	CHECK( text.lines[6].data() == std::string_view{
-		"net      online . 1.2k steps . profile loaded" } );
+	CHECK( text.lines[6].data() == paceLine );
+	CHECK( text.lines[7].data() == std::string_view{
+		"LEARN: online | STEPS: 1.2k | PROFILE: loaded" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 
 	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
-	CHECK( uniform.lineCount == 7u );
-	CHECK( uniform.widthChars == 68u );
+	CHECK( uniform.lineCount == 8u );
+	CHECK( uniform.widthChars <= k_uFramegenHudMaxColumns );
 	CHECK( uniform.hdr == 1u );
 	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'g' ) );
 	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
@@ -109,17 +166,17 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	tiledSnapshot.renderOrigin = "NVIDIA";
 	const FramegenHudText_t tiledText = format_framegen_hud( 2u, tiledSnapshot );
 	CHECK( tiledText.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics render NVIDIA              buffers xGPU" } );
+		"PRESENT: AMD Radeon Graphics @ unknown" } );
 
 	auto ambiguousLinearSnapshot = snapshot;
 	ambiguousLinearSnapshot.otherDeviceName = nullptr;
 	const FramegenHudText_t ambiguousLinearText =
 		format_framegen_hud( 2u, ambiguousLinearSnapshot );
 	CHECK( ambiguousLinearText.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics render other-GPU           buffers xGPU" } );
+		"PRESENT: AMD Radeon Graphics @ unknown" } );
 }
 
-TEST_CASE( "CGA HUD preserves its ABI and ordered two-color fade", "[framegen][hud]" )
+TEST_CASE( "CGA HUD uses the matching bounded ABI and ordered two-color fade", "[framegen][hud]" )
 {
 	CHECK( framegen_hud_cga_color( 0u, 0u, 0u ) == 0x55ffffu );
 	CHECK( framegen_hud_cga_color( 0u, 0u, 1u ) == 0x55ffffu );
@@ -150,7 +207,7 @@ TEST_CASE( "CGA HUD preserves its ABI and ordered two-color fade", "[framegen][h
 	CHECK( cga.font == normal.font );
 	CHECK( cga.text == normal.text );
 	CHECK( cga.lineCount == normal.lineCount );
-	CHECK( sizeof( cga ) == 1584u );
+	CHECK( sizeof( cga ) == 1648u );
 	CHECK( framegen_hud_line_pitch( false ) == 8u );
 	CHECK( framegen_hud_line_pitch( true ) == 11u );
 	CHECK( framegen_hud_height( 5u, false ) == 48u );
@@ -184,28 +241,28 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 	};
 	const FramegenHudText_t text = format_framegen_hud_detailed( 1u, snapshot );
 
-	REQUIRE( text.lineCount == 5u );
+	REQUIRE( text.lineCount == 6u );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon RX 5700  render n/a                 buffers local" } );
-	CHECK( text.lines[2].data() == std::string_view{
-		"modes    bidir:requested(OFF)  base:off  net:off  adapt:off" } );
+		"PRESENT: AMD Radeon RX 5700 XT @ unknown" } );
+	CHECK( text.lines[3].data() == std::string_view{
+		"BIDIR: requested(OFF) | BASE: off | NET: off | ADAPT: off" } );
 	auto netOnly = snapshot;
 	netOnly.bidirRequested = false;
 	netOnly.netRequested = true;
 	const FramegenHudText_t netText = format_framegen_hud_detailed( 1u, netOnly );
-	CHECK( netText.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:requested(OFF)  adapt:off" } );
+	CHECK( netText.lines[3].data() == std::string_view{
+		"BIDIR: off | BASE: off | NET: requested(OFF) | ADAPT: off" } );
 	auto bothRequested = snapshot;
 	bothRequested.netRequested = true;
 	const FramegenHudText_t bothText = format_framegen_hud_detailed( 1u, bothRequested );
-	CHECK( bothText.lines[2].data() == std::string_view{
-		"modes    bidir:requested(OFF)  base:off  net:requested(OFF)  adapt:off" } );
+	CHECK( bothText.lines[3].data() == std::string_view{
+		"BIDIR: requested(OFF) | BASE: off | NET: requested(OFF) | ADAPT: off" } );
 	auto vrrOnly = snapshot;
 	vrrOnly.bidirRequested = false;
 	vrrOnly.vrrRequested = true;
 	const FramegenHudText_t vrrText = format_framegen_hud_detailed( 1u, vrrOnly );
-	CHECK( vrrText.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:off  adapt:off  vrr:requested(off)" } );
+	CHECK( vrrText.lines[3].data() == std::string_view{
+		"BIDIR: off | BASE: off | NET: off | ADAPT: off | VRR: requested(off)" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 }
@@ -227,29 +284,34 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 
 	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[0].data() == std::string_view{
-		"source 40fps | generated 78fps | fill 98%" } );
+		"SOURCE: 40 fps | GENERATED: 78 fps | FILL: 98%" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"motion / learned x2 | 120Hz | git 76e6d5" } );
+		"MODE: motion/learned x2 120Hz | GIT: 76e6d5" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"learning off | profile not loaded" } );
+		"LEARN: off | PROFILE: not loaded" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"full | deadline 0% | jitter 0.0ms" } );
+		"STATE: full | HIT: 0% | JITTER: 0.0ms" } );
 	CHECK( text.lines[4].data() ==
-		"deadline " + std::string( 12, '\x01' ) + " | jitter " + std::string( 12, '\x01' ) );
+		"HIT: " + std::string( 12, '\x01' ) + " | JITTER: " + std::string( 12, '\x01' ) );
 	auto buildIdentity = snapshot;
 	buildIdentity.version = "3.16.14+96ad25e89-dirty";
 	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
-		"git 96ad25e89-dirty" ) != std::string_view::npos );
+		"GIT: 96ad25e89-dirty" ) != std::string_view::npos );
 	// Meson's dirty checkout marker is a trailing '+', not only '-dirty'.
 	buildIdentity.version = "0.1.0+96ad25e89+";
 	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
-		"git 96ad25e89+" ) != std::string_view::npos );
+		"GIT: 96ad25e89+" ) != std::string_view::npos );
 	buildIdentity.version = nullptr;
 	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
-		"git unknown" ) != std::string_view::npos );
+		"GIT: unknown" ) != std::string_view::npos );
 	const auto uniform = make_framegen_hud_uniform( text, false );
 	CHECK( uniform.lineCount == 5u );
 	CHECK( uniform.widthChars <= k_uFramegenHudMaxColumns );
+	// SOURCE is a label; its measured value carries the high-bit attribute.
+	CHECK_FALSE( framegen_hud_value_column(text.lines[0].data(),0u) );
+	CHECK( framegen_hud_value_column(text.lines[0].data(),8u) );
+	CHECK( ((uniform.text[2] >> 0u) & 0xffu) == (uint32_t('4') | 128u) );
+	CHECK( (uniform.text[0] & 0xffu) == uint32_t('S') );
 
 	auto warning = snapshot;
 	warning.netRequested = true;
@@ -268,7 +330,7 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	warning.pacingSdMsHistory.fill( 4.0 );
 	const auto training = format_framegen_hud( 1u, warning );
 	CHECK( training.lines[4].data() ==
-		"deadline " + std::string( 12, '\x08' ) + " | jitter " + std::string( 12, '\x08' ) );
+		"HIT: " + std::string( 12, '\x08' ) + " | JITTER: " + std::string( 12, '\x08' ) );
 	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
 }
 
@@ -286,27 +348,27 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 		.ladderRecoveryBackoffDecisions = 90u,
 	};
 	FramegenHudText_t text = format_framegen_hud_detailed( 1u, snapshot );
-	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 100%" } );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  hold" } );
+		"SOURCE: 246fps[1.2k] | GEN: 999fps[56.8k] | REPEAT: 0fps | FILL: 100%" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: hold" } );
 
 	snapshot.ladderHold = 0u;
 	snapshot.ladderRecoveryProbationRemaining = 46u;
 	text = format_framegen_hud_detailed( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  probation 2s" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: probation 2s" } );
 
 	snapshot.ladderRecoveryProbationRemaining = 0u;
 	snapshot.ladderRecoveryDecisionsSinceClimb = 44u;
 	text = format_framegen_hud_detailed( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  recover in 2s" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: recover in 2s" } );
 
 	snapshot.ladderRecoveryDecisionsSinceClimb = 90u;
 	text = format_framegen_hud_detailed( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  watching" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: watching" } );
 }
 
 TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",

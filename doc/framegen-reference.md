@@ -380,13 +380,19 @@ prefix such as `--child -- %command%`). See `scripts/gamescope-hybrid.sh --help`
 
 `GAMESCOPE_FRAMEGEN_HUD=1` draws four concise lines: source/generated rates and fill; mode/pipeline/multiplier, refresh/VRR and Git checkout hash; learning steps and loaded-profile status; recovery state, deadline hit rate and jitter. A fifth line shows twelve-window deadline-hit and jitter sparklines (0–100% and 0–4 ms scales). Requested-but-inactive net, bidirectional or VRR features add a sixth status line. `2` shows the full diagnostic rows below.
 `GAMESCOPE_FRAMEGEN_HUD_SCALE` sizes it and `GAMESCOPE_FRAMEGEN_HUD_CORNER`
-places it (bottom right by default). The violet backing is only 14% opaque (86% of the underlying scene remains), with 86%-opacity text. The thin muted cyan/magenta edges, and smaller automatic font share the native settings menu palette. HDR HUD colors are blended in linear Rec.2020 at a 160-nit reference and then encoded to PQ; the underlying frame encoding is preserved.
+places it (bottom right by default). The violet backing is only 14% opaque (86% of the underlying scene remains), with 90%-opacity cyan labels and 98%-opacity white values. The thin muted cyan/magenta edges, and smaller automatic font share the native settings menu palette. HDR HUD colors are blended in linear Rec.2020 at a 160-nit reference and then encoded to PQ; the underlying frame encoding is preserved.
 
 `GAMESCOPE_FRAMEGEN_HUD_OPACITY=0..100` overrides background opacity only;
 0 makes the backing clear, 100 makes it solid, and an unset value uses the style
 default (14% Quiet/Mallsoft, 36% CGA). Text remains independently readable.
 CGA uses white lettering with a black pixel outline, wider row spacing, and a
 cyan-to-magenta ordered dither. HUD Text Size in the menu offers Auto or 1–6×.
+
+Compact fields use cyan labels, colons and bright measured values. Spatial is
+marked `[EXP]` when shown. The built-in `spatial-experimental` menu preset
+selects Spatial without replacing the game's learned file. NPU training is
+shown as unavailable: the offline NPU inference companion does not replace
+GPU online training.
 
 Per-game settings can be edited with the optional [native Wayland menu](../tools/vapor-menu/README.md). Preset changes are saved for the next launch and do not replace learned weight files.
 

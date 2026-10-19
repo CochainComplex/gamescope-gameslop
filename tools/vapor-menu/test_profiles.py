@@ -109,6 +109,39 @@ class Profiles(unittest.TestCase):
             self.assertNotIn("GAMESCOPE_FRAMEGEN_HUD_OPACITY", env)
             self.assertNotIn("GAMESCOPE_FRAMEGEN_HUD_SCALE", env)
 
+    def test_experimental_preset_and_unavailable_npu_are_truthful(self):
+        with tempfile.TemporaryDirectory(prefix="vapor-experiments-", dir="/tmp") as work:
+            folder = Path(work) / "game"
+            self.assertEqual(launcher.load(folder / "spatial-experimental.ini")["pipeline"], "spatial")
+            args = argparse.Namespace(game="game", profile="spatial-experimental", profile_root=work,
+                                      net_profile=None, gamescope="/host/gamescope", host_arg=[], command=["game"])
+            command, env, *_ = launcher.launch_plan(args, {})
+            self.assertEqual(command[command.index("--framegen-pipeline")+1], "spatial")
+            self.assertEqual(env["GAMESCOPE_FRAMEGEN_NET_ONLINE"], "1")
+            self.assertFalse(folder.exists())  # Virtual preset never rewrites weights/settings.
+            folder.mkdir()
+            path = folder / "spatial-experimental.ini"
+            path.write_text("version=1\npipeline=guided\n")
+            self.assertEqual(launcher.load(path)["pipeline"], "guided")  # User override wins.
+            path.write_text("version=1\ntraining_device=npu\n")
+            with self.assertRaisesRegex(ValueError, "NPU training unavailable"):
+                launcher.launch_plan(args, {})
+            self.assertFalse((folder / "learned.bin").exists())
+
+    def test_spatial_builtin_refuses_older_host_without_writes(self):
+        with tempfile.TemporaryDirectory(prefix="vapor-old-host-", dir="/tmp") as work:
+            host = Path(work) / "gamescope"
+            host.write_text("#!/bin/sh\n[ \"$1\" = --help ] || exit 91\necho \"--framegen-pipeline NAME 'warp', 'learned'\"\n")
+            host.chmod(0o700)
+            root = Path(work) / "profiles"
+            command = ["python3", str(ROOT / "scripts/vapor-profile.py"), "--game", "game",
+                       "--profile", "spatial-experimental", "--profile-root", str(root),
+                       "--gamescope", str(host), "--dry-run", "--", "game"]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Spatial" if ROOT.name == "gamescope" else "does not support", result.stderr)
+            self.assertFalse(root.exists())
+
     def test_reject_invalid_presets(self):
         for invalid in ["..", "../game", "with space", "", "a"*65]:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):

@@ -3,13 +3,16 @@
 These images are generated from the actual menu artwork and runtime HUD
 formatter with illustrative values. They are CPU layout previews, not game
 captures or measurements of framegen image quality. The backgrounds behind
-the HUD make its transparency visible.
+the HUD make its transparency visible. Labels are cyan and values bright white,
+with explicit field separators. The NPU switch is disabled because the existing
+prototype does offline inference, not live GPU training replacement.
 
 | Selectable menu style | Preview |
 |---|---|
 | **Quiet** — current default; faded cyan/mauve on a dark translucent panel. | [quiet.png](quiet.png) |
 | **Mallsoft** — warm stone, washed teal, dusty rose and an empty glass/column motif in the header. | [mallsoft.png](mallsoft.png) |
-| **CGA** — cyan at the top, magenta at the bottom, mixed through chunky ordered pixels; black/white text. | [cga.png](cga.png) |
+| **CGA** — cyan at the top, magenta at the bottom, mixed through chunky ordered pixels; dark text panels. | [cga.png](cga.png) |
+| **Experimental settings** — built-in Spatial preset and unavailable NPU training switch; all eighteen controls visible. | [experiments.png](experiments.png) |
 
 Choose **Menu Style** with Left/Right or Enter. It previews immediately.
 **Save Preset** remembers the style for that game's preset. Appearance controls

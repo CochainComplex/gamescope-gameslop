@@ -54,6 +54,7 @@
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
+#include "framegen/gpu_diagnostics.hpp"
 #include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
@@ -251,7 +252,7 @@ static constexpr size_t k_nFramegenHudPersistentBytes =
 	k_nFramegenHudUploadSlots * sizeof( gamescope::framegen::FramegenHudUniform_t );
 static constexpr size_t k_nFramegenHudPersistentPad =
 	( ( k_nFramegenHudPersistentBytes + 4095u ) / 4096u ) * 4096u;
-static_assert( k_nFramegenHudPersistentBytes == 3'168u );
+static_assert( k_nFramegenHudPersistentBytes == 3'296u );
 static_assert( k_nFramegenHudPersistentPad == 4'096u );
 static_assert( CVulkanDevice::upload_buffer_persistent_pad
 	>= k_nFramegenHudPersistentPad );
@@ -848,6 +849,69 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 			std::snprintf( m_framegenOtherDeviceName.data(),
 				m_framegenOtherDeviceName.size(), "%s", otherProperties.deviceName );
 		}
+	}
+
+	// Capture bounded, read-only device metadata once; no Vulkan/DRM queries
+	// are made by diagnostics requests or the compositor's observation path.
+	{
+		gamescope::framegen::GpuDiagnostics inventory;
+		inventory.scope = GetBackend()->UsesVulkanSwapchain()
+			? "Nested swapchain: outer display GPU unknown"
+			: "Backend owns output: Vulkan compositor device shown";
+		inventory.build = gamescope::k_szGamescopeHudVersion;
+		std::vector<VkPhysicalDevice> diagnosticDevices{m_physDev};
+		for (auto physical : physDevs) if (physical!=m_physDev) diagnosticDevices.push_back(physical);
+		for (auto physical : diagnosticDevices) {
+			if (inventory.cards.size() >= 16u) break;
+			VkPhysicalDeviceProperties properties;
+			vk.GetPhysicalDeviceProperties(physical, &properties);
+			uint32_t count = 0;
+			vk.EnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+			std::vector<VkExtensionProperties> extensions(count);
+			vk.EnumerateDeviceExtensionProperties(physical, nullptr, &count, extensions.data());
+			auto supports = [&](const char *name) {
+				return std::any_of(extensions.begin(),extensions.end(),[&](const auto &ext) {
+					return std::strcmp(ext.extensionName,name)==0;
+				});
+			};
+			VkPhysicalDeviceProperties2 info{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+			VkPhysicalDeviceDriverProperties driver{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+			VkPhysicalDevicePCIBusInfoPropertiesEXT pci{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT };
+			VkPhysicalDeviceDrmPropertiesEXT drm{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT };
+			if (properties.apiVersion >= VK_API_VERSION_1_2 || supports(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+				driver.pNext=info.pNext; info.pNext=&driver;
+			}
+			if (supports(VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) { pci.pNext=info.pNext; info.pNext=&pci; }
+			if (supports(VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) { drm.pNext=info.pNext; info.pNext=&drm; }
+			vk.GetPhysicalDeviceProperties2(physical,&info);
+			gamescope::framegen::GpuCard card;
+			card.name=properties.deviceName; card.vendor=properties.vendorID; card.device=properties.deviceID;
+			card.software=properties.deviceType==VK_PHYSICAL_DEVICE_TYPE_CPU;
+			char value[128];
+			if (supports(VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) {
+				std::snprintf(value,sizeof(value),"%04x:%02x:%02x.%u",pci.pciDomain,pci.pciBus,pci.pciDevice,pci.pciFunction);
+				card.pci=value;
+			}
+#if HAVE_DRM
+			if (drm.hasRender) {
+				drmDevice *device=nullptr;
+				if (drmGetDeviceFromDevId(makedev(drm.renderMajor,drm.renderMinor),0,&device)==0) {
+					if (device->available_nodes & (1<<DRM_NODE_RENDER)) card.node=device->nodes[DRM_NODE_RENDER];
+					if (card.pci.empty() && device->bustype==DRM_BUS_PCI && device->businfo.pci) {
+						auto bus=device->businfo.pci;
+						std::snprintf(value,sizeof(value),"%04x:%02x:%02x.%u",bus->domain,bus->bus,bus->dev,bus->func);
+						card.pci=value;
+					}
+					drmFreeDevice(&device);
+				}
+			}
+#endif
+			if (driver.driverName[0]) card.driver=std::string(driver.driverName)+" / "+driver.driverInfo;
+			else { std::snprintf(value,sizeof(value),"driver version 0x%x",properties.driverVersion); card.driver=value; }
+			if (physical==m_physDev) inventory.presenter=inventory.cards.size();
+			inventory.cards.push_back(std::move(card));
+		}
+		gamescope::framegen::gpu_diagnostics_store().initialize(std::move(inventory));
 	}
 
 	// Record how many queues the chosen compositor family exposes, so
@@ -11304,6 +11368,7 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.otherDeviceName = g_device.framegenOtherDeviceName(),
 		.renderOrigin = pBaseClientTexture != nullptr
 			? pBaseClientTexture->renderOrigin() : nullptr,
+		.gpu = gamescope::framegen::gpu_diagnostics_store().snapshot(),
 		.mode = effective.mode,
 		.pipeline = effective.pipeline,
 		.multiplier = effective.multiplier,
@@ -16027,6 +16092,12 @@ static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo
 
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud, const struct FrameInfo_t *pHudFrameInfo )
 {
+	if (!pOutputOverride && increment) {
+		const auto *client=framegen_hud_base_client_texture(frameInfo);
+		gamescope::framegen::gpu_diagnostics_store().observe(
+			client ? client->renderOrigin() : nullptr, client && client->deviceLocalStagingImage());
+	}
+
 	// Offscreen overrides do not consume a swapchain image. The generated
 	// window-present path reconciles before selecting its explicit override.
 	if ( !pOutputOverride && GetBackend()->UsesVulkanSwapchain()

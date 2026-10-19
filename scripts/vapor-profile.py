@@ -14,6 +14,7 @@ CHOICES = {
     "framegen": ("on", "off"), "mode": ("motion", "extrapolate", "blend"),
     "pipeline": ("warp", "checked", "learned", "predict", "guided", "spatial"),
     "multiplier": ("2", "3", "4"), "online": ("on", "off"),
+    "training_device": ("gpu", "npu"),
     "bidir": ("off", "on"), "hud": ("1", "2", "0"),
     "corner": ("br", "bl", "tr", "tl", "bc"),
     "style": ("quiet", "mallsoft", "cga"),
@@ -137,6 +138,8 @@ def validate_net_profile(path):
 def load(path):
     settings = DEFAULTS.copy()
     if not path.exists():
+        if path.stem == "spatial-experimental":
+            settings["pipeline"] = "spatial"
         return settings
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 8192:
         raise ValueError("Preset must be a small regular file")
@@ -177,6 +180,8 @@ def launch_plan(args, environment):
         profile = active.read_text().removesuffix("\n")
     profile = identifier(profile or "default")
     settings = load(root / game / f"{profile}.ini")
+    if settings["training_device"] != "gpu":
+        raise ValueError("NPU training unavailable: current companion supports offline inference only")
     context = launch_context(args.host_arg, environment)
     validate(settings, context)
     env = environment.copy()

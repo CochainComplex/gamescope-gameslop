@@ -26,6 +26,7 @@ inline const std::map<std::string, std::vector<std::string>> choices{
     {"pipeline", {"warp", "checked", "learned", "predict", "guided", "spatial"}},
     {"multiplier", {"2", "3", "4"}},
     {"online", {"on", "off"}},
+    {"training_device", {"gpu", "npu"}},
     {"bidir", {"off", "on"}},
     {"hud", {"1", "2", "0"}},
     {"corner", {"br", "bl", "tr", "tl", "bc"}},
@@ -77,7 +78,7 @@ inline void validateLearned(const fs::path &path) {
 struct Profile {
     std::map<std::string,std::string> values{
         {"framegen","on"}, {"mode","motion"}, {"pipeline","learned"},
-        {"multiplier","2"}, {"online","on"}, {"bidir","off"},
+        {"training_device","gpu"}, {"multiplier","2"}, {"online","on"}, {"bidir","off"},
         {"hud","1"}, {"corner","br"}, {"net_profile",""}, {"style","quiet"}, {"hud_opacity","auto"}, {"hud_scale","auto"},
     };
     void set(const std::string &key, const std::string &value) {
@@ -129,7 +130,10 @@ struct Profile {
 };
 inline Profile load(const fs::path &path) {
     Profile p;
-    if (!fs::exists(path)) return p;
+    if (!fs::exists(path)) {
+        if (path.stem()=="spatial-experimental") p.set("pipeline","spatial");
+        return p;
+    }
     if (fs::is_symlink(path) || !fs::is_regular_file(path) || fs::file_size(path)>8192)
         throw std::runtime_error("Profile must be a small regular file");
     std::ifstream in(path);
@@ -171,6 +175,8 @@ inline void writeAtomic(const fs::path &path, const std::string &bytes) {
     } catch (...) { if (fd>=0) close(fd); unlink(temporary.c_str()); throw; }
 }
 inline void save(const fs::path &path, const Profile &p) {
+    if (p.values.at("training_device")!="gpu")
+        throw std::runtime_error("NPU training unavailable / offline inference only");
     // Validate even when the caller constructed values directly.
     Profile checked;
     for (auto &[key,value] : p.values) checked.set(key,value);
@@ -284,7 +290,8 @@ struct Store {
         status="Unsaved / learned file unchanged";
     }
     void refresh() {
-        names={name};
+        names={"default",name};
+        if (context.supportsPipeline("spatial")) names.push_back("spatial-experimental");
         if (fs::is_directory(directory)) for (auto &file : fs::directory_iterator(directory))
             if (file.is_regular_file() && !file.is_symlink() && file.path().extension()==".ini" && identifier(file.path().stem().string()))
                 names.push_back(file.path().stem().string());
@@ -295,6 +302,8 @@ struct Store {
         int at=int(std::find(names.begin(),names.end(),name)-names.begin());
         auto next=names[(at+int(names.size())+delta)%int(names.size())];
         auto loaded=load(directory/(next+".ini"));
+        if (next=="spatial-experimental" && !fs::exists(directory/(next+".ini")))
+            loaded.set("net_profile",draft.values.at("net_profile"));
         name=next; draft=loaded;
         if (draft.values["net_profile"].empty()) draft.set("net_profile",(directory/"learned.bin").string());
         refreshLearned(); status="Editing "+name+" / next launch";

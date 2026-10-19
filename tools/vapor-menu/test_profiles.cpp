@@ -33,6 +33,15 @@ int main(int argc, char **argv) {
     }
     vapor::fs::path root=argv[1];
     vapor::fs::create_directories(root);
+    const auto builtIn = vapor::load(root/"spatial-experimental.ini");
+    assert(builtIn.values.at("pipeline")=="spatial");
+    assert(builtIn.values.at("bidir")=="off");
+    assert(builtIn.values.at("training_device")=="gpu");
+    assert(!vapor::fs::exists(root/"spatial-experimental.ini"));
+    auto unavailable=builtIn; unavailable.set("training_device","npu");
+    assert(rejects([&]{vapor::save(root/"npu.ini",unavailable);}));
+    assert(!vapor::fs::exists(root/"npu.ini"));
+
     assert(!vapor::identifier("../weights"));
     assert(!vapor::identifier(".."));
     assert(vapor::identifier("farcry6-test"));
@@ -80,6 +89,12 @@ int main(int argc, char **argv) {
     assert(store.name=="default");
     assert(store.draft.values.at("pipeline")=="warp");
     assert(vapor::active(root/"test-game")=="custom-1");
+    auto selectedWeights=store.draft.values.at("net_profile");
+    for (size_t i=0;i<store.names.size() && store.name!="spatial-experimental";++i) store.select(1);
+    assert(store.name=="spatial-experimental");
+    assert(store.draft.values.at("pipeline")=="spatial");
+    assert(store.draft.values.at("net_profile")==selectedWeights);
+    assert(!vapor::fs::exists(root/"test-game/spatial-experimental.ini"));
     // Explicit selection must not consult a broken last-used marker.
     std::ofstream(root/"test-game/.active") << "bad marker\nextra\n";
     setenv("VAPOR_PROFILE","default",1);

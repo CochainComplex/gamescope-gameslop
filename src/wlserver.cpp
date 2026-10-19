@@ -57,6 +57,7 @@
 #include "presentation-time-protocol.h"
 
 #include "wlserver.hpp"
+#include "WaylandServer/GpuDiagnostics.h"
 #include "hdmi.h"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
@@ -1567,6 +1568,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 static void create_gamescope_control( void )
 {
 	wl_global_create( wlserver.display, &gamescope_control_interface, gamescope_control_interface.version, NULL, gamescope_control_bind );
+	gamescope::create_gpu_diagnostics_global(wlserver.display);
 }
 
 ////////////////////////

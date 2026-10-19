@@ -92,7 +92,7 @@ Save Preset remembers both for the next launch. The launcher exports
 `GAMESCOPE_FRAMEGEN_HUD_OPACITY` and `GAMESCOPE_FRAMEGEN_HUD_SCALE`; Auto
 clears those overrides.
 
-All seventeen controls are visible together in a two-column layout: frame
+All eighteen controls are visible together in a two-column layout: frame
 generation on the left, HUD/appearance on the right, preset above and actions
 below. Integer-scaled text fits a 608×340 logical panel (2× at 1280×720).
 Up/Down follows the visual order; Left/Right edits; Enter activates actions;
@@ -181,3 +181,27 @@ memory/queues, buffer formats, allocation failures and timing pressure still
 require the renderer's runtime checks and may cause dormancy or fallback. Use
 the HUD/logs to inspect the effective mode. A missing frozen weight set leaves
 the optional refiner inactive; it does not make the underlying pipeline invalid.
+
+Experimental settings: **spatial-experimental** is a built-in next-launch preset
+(Motion, Spatial, ×2, GPU online training, bidirectional off). It is offered
+alongside saved presets; an existing file with that name takes precedence.
+The preset is virtual until saved and reuses the game's existing learned-file
+reference. Spatial keeps its own role/encoding weight set inside that file.
+The integrated launcher probes host support; the legacy launcher also refuses
+a Spatial launch on a host that does not advertise it. No old host is upgraded.
+The pipeline selector marks Spatial **[EXPERIMENTAL]**.
+
+**NPU TRAINING [EXPERIMENTAL]** shows a disabled switch beside GPU training.
+Its explanation is “NPU training unavailable / offline inference only”. The
+current [NPU companion](../../doc/framegen-npu-experiment.md) performs offline
+inference and separate CPU training; it cannot replace GPU online gradients.
+The schema reserves `training_device=gpu|npu` (default `gpu`), but saving or
+launching an NPU selection is refused. No SDK probe, compilation or helper is
+run at startup. This control is a visible availability indicator, not live NPU
+offload. Training remains on the GPU.
+
+HUD labels use muted cyan (canonical cyan in CGA); measured values use bright
+white. Colons and pipe-delimited fields separate the readings, for example
+`SOURCE: 40 fps | GENERATED: 78 fps | FILL: 98%`. Sparklines, checkout hash and
+independent backing opacity remain. Label/value attributes fit inside the
+existing packed character bytes; the uniform remains 1584 bytes.
