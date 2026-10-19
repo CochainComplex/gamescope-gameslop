@@ -99,6 +99,24 @@ enum class FramegenHudStyle : uint32_t
 	return std::nullopt;
 }
 
+// GAMESCOPE_FRAMEGEN_HUD_STYLE when unset or invalid, and how the log names it.
+inline constexpr FramegenHudStyle k_eFramegenHudStyleDefault = FramegenHudStyle::Quiet;
+inline constexpr const char *k_pszFramegenHudStyleDefault = "quiet";
+
+// The style a raw GAMESCOPE_FRAMEGEN_HUD_STYLE value (getenv's result) selects,
+// as framegen_setting resolves it with parse_hud_style_setting: unset or
+// invalid keeps the default (framegen_setting logs an invalid value once).
+[[nodiscard]] inline FramegenHudStyle resolve_hud_style_setting( const char *value )
+{
+	return parse_hud_style_setting( value ).value_or( k_eFramegenHudStyleDefault );
+}
+
+// Quiet and Mallsoft share the shader's muted palette; only CGA differs.
+[[nodiscard]] constexpr bool framegen_hud_style_cga( FramegenHudStyle style )
+{
+	return style == FramegenHudStyle::Cga;
+}
+
 // Parse the complete string and reject non-finite values explicitly. Keeping
 // range policy at the call site makes clamp-vs-fallback behavior reviewable for
 // each setting while sharing one strict lexical contract.

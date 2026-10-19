@@ -3,6 +3,7 @@
 
 #include "framegen/deadline.hpp"
 #include "framegen/hud.hpp"
+#include "framegen/hud_history.hpp"
 
 #include <algorithm>
 #include <array>
@@ -366,6 +367,150 @@ static std::string framegen_hud_shader_source()
 		std::istreambuf_iterator<char>() );
 }
 
+static std::string framegen_read_source( const char *path )
+{
+	std::ifstream file( path );
+	return std::string( ( std::istreambuf_iterator<char>( file ) ),
+		std::istreambuf_iterator<char>() );
+}
+
+static bool framegen_source_ident( char c )
+{
+	return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) || c == '_';
+}
+
+// C++/GLSL source reduced to a canonical form for exact comparison: comments
+// dropped, whitespace removed except one space between two identifier
+// characters, string/char literals kept verbatim (raw strings and digit
+// separators included). `literal` marks the characters inside a literal.
+struct FramegenSourceCode
+{
+	std::string text;
+	std::vector<bool> literal;
+};
+
+static FramegenSourceCode framegen_source_normalize( std::string_view source )
+{
+	FramegenSourceCode code;
+	bool pendingSpace = false;
+	const auto emit = [&]( char c, bool literal )
+	{
+		if ( pendingSpace && !literal && !code.text.empty() && framegen_source_ident( code.text.back() )
+			&& framegen_source_ident( c ) )
+		{
+			code.text.push_back( ' ' );
+			code.literal.push_back( false );
+		}
+		pendingSpace = false;
+		code.text.push_back( c );
+		code.literal.push_back( literal );
+	};
+	size_t i = 0;
+	while ( i < source.size() )
+	{
+		const char c = source[i];
+		if ( source.substr( i, 2 ) == "//" )
+		{
+			while ( i < source.size() && source[i] != '\n' )
+				i++;
+			pendingSpace = true;
+		}
+		else if ( source.substr( i, 2 ) == "/*" )
+		{
+			const size_t end = source.find( "*/", i + 2 );
+			i = end == std::string_view::npos ? source.size() : end + 2;
+			pendingSpace = true;
+		}
+		else if ( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' )
+		{
+			i++;
+			pendingSpace = true;
+		}
+		else if ( c == 'R' && source.substr( i + 1, 1 ) == "\""
+			&& ( i == 0 || !framegen_source_ident( source[i - 1] ) || source[i - 1] == '8'
+				|| source[i - 1] == 'u' || source[i - 1] == 'U' || source[i - 1] == 'L' ) )
+		{
+			const size_t open = source.find( '(', i + 2 );
+			const std::string close = ")" + std::string( source.substr( i + 2, open - ( i + 2 ) ) ) + "\"";
+			const size_t end = source.find( close, open );
+			const size_t stop = end == std::string_view::npos ? source.size() : end + close.size();
+			emit( 'R', false );
+			for ( i++; i < stop; i++ )
+				emit( source[i], true );
+		}
+		else if ( c == '"' || ( c == '\'' && !( i > 0 && framegen_source_ident( source[i - 1] ) ) ) )
+		{
+			emit( c, false );
+			for ( i++; i < source.size() && source[i] != c; i++ )
+			{
+				if ( source[i] == '\\' && i + 1 < source.size() )
+					emit( source[i++], true );
+				emit( source[i], true );
+			}
+			if ( i < source.size() )
+				emit( source[i++], false );
+		}
+		else
+			emit( source[i++], false );
+	}
+	return code;
+}
+
+// Each statement that starts with `start` (canonical form, at an identifier
+// boundary, outside literals) and runs to the first `end` outside a literal,
+// whole and canonical. Comparing the full list pins both the text and the
+// number of such statements.
+static std::vector<std::string> framegen_source_statements( std::string_view source,
+	std::string_view start, std::string_view end )
+{
+	const FramegenSourceCode code = framegen_source_normalize( source );
+	std::vector<std::string> statements;
+	for ( size_t at = code.text.find( start ); at != std::string::npos; at = code.text.find( start, at + 1 ) )
+	{
+		if ( code.literal[at] || ( at > 0 && framegen_source_ident( start.front() )
+			&& framegen_source_ident( code.text[at - 1] ) ) )
+			continue;
+		size_t stop = code.text.find( end, at + start.size() );
+		while ( stop != std::string::npos && code.literal[stop] )
+			stop = code.text.find( end, stop + 1 );
+		if ( stop == std::string::npos )
+			break;
+		statements.push_back( code.text.substr( at, stop + end.size() - at ) );
+	}
+	return statements;
+}
+
+// Each definition starting with `start` through its matching closing brace.
+static std::vector<std::string> framegen_source_definitions( std::string_view source, std::string_view start )
+{
+	const FramegenSourceCode code = framegen_source_normalize( source );
+	std::vector<std::string> definitions;
+	for ( size_t at = code.text.find( start ); at != std::string::npos; at = code.text.find( start, at + 1 ) )
+	{
+		if ( code.literal[at] || ( at > 0 && framegen_source_ident( code.text[at - 1] ) ) )
+			continue;
+		int depth = 0;
+		for ( size_t i = at; i < code.text.size(); i++ )
+		{
+			if ( code.literal[i] )
+				continue;
+			if ( code.text[i] == '{' )
+				depth++;
+			else if ( code.text[i] == '}' && --depth == 0 )
+			{
+				definitions.push_back( code.text.substr( at, i + 1 - at ) );
+				break;
+			}
+		}
+	}
+	return definitions;
+}
+
+static std::string framegen_canonical( std::string_view source )
+{
+	return framegen_source_normalize( source ).text;
+}
+
 // The single unsigned capture of `pattern`, which must match exactly once.
 static std::optional<uint32_t> framegen_hud_shader_uint( const std::string &source, const char *pattern )
 {
@@ -404,11 +549,441 @@ TEST_CASE( "HUD UBO declaration and outline threshold match cs_framegen_hud.comp
 		== k_uFramegenHudMaxColumns );
 
 	// The outline threshold compares the encoded percent (opacity + 1) as an
-	// integer, exactly as framegen_hud_outlined.
+	// integer, exactly as framegen_hud_outlined. Each statement is compared
+	// whole, up to its ';' or '{', so nothing can be appended to it.
+	CHECK( framegen_source_statements( source, "uint encodedOpacity=", ";" )
+		== std::vector<std::string>{ "uint encodedOpacity=(u_style>>8u)&255u;" } );
+	CHECK( framegen_source_statements( source, "bool lowBacking=", ";" )
+		== std::vector<std::string>{ "bool lowBacking=encodedOpacity!=0u&&encodedOpacity-1u<"
+			+ std::to_string( k_uFramegenHudOutlineBelowPercent ) + "u;" } );
+	CHECK( framegen_source_statements( source, "if(cga||", "{" )
+		== std::vector<std::string>{ "if(cga||lowBacking){" } );
 	CHECK( framegen_hud_shader_uint( source,
 		R"(encodedOpacity\s*!=\s*0u\s*&&\s*encodedOpacity\s*-\s*1u\s*<\s*(\d+)u)" )
 		== k_uFramegenHudOutlineBelowPercent );
-	CHECK( std::regex_search( source, std::regex( R"(if\s*\(\s*cga\s*\|\|\s*lowBacking\s*\))" ) ) );
+
+	// The outline's blend weight is hud.hpp's constant: the whole statement,
+	// with the weight as the only free part.
+	const std::vector<std::string> outlineBlend =
+		framegen_source_statements( source, "if(outline)", ";" );
+	REQUIRE( outlineBlend.size() == 1u );
+	const std::string_view outlinePrefix = "if(outline)result=mix(result,palette(vec3(0.0)),";
+	const std::string_view outlineSuffix = ");";
+	REQUIRE( outlineBlend[0].starts_with( outlinePrefix ) );
+	REQUIRE( outlineBlend[0].ends_with( outlineSuffix ) );
+	const std::string outlineWeight = outlineBlend[0].substr( outlinePrefix.size(),
+		outlineBlend[0].size() - outlinePrefix.size() - outlineSuffix.size() );
+	REQUIRE( std::regex_match( outlineWeight, std::regex( R"(\d+\.\d+)" ) ) );
+	CHECK( std::stof( outlineWeight ) == k_flFramegenHudOutlineBlend );
+}
+
+TEST_CASE( "HUD shader statement matcher compares whole statements", "[framegen][hud]" )
+{
+	const std::string shader =
+		"bool lowBacking = encodedOpacity != 0u && encodedOpacity - 1u < 10u && false; // x\n"
+		"if (outline) result = mix(result, palette(vec3(0.0)), 0.5);\n";
+	CHECK( framegen_source_statements( shader, "bool lowBacking=", ";" )
+		== std::vector<std::string>{ "bool lowBacking=encodedOpacity!=0u&&encodedOpacity-1u<10u&&false;" } );
+	CHECK( framegen_source_statements( shader, "if(outline)", ";" )
+		== std::vector<std::string>{ "if(outline)result=mix(result,palette(vec3(0.0)),0.5);" } );
+	// Comments are not code: a commented-out copy does not count.
+	CHECK( framegen_source_statements( "// bool lowBacking = 1;\n/* bool lowBacking = 2; */\n",
+		"bool lowBacking=", ";" ).empty() );
+	// Literals stay verbatim and hide their ';', '{' and comment markers;
+	// raw strings and digit separators are not mistaken for literals' ends.
+	CHECK( framegen_canonical( "x = \"a ; // b\" ;  y = 3'296u ;" ) == "x=\"a ; // b\";y=3'296u;" );
+	CHECK( framegen_source_statements( "f( \"a;b\" ); f( 1 );", "f(", ";" )
+		== std::vector<std::string>{ "f(\"a;b\");", "f(1);" } );
+	CHECK( framegen_canonical( "auto r = R\"x(a \" ) b)x\" ; int i;" ) == "auto r=R\"x(a \" ) b)x\";int i;" );
+	CHECK( framegen_source_definitions( "static int g() { if ( a ) { return '}'; } return 0; } int h;",
+		"static int g(" ) == std::vector<std::string>{ "static int g(){if(a){return'}';}return 0;}" } );
+	// Identifier boundary: `xbool lowBacking=` is not the statement.
+	CHECK( framegen_source_statements( "xbool lowBacking = 1;", "bool lowBacking=", ";" ).empty() );
+}
+
+// ---------------------------------------------------------------------------
+// HUD history split (framegen/hud_history.hpp) and its wiring in rendervulkan.cpp.
+
+namespace
+{
+
+constexpr std::array<FramegenHudHistoryCheck, 5> k_eHudHistoryCheckOrder = {
+	FramegenHudHistoryCheck::FramegenEnabled,
+	FramegenHudHistoryCheck::OwnsOutputRing,
+	FramegenHudHistoryCheck::CursorSplitEnabled,
+	FramegenHudHistoryCheck::BidirActive,
+	FramegenHudHistoryCheck::ColorProbeRecording,
+};
+
+// One enumerated case: the split facts plus the live check answers.
+struct HudHistoryCase
+{
+	FramegenHudHistoryState state;
+	bool enabled = false, owns = false, cursorSwitch = false, bidir = false, probe = false;
+
+	static HudHistoryCase from_bits( uint32_t bits )
+	{
+		HudHistoryCase c;
+		c.state.splitCandidate = bits & ( 1u << 0 );
+		c.state.hudOn = bits & ( 1u << 1 );
+		c.state.cursorSplit = bits & ( 1u << 2 );
+		c.state.compositeImage = bits & ( 1u << 3 );
+		c.state.transferSrc = bits & ( 1u << 4 );
+		c.state.hudFreeImage = bits & ( 1u << 5 );
+		c.enabled = bits & ( 1u << 6 );
+		c.owns = bits & ( 1u << 7 );
+		c.cursorSwitch = bits & ( 1u << 8 );
+		c.bidir = bits & ( 1u << 9 );
+		c.probe = bits & ( 1u << 10 );
+		return c;
+	}
+
+	bool answer( FramegenHudHistoryCheck check ) const
+	{
+		switch ( check )
+		{
+			case FramegenHudHistoryCheck::FramegenEnabled: return enabled;
+			case FramegenHudHistoryCheck::OwnsOutputRing: return owns;
+			case FramegenHudHistoryCheck::CursorSplitEnabled: return cursorSwitch;
+			case FramegenHudHistoryCheck::BidirActive: return bidir;
+			case FramegenHudHistoryCheck::ColorProbeRecording: return probe;
+		}
+		return false;
+	}
+
+	// The reason and every check asked, in order.
+	std::pair<const char *, std::vector<FramegenHudHistoryCheck>> reason() const
+	{
+		std::vector<FramegenHudHistoryCheck> asked;
+		const char *r = framegen_hud_in_history_reason( state, [&]( FramegenHudHistoryCheck check )
+		{
+			asked.push_back( check );
+			return answer( check );
+		} );
+		return { r, asked };
+	}
+};
+
+constexpr uint32_t k_uHudHistoryCaseCount = 1u << 11;
+
+std::string hud_reason_text( const char *reason )
+{
+	return reason != nullptr ? reason : "<none>";
+}
+
+} // namespace
+
+TEST_CASE( "HUD history split decisions match their definition for every input", "[framegen][hud][hud-history]" )
+{
+	for ( uint32_t bits = 0; bits < k_uHudHistoryCaseCount; bits++ )
+	{
+		const HudHistoryCase c = HudHistoryCase::from_bits( bits );
+		const FramegenHudHistoryState &s = c.state;
+		INFO( "case bits " << bits );
+		const bool candidate = s.splitCandidate && s.hudOn;
+		CHECK( framegen_hud_split_candidate( s ) == candidate );
+		CHECK( framegen_hud_history_copy_wanted( s )
+			== ( candidate && !s.cursorSplit && s.compositeImage && s.transferSrc ) );
+		CHECK( framegen_hud_free_history( s ) == ( candidate && ( s.cursorSplit || s.hudFreeImage ) ) );
+	}
+	// Spot rows, readable on their own.
+	FramegenHudHistoryState s;
+	s.splitCandidate = true;
+	s.hudOn = true;
+	s.compositeImage = true;
+	s.transferSrc = true;
+	CHECK( framegen_hud_history_copy_wanted( s ) );
+	CHECK_FALSE( framegen_hud_free_history( s ) );         // pool busy
+	s.hudFreeImage = true;
+	CHECK( framegen_hud_free_history( s ) );
+	s.hudOn = false;
+	CHECK_FALSE( framegen_hud_history_copy_wanted( s ) );  // HUD off: no copy
+	CHECK_FALSE( framegen_hud_free_history( s ) );
+	s.hudOn = true;
+	s.cursorSplit = true;
+	CHECK_FALSE( framegen_hud_history_copy_wanted( s ) );  // cursor split: already HUD-free
+	s.hudFreeImage = false;
+	CHECK( framegen_hud_free_history( s ) );
+	s.splitCandidate = false;
+	CHECK_FALSE( framegen_hud_free_history( s ) );
+}
+
+TEST_CASE( "HUD-in-history reason is set exactly when history carries the HUD", "[framegen][hud][hud-history]" )
+{
+	for ( uint32_t bits = 0; bits < k_uHudHistoryCaseCount; bits++ )
+	{
+		const HudHistoryCase c = HudHistoryCase::from_bits( bits );
+		INFO( "case bits " << bits );
+		const auto [reason, asked] = c.reason();
+		const bool hudFree = framegen_hud_free_history( c.state );
+		CHECK( ( reason != nullptr ) == ( !hudFree && c.enabled && c.state.hudOn ) );
+		// HUD-free history never reads a live input; otherwise framegen
+		// enablement is read first, and nothing else when it or the HUD is off.
+		if ( hudFree )
+			CHECK( asked.empty() );
+		else
+		{
+			REQUIRE_FALSE( asked.empty() );
+			CHECK( asked.front() == FramegenHudHistoryCheck::FramegenEnabled );
+			if ( !c.enabled || !c.state.hudOn )
+				CHECK( asked.size() == 1u );
+		}
+	}
+}
+
+TEST_CASE( "HUD-in-history reason names the first cause in a fixed order", "[framegen][hud][hud-history]" )
+{
+	uint32_t seen[8] = {};
+	for ( uint32_t bits = 0; bits < k_uHudHistoryCaseCount; bits++ )
+	{
+		const HudHistoryCase c = HudHistoryCase::from_bits( bits );
+		const FramegenHudHistoryState &s = c.state;
+		INFO( "case bits " << bits );
+		const auto [reason, asked] = c.reason();
+		if ( reason == nullptr )
+			continue;
+
+		// The cascade, as a table: the first cause that holds is named, and
+		// the live checks asked are exactly those up to the deciding one.
+		const bool candidate = s.splitCandidate && s.hudOn;
+		const struct { bool holds; const char *text; size_t checksAsked; } cascade[] = {
+			{ !c.owns, "a Vulkan-swapchain backend (nested SDL) has no compositor-owned output ring", 2u },
+			{ !c.cursorSwitch, "GAMESCOPE_FRAMEGEN_CURSOR=0 disables the split", 3u },
+			{ c.bidir, "bidirectional interpolation flips its history images", 4u },
+			{ c.probe, "the colour probe is recording", 5u },
+			{ candidate && s.compositeImage && !s.transferSrc, "the output image lacks transferSrc", 5u },
+			{ candidate, "the owned history pool was busy", 5u },
+			{ true, "the HUD-free split conditions were not met", 5u },
+		};
+		size_t first = 0;
+		while ( !cascade[first].holds )
+			first++;
+		CHECK( hud_reason_text( reason ) == cascade[first].text );
+		REQUIRE( asked.size() == cascade[first].checksAsked );
+		for ( size_t i = 0; i < asked.size(); i++ )
+			CHECK( asked[i] == k_eHudHistoryCheckOrder[i] );
+		seen[first]++;
+	}
+	// Every reason, the catch-all included, is produced by some input.
+	for ( uint32_t i = 0; i < 7u; i++ )
+	{
+		INFO( "cascade row " << i );
+		CHECK( seen[i] > 0u );
+	}
+}
+
+TEST_CASE( "HUD-in-history reasons in the states vulkan_composite can produce", "[framegen][hud][hud-history]" )
+{
+	// The split candidate as vulkan_composite computes it: framegen on, the
+	// CURSOR switch on, a compositor-owned ring, not a side composite, no
+	// bidir, no colour probe, no base-layer scene, a composite that records
+	// history. The cursor split needs the candidate, a composite image, a
+	// topmost cursor layer and a free pool image; the HUD copy then needs a
+	// free pool image of its own.
+	std::vector<std::string> catchAllWhy;
+	uint32_t reasons[8] = {};
+	for ( uint32_t bits = 0; bits < ( 1u << 14 ); bits++ )
+	{
+		const bool enabled = bits & 1u, cursorSwitch = bits & 2u, owns = bits & 4u, side = bits & 8u;
+		const bool bidir = bits & 16u, probe = bits & 32u, baseLayer = bits & 64u, records = bits & 128u;
+		const bool hudOn = bits & 256u, image = bits & 512u, transferSrc = bits & 1024u;
+		const bool cursorTop = bits & 2048u, poolForCursor = bits & 4096u, poolForHud = bits & 8192u;
+		if ( side || !enabled || !hudOn )
+			continue; // side composites never record; no reason without framegen and the HUD
+		HudHistoryCase c;
+		c.enabled = enabled;
+		c.owns = owns;
+		c.cursorSwitch = cursorSwitch;
+		c.bidir = bidir;
+		c.probe = probe;
+		c.state.hudOn = hudOn;
+		c.state.splitCandidate = enabled && cursorSwitch && owns && !bidir && !probe && !baseLayer && records;
+		c.state.cursorSplit = c.state.splitCandidate && image && cursorTop && poolForCursor;
+		c.state.compositeImage = image;
+		c.state.transferSrc = image && transferSrc;
+		c.state.hudFreeImage = framegen_hud_history_copy_wanted( c.state ) && poolForHud;
+		const char *reason = c.reason().first;
+		INFO( "case bits " << bits );
+		CHECK( ( reason == nullptr ) == framegen_hud_free_history( c.state ) );
+		// Without a composite image the history image is null too, and
+		// framegen_record_real_frame returns before the note.
+		if ( reason == nullptr || !image )
+			continue;
+		const std::string text = reason;
+		if ( text == k_pszFramegenHudInHistoryUnmet )
+		{
+			// Only a non-candidate with every live check passing: a base-layer
+			// scene or a composite that records no history.
+			CHECK( owns );
+			CHECK( cursorSwitch );
+			CHECK_FALSE( bidir );
+			CHECK_FALSE( probe );
+			CHECK( ( baseLayer || !records ) );
+			reasons[7]++;
+		}
+		else if ( text == k_pszFramegenHudInHistorySwapchain )
+			reasons[1]++;
+		else if ( text == k_pszFramegenHudInHistoryCursorOff )
+			reasons[2]++;
+		else if ( text == k_pszFramegenHudInHistoryBidir )
+			reasons[3]++;
+		else if ( text == k_pszFramegenHudInHistoryColorProbe )
+			reasons[4]++;
+		else if ( text == k_pszFramegenHudInHistoryNoTransferSrc )
+		{
+			CHECK( c.state.splitCandidate );
+			CHECK( image );
+			CHECK_FALSE( c.state.cursorSplit );
+			reasons[5]++;
+		}
+		else if ( text == k_pszFramegenHudInHistoryPoolBusy )
+		{
+			CHECK( c.state.splitCandidate );
+			CHECK( c.state.transferSrc );
+			CHECK_FALSE( poolForHud );
+			reasons[6]++;
+		}
+	}
+	for ( uint32_t i = 1; i < 8u; i++ )
+	{
+		INFO( "reason " << i );
+		CHECK( reasons[i] > 0u );
+	}
+}
+
+TEST_CASE( "HUD-in-history note is said once, for a frame that carries the HUD", "[framegen][hud][hud-history]" )
+{
+	// Exact strings: the log reads them, and the reason test pins the rest.
+	CHECK( std::string_view( k_pszFramegenHudInHistoryUnmet ) == "the HUD-free split conditions were not met" );
+
+	FramegenHudInHistoryNote note;
+	CHECK( note.take( true, true, "R" ) == nullptr );   // HUD-free: nothing to say
+	CHECK( note.take( false, false, "R" ) == nullptr ); // HUD off: nothing to say
+	CHECK_FALSE( note.logged );
+	CHECK( hud_reason_text( note.take( false, true, "R" ) ) == "R" );
+	CHECK( note.logged );
+	CHECK( note.take( false, true, "S" ) == nullptr );  // said once
+	CHECK( note.take( false, true, nullptr ) == nullptr );
+
+	FramegenHudInHistoryNote fallback;
+	CHECK( hud_reason_text( fallback.take( false, true, nullptr ) ) == "the HUD-free split conditions were not met" );
+	CHECK( fallback.take( false, true, "R" ) == nullptr );
+}
+
+// rendervulkan.cpp is not compiled by any test, so its wiring is pinned as
+// source: change it together with these expectations, never alone.
+static std::string framegen_rendervulkan_source()
+{
+	return framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+}
+
+TEST_CASE( "vulkan_composite decides the HUD history split only through hud_history.hpp", "[framegen][hud][hud-history]" )
+{
+	const std::string source = framegen_rendervulkan_source();
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_statements( source, "gamescope::framegen::FramegenHudHistoryState hudHistory;",
+		"hudHistory,framegen_hud_history_check);" ) == std::vector<std::string>{ framegen_canonical( R"src(
+	gamescope::framegen::FramegenHudHistoryState hudHistory;
+	hudHistory.splitCandidate = bCursorSplitCandidate;
+	hudHistory.hudOn = framegen_hud_level() != 0u;
+	hudHistory.cursorSplit = bCursorSplit;
+	hudHistory.compositeImage = compositeImage != nullptr;
+	hudHistory.transferSrc = compositeImage != nullptr && compositeImage->transferSrc();
+	gamescope::Rc<CVulkanTexture> pHudFreeHistoryImage;
+	if ( gamescope::framegen::framegen_hud_history_copy_wanted( hudHistory ) )
+	{
+		pHudFreeHistoryImage = framegen_acquire_cursor_history_image(
+			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
+	}
+	hudHistory.hudFreeImage = pHudFreeHistoryImage != nullptr;
+	const bool bHudFreeHistory = gamescope::framegen::framegen_hud_free_history( hudHistory );
+	const char *pszHudInHistoryReason = gamescope::framegen::framegen_hud_in_history_reason(
+		hudHistory, framegen_hud_history_check );)src" ) } );
+
+	CHECK( framegen_source_definitions( source, "static bool framegen_hud_history_check(" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+static bool framegen_hud_history_check( gamescope::framegen::FramegenHudHistoryCheck eCheck )
+{
+	switch ( eCheck )
+	{
+		case gamescope::framegen::FramegenHudHistoryCheck::FramegenEnabled:
+			return vulkan_framegen_is_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::OwnsOutputRing:
+			return framegen_owns_output_ring();
+		case gamescope::framegen::FramegenHudHistoryCheck::CursorSplitEnabled:
+			return framegen_cursor_split_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::BidirActive:
+			return vulkan_framegen_bidir_active();
+		case gamescope::framegen::FramegenHudHistoryCheck::ColorProbeRecording:
+			return framegen_color_record_dir() != nullptr;
+	}
+	return false;
+})src" ) } );
+
+	// Neither verdict is assigned anywhere else, and both reach framegen.
+	CHECK( framegen_source_statements( source, "bHudFreeHistory=", ";" ).size() == 1u );
+	CHECK( framegen_source_statements( source, "pszHudInHistoryReason=", ";" ).size() == 1u );
+	CHECK( framegen_source_statements( source, "framegen_record_real_frame(pFramegenHistoryImage", ";" )
+		== std::vector<std::string>{ "framegen_record_real_frame(pFramegenHistoryImage,frameInfo,sequence,"
+			"bCursorFreeHistory,bHudFreeHistory,pszHudInHistoryReason);" } );
+	// The cursor-split candidate the state is built from: same order as ever.
+	CHECK( framegen_source_statements( source, "const bool bCursorSplitCandidate=", ";" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+	const bool bCursorSplitCandidate = vulkan_framegen_is_enabled()
+		&& framegen_cursor_split_enabled()
+		&& framegen_owns_output_ring()
+		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
+		&& !vulkan_framegen_bidir_active()
+		&& framegen_color_record_dir() == nullptr
+		&& !framegen_base_layer_usable( frameInfo )
+		&& framegen_composite_records_history( frameInfo );)src" ) } );
+}
+
+TEST_CASE( "framegen_record_real_frame says the HUD-in-history note through hud_history.hpp", "[framegen][hud][hud-history]" )
+{
+	const std::string source = framegen_rendervulkan_source();
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_definitions( source, "static void framegen_note_hud_in_history(" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+static void framegen_note_hud_in_history( bool bHudFreeRealFrame, const char *pszReason )
+{
+	static gamescope::framegen::FramegenHudInHistoryNote s_note;
+	if ( const char *pszLog = s_note.take( bHudFreeRealFrame, framegen_hud_level() != 0u, pszReason ) )
+		vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
+			pszLog );
+})src" ) } );
+	// Called once, from the output-space history shift, with the composite's verdicts.
+	CHECK( framegen_source_statements( source, "framegen_note_hud_in_history(bHudFree", ";" )
+		== std::vector<std::string>{ "framegen_note_hud_in_history(bHudFreeRealFrame,pszHudInHistoryReason);" } );
+	CHECK( framegen_source_statements( source, "g_framegenHistory.bHudFreeCurrent=", ";" )
+		== std::vector<std::string>{ "g_framegenHistory.bHudFreeCurrent=false;",
+			"g_framegenHistory.bHudFreeCurrent=bHudFreeRealFrame;" } );
+}
+
+TEST_CASE( "framegen_hud_cga reads GAMESCOPE_FRAMEGEN_HUD_STYLE only through the settings helpers", "[framegen][hud]" )
+{
+	const std::string source = framegen_rendervulkan_source();
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_definitions( source, "static bool framegen_hud_cga(" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+static bool framegen_hud_cga()
+{
+	static const bool enabled = gamescope::framegen::framegen_hud_style_cga( framegen_setting(
+		"GAMESCOPE_FRAMEGEN_HUD_STYLE", gamescope::framegen::k_eFramegenHudStyleDefault,
+		gamescope::framegen::parse_hud_style_setting, gamescope::framegen::k_pszFramegenHudStyleDefault ) );
+	return enabled;
+})src" ) } );
+	// No second reader of the variable anywhere in the file (comments aside),
+	// and the uniform takes the style from framegen_hud_cga().
+	const std::string code = framegen_canonical( source );
+	CHECK( code.find( "GAMESCOPE_FRAMEGEN_HUD_STYLE" ) == code.rfind( "GAMESCOPE_FRAMEGEN_HUD_STYLE" ) );
+	CHECK( framegen_source_statements( source, "gamescope::framegen::make_framegen_hud_uniform(", ";" )
+		== std::vector<std::string>{ "gamescope::framegen::make_framegen_hud_uniform(g_framegenHud.text,"
+			"g_framegenHud.hdr,framegen_hud_cga(),framegen_hud_opacity());" } );
+	CHECK( framegen_source_statements( source, "framegen_hud_cga(", ")" ).size() == 2u );
 }
 
 TEST_CASE( "CGA HUD Bayer table matches cs_framegen_hud.comp", "[framegen][hud]" )

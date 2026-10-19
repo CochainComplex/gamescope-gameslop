@@ -154,6 +154,7 @@ void main() {
             || text_pixel(logical - uvec2(1u,0u))
             || text_pixel(logical + uvec2(0u,1u))
             || text_pixel(logical - uvec2(0u,1u)));
+        // Weight: k_flFramegenHudOutlineBlend in hud.hpp (test-pinned).
         if (outline) result = mix(result, palette(vec3(0.0)), 0.98);
     }
     if (cga) {
