@@ -575,6 +575,12 @@ TEST_CASE( "HUD UBO declaration and outline threshold match cs_framegen_hud.comp
 		outlineBlend[0].size() - outlinePrefix.size() - outlineSuffix.size() );
 	REQUIRE( std::regex_match( outlineWeight, std::regex( R"(\d+\.\d+)" ) ) );
 	CHECK( std::stof( outlineWeight ) == k_flFramegenHudOutlineBlend );
+
+	// Which pixels the outline covers: background pixels with lettering in
+	// one of the four direct neighbours.
+	CHECK( framegen_source_statements( source, "bool outline=", ";" ) == std::vector<std::string>{
+		"bool outline=!ink&&(text_pixel(logical+uvec2(1u,0u))||text_pixel(logical-uvec2(1u,0u))"
+		"||text_pixel(logical+uvec2(0u,1u))||text_pixel(logical-uvec2(0u,1u)));" } );
 }
 
 TEST_CASE( "HUD shader statement matcher compares whole statements", "[framegen][hud]" )
@@ -940,6 +946,36 @@ static bool framegen_hud_history_check( gamescope::framegen::FramegenHudHistoryC
 		&& framegen_composite_records_history( frameInfo );)src" ) } );
 }
 
+TEST_CASE( "vulkan_composite takes the HUD-free copy before the HUD pass", "[framegen][hud][hud-history]" )
+{
+	const std::string source = framegen_rendervulkan_source();
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_statements( source, "const bool bCursorSplit=", ";" )
+		== std::vector<std::string>{ "const bool bCursorSplit=pCursorScanoutImage!=nullptr;" } );
+	CHECK( framegen_source_statements( source, "if(pHudFreeHistoryImage!=nullptr)", "}" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+	if ( pHudFreeHistoryImage != nullptr )
+	{
+		cmdBuffer->copyImage( compositeImage, pHudFreeHistoryImage );
+		pFramegenHistoryImage = std::move( pHudFreeHistoryImage );
+	})src" ) } );
+	// Decide, copy, draw the HUD, then hand history to framegen: in that order.
+	const std::string code = framegen_canonical( source );
+	const size_t decided = code.find( "const bool bHudFreeHistory=" );
+	const size_t copied = code.find( "if(pHudFreeHistoryImage!=nullptr)" );
+	const size_t hud = code.find( "nFramegenHudSlot=framegen_hud_record(" );
+	const size_t recorded = code.find( "framegen_record_real_frame(pFramegenHistoryImage" );
+	REQUIRE( decided != std::string::npos );
+	REQUIRE( copied != std::string::npos );
+	REQUIRE( hud != std::string::npos );
+	REQUIRE( recorded != std::string::npos );
+	CHECK( decided < copied );
+	CHECK( copied < hud );
+	CHECK( hud < recorded );
+	CHECK( code.find( "nFramegenHudSlot=framegen_hud_record(", hud + 1 ) == std::string::npos );
+}
+
 TEST_CASE( "framegen_record_real_frame says the HUD-in-history note through hud_history.hpp", "[framegen][hud][hud-history]" )
 {
 	const std::string source = framegen_rendervulkan_source();
@@ -954,7 +990,11 @@ static void framegen_note_hud_in_history( bool bHudFreeRealFrame, const char *ps
 		vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
 			pszLog );
 })src" ) } );
-	// Called once, from the output-space history shift, with the composite's verdicts.
+	// Called once, from the output-space history shift, with the composite's
+	// verdicts, right where the HUD-free flag of the new current frame is set.
+	CHECK( framegen_source_statements( source, "g_framegenHistory.bHudFreeCurrent=bHudFreeRealFrame;",
+		"pszHudInHistoryReason);" ) == std::vector<std::string>{ "g_framegenHistory.bHudFreeCurrent=bHudFreeRealFrame;"
+			"framegen_note_hud_in_history(bHudFreeRealFrame,pszHudInHistoryReason);" } );
 	CHECK( framegen_source_statements( source, "framegen_note_hud_in_history(bHudFree", ";" )
 		== std::vector<std::string>{ "framegen_note_hud_in_history(bHudFreeRealFrame,pszHudInHistoryReason);" } );
 	CHECK( framegen_source_statements( source, "g_framegenHistory.bHudFreeCurrent=", ";" )
