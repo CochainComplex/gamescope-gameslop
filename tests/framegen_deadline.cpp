@@ -1413,6 +1413,111 @@ TEST_CASE( "large anchor correction discards only matching provisional slots", "
 	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true ) );
 }
 
+TEST_CASE( "nested correction retains the 22 recorded irreplaceable provisional slots",
+	"[framegen][deadline][nested][correction]" )
+{
+	// Step-1 ladder-decisions.csv: all 22 lost slots had p_admit=p_submitted=1.
+	// Four followup-{checked,learned}-r{1,2} H1 runs. Times are relative to
+	// p_now_ns; use callback arrival (earlier than discard/replan) to give the
+	// replacement its most generous possible budget. All costs were mature.
+	struct RecordedReplacement
+	{
+		uint64_t arrivalNs, rawTargetNs, rawWakeNs, biasedWakeNs, costNs;
+	};
+	constexpr RecordedReplacement lost[] = {
+		{ 7'570'144u, 12'229'708u, 8'179'708u, 7'289'094u, 501'908u },
+		{ 6'399'918u, 12'179'783u, 8'129'783u, 6'910'915u, 502'316u },
+		{ 6'734'974u, 12'305'390u, 8'255'390u, 7'004'011u, 508'917u },
+		{ 7'682'194u, 12'330'716u, 8'280'716u, 7'247'622u, 547'352u },
+		{ 7'011'040u, 12'254'122u, 8'204'122u, 7'000'967u, 537'036u },
+		{ 6'655'365u, 11'852'949u, 7'802'949u, 6'731'436u, 536'736u },
+		{ 6'933'054u, 12'340'684u, 8'290'173u, 7'050'119u, 442'626u },
+		{ 7'842'274u, 12'308'918u, 8'258'918u, 7'288'623u, 501'317u },
+		{ 6'880'677u, 12'340'130u, 8'290'130u, 7'362'072u, 546'513u },
+		{ 6'971'376u, 12'276'897u, 8'226'897u, 7'123'744u, 482'262u },
+		{ 7'018'705u, 12'225'239u, 8'175'239u, 7'036'879u, 534'010u },
+		{ 7'147'815u, 11'989'340u, 7'939'340u, 6'932'698u, 461'453u },
+		{ 6'924'007u, 12'250'161u, 8'200'161u, 7'018'284u, 534'138u },
+		{ 6'573'713u, 12'292'455u, 8'242'455u, 6'866'661u, 505'244u },
+		{ 7'518'468u, 12'318'070u, 8'268'070u, 7'774'930u, 532'194u },
+		{ 7'772'413u, 12'282'153u, 8'232'153u, 7'766'776u, 562'854u },
+		{ 7'552'542u, 12'249'449u, 8'199'449u, 7'670'138u, 577'265u },
+		{ 7'481'088u, 12'302'109u, 8'252'109u, 7'994'279u, 526'679u },
+		{ 7'744'561u, 12'336'853u, 8'286'853u, 7'837'453u, 518'075u },
+		{ 7'640'988u, 12'268'871u, 8'218'871u, 7'634'995u, 459'637u },
+		{ 7'849'567u, 12'286'802u, 8'236'802u, 7'755'393u, 555'290u },
+		{ 7'300'942u, 12'301'805u, 8'251'780u, 7'794'687u, 454'961u },
+	};
+	constexpr uint64_t intervalNs = 8'333'333u;
+	const AnchorCorrection_t correction = {
+		.anchor = { .realFrameId = 42u }, .matched = true, .discardProvisional = true };
+	uint32_t expired = 0u;
+	for ( const auto &d : lost )
+	{
+		CAPTURE( d.arrivalNs, d.rawWakeNs, d.biasedWakeNs, d.costNs );
+		// The old raw-wake-only guard allowed all 22 discards.
+		CHECK( fixed_grid_slot_submittable( d.rawTargetNs, d.rawWakeNs,
+			d.rawTargetNs - intervalNs, d.arrivalNs, intervalNs,
+			cadence_arrival_guard_ns( intervalNs ) ) );
+		CHECK( discard_pending_provisional_slot( correction, 42u, true ) );
+		CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+			d.costNs, k_uDeadlineMinSamples, d.biasedWakeNs, d.arrivalNs ) );
+		expired += d.arrivalNs >= d.biasedWakeNs;
+	}
+	CHECK( expired == 8u ); // Other 14 still have time, but insufficient budget.
+}
+
+TEST_CASE( "nested correction uses strict measured admission before discarding pixels",
+	"[framegen][deadline][nested][correction]" )
+{
+	const AnchorCorrection_t correction = {
+		.anchor = { .realFrameId = 42u }, .matched = true, .discardProvisional = true };
+	// Existing admission's 85% jitter margin, including its exact boundary.
+	CHECK( discard_pending_provisional_slot( correction, 42u, true,
+		850u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		851u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		1u, k_uDeadlineMinSamples, 2'000u, 2'000u ) );
+	// A cold/unknown replacement cannot justify discarding submitted pixels.
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		0u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		1u, k_uDeadlineMinSamples - 1u, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 41u, true,
+		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, false,
+		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	AnchorCorrection_t small = correction;
+	small.discardProvisional = false;
+	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true,
+		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+}
+
+TEST_CASE( "nested correction wires the biased deadline and current work class into discard",
+	"[framegen][deadline][nested][correction][reference-wiring]" )
+{
+	const std::string source = framegen_rendervulkan_source();
+	REQUIRE_FALSE( source.empty() );
+	const auto statement = [&]( std::string_view start )
+	{
+		return framegen_source_statements( source, framegen_canonical( start ), ";" );
+	};
+	CHECK( statement( "const uint64_t ulReplacementWakeNs =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const uint64_t ulReplacementWakeNs = gamescope::framegen::apply_present_bias_ns("
+			" ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs );" ) } );
+	CHECK( statement( "const FramegenCausalRungSelection_t replacement =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const FramegenCausalRungSelection_t replacement = framegen_sample_causal_rung("
+			" g_framegenHistory.nDegradeSteps );" ) } );
+	CHECK( statement( "const bool bDiscard =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const bool bDiscard = gamescope::framegen::discard_pending_provisional_slot("
+			" correction, entry.ulAnchorRealFrameId, entry.bProvisional,"
+			" replacement.ulCostNs, replacement.uSamples, ulReplacementWakeNs, ulNowNs );" ) } );
+}
+
 TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[framegen][deadline]" )
 {
 	constexpr uint64_t interval = 8'334'000u;
