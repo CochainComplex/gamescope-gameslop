@@ -7841,6 +7841,11 @@ error(Display *dpy, XErrorEvent *ev)
 static void
 steamcompmgr_exit(void)
 {
+	// Save online learning before anything below can block on a lock that a thread
+	// parked in handle_io_error still holds. vulkan_framegen_shutdown flushes again
+	// after the final GPU readback, writing only if progress advanced.
+	vulkan_framegen_flush_profile();
+
 	g_ImageWaiter.Shutdown();
 
 	// Clean up any commits.
@@ -7891,6 +7896,9 @@ steamcompmgr_exit(void)
     wlserver_unlock(false);
 }
 
+// Set at the top of steamcompmgr_main; read by handle_io_error on any thread.
+static std::atomic<pthread_t> s_steamcompmgrThread{};
+
 [[noreturn]] static int
 handle_io_error(Display *dpy)
 {
@@ -7901,12 +7909,21 @@ handle_io_error(Display *dpy)
 
 	if ( !g_bRun )
 	{
+		// The framegen profile state (weights cache, progress, checkpoint writer) is
+		// owned by the steamcompmgr thread. Any other thread whose Xlib call failed
+		// (Wayland/input, screenshot worker) parks here instead of exiting: the owner
+		// either finishes its normal teardown, which saves the profile, or reaches this
+		// handler itself. A stalled teardown is still ended by the shutdown watchdog.
+		if ( !pthread_equal( pthread_self(), s_steamcompmgrThread.load() ) )
+		{
+			xwm_log.infof("X11 I/O error while shutting down; leaving exit to the compositor thread.");
+			for ( ;; )
+				pause();
+		}
 		xwm_log.infof("X11 I/O error while shutting down, exiting.");
 		// _exit skips steamcompmgr's teardown, so persist the net profile here or
 		// every interrupted session loses its learning since the last checkpoint.
-		static std::atomic_flag s_bFlushed = ATOMIC_FLAG_INIT;
-		if ( !s_bFlushed.test_and_set() )
-			vulkan_framegen_flush_profile();
+		vulkan_framegen_flush_profile();
 		_exit(0);
 	}
 
@@ -10124,6 +10141,7 @@ static void framegen_drop_commit_deadline()
 void
 steamcompmgr_main(int argc, char **argv)
 {
+	s_steamcompmgrThread = pthread_self();
 	int	readyPipeFD = -1;
 
 	// Reset getopt() state
