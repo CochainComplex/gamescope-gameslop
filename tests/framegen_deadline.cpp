@@ -6979,3 +6979,133 @@ TEST_CASE( "composite seqs change nothing on live and generated paints", "[frame
 		}
 	}
 }
+
+// Decision inputs recorded on the nested headless host (2048x1280@120,
+// GravityMark 200k on NVIDIA, checked x2 presented on the 890M; 70fefeec plus
+// temporary logging). Times are relative to the decision's now. In every case
+// the learned present bias (about -3.4 to -3.6 ms) has moved the slot's wake
+// onto the provisional raw-vblank start bound, so no rung fits the remaining
+// time, although each mature cost is below 1 ms of an 8.33 ms refresh.
+namespace
+{
+
+struct RecordedCausalDecision_t
+{
+	uint64_t wakeNs;
+	uint64_t startNs; // provisional start estimate (0 = corrected anchor)
+	uint64_t targetNs;
+	std::array<LadderRungCost_t, 3> rungs;
+};
+
+constexpr uint64_t k_ulRecordedIntervalNs = 8'333'333u;
+
+constexpr std::array<RecordedCausalDecision_t, 3> k_recordedFalseDegrades = { {
+	// degrade-settle 0->2, site real-frame decision
+	{ 4'678'000u, 4'674'000u, 9'395'000u,
+		{ { { 682'000u, 2498u }, { 861'000u, 3u }, { 644'000u, 204u } } } },
+	// degrade-settle 0->2, anchor-correction replan (corrected anchor)
+	{ 520'000u, 0u, 4'570'000u,
+		{ { { 515'000u, 2109u }, { 861'000u, 3u }, { 601'000u, 115u } } } },
+	// degrade-fit 0->1: the cold rung was probed with 3 us of budget
+	{ 4'870'000u, 4'867'000u, 9'771'000u,
+		{ { { 807'000u, 483u }, { 0u, 0u }, { 0u, 0u } } } },
+} };
+
+constexpr uint64_t recorded_remaining_budget_ns( const RecordedCausalDecision_t &d )
+{
+	return d.wakeNs > d.startNs ? deadline_budget_ns( d.wakeNs - d.startNs ) : 0u;
+}
+
+constexpr uint64_t recorded_nested_slot_budget_ns( const RecordedCausalDecision_t &d )
+{
+	// The compositor wake lead is target - wake (the bias shifts both equally).
+	return nested_slot_budget_ns( k_ulRecordedIntervalNs, d.targetNs - d.wakeNs );
+}
+
+} // namespace
+
+TEST_CASE( "nested late-phase decisions are not ladder capacity evidence",
+	"[framegen][deadline][recovery][nested]" )
+{
+	for ( const RecordedCausalDecision_t &d : k_recordedFalseDegrades )
+	{
+		const LadderRungCost_t current = d.rungs[ 0 ];
+		const uint64_t remainingNs = recorded_remaining_budget_ns( d );
+		const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
+
+		// The window collapsed for every mature rung, so the old nested path
+		// (no slot reference) took this as capacity evidence and degraded.
+		for ( const LadderRungCost_t &rung : d.rungs )
+		{
+			if ( rung.samples >= k_uDeadlineMinSamples )
+				CHECK_FALSE( deadline_cost_fits( rung.costNs, d.wakeNs, 0u, d.startNs ) );
+		}
+		CHECK( causal_shortfall_action( false, current.costNs, current.samples,
+			remainingNs, 0u, 0u ) == CausalShortfallAction_t::Degrade );
+
+		// A normally planned nested slot holds the rung several times over.
+		CHECK( slotNs > 2'500'000u );
+		CHECK( current.costNs * 3u < slotNs );
+		CHECK( causal_shortfall_action( false, current.costNs, current.samples,
+			remainingNs, slotNs, 0u ) == CausalShortfallAction_t::SkipPhaseOnly );
+	}
+}
+
+TEST_CASE( "nested slot reference still degrades on real capacity evidence",
+	"[framegen][deadline][recovery][nested]" )
+{
+	const RecordedCausalDecision_t &d = k_recordedFalseDegrades[ 0 ];
+	const uint64_t remainingNs = recorded_remaining_budget_ns( d );
+	const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
+	STATIC_REQUIRE( nested_slot_budget_ns( 8'000'000u, 3'000'000u )
+		== deadline_budget_ns( 5'000'000u ) );
+	STATIC_REQUIRE( nested_slot_budget_ns( 8'000'000u, 9'000'000u ) == 0u );
+
+	// A mature rung which cannot fit even a normally planned slot degrades.
+	CHECK( causal_shortfall_action( false, slotNs + 1u, k_uDeadlineMinSamples,
+		remainingNs, slotNs, 0u ) == CausalShortfallAction_t::Degrade );
+	// ...after the post-degradation hold.
+	CHECK( causal_shortfall_action( false, slotNs + 1u, k_uDeadlineMinSamples,
+		remainingNs, slotNs, 2u ) == CausalShortfallAction_t::SkipHeld );
+	// A deadline miss the hysteresis judged to degrade bypasses both skips.
+	CHECK( causal_shortfall_action( true, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
+		remainingNs, slotNs, 2u ) == CausalShortfallAction_t::Degrade );
+	// An immature cost is never classified as phase-only.
+	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs,
+		k_uDeadlineMinSamples - 1u, remainingNs, slotNs, 0u )
+		== CausalShortfallAction_t::Degrade );
+	// No slot reference (lead >= interval) keeps the previous behaviour.
+	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
+		remainingNs, 0u, 0u ) == CausalShortfallAction_t::Degrade );
+}
+
+TEST_CASE( "false nested degradations inside probation ratchet the recovery back-off",
+	"[framegen][deadline][recovery][nested]" )
+{
+	// Recovered 2 -> 0, then a recorded false degradation 100 decisions later
+	// (inside the 225-decision probation), repeated. Each one doubles the
+	// back-off until the one-minute cap: the pattern seen in the logs
+	// (backoff 360 -> 720 -> 1440 -> 2700).
+	const RecordedCausalDecision_t &d = k_recordedFalseDegrades[ 0 ];
+	const uint64_t remainingNs = recorded_remaining_budget_ns( d );
+	const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
+
+	const auto replay = [&]( uint64_t slotReferenceNs )
+	{
+		RecoveryState_t state;
+		for ( int cycle = 0; cycle < 6; cycle++ )
+		{
+			state = commit_ladder_recovery( state );
+			for ( int decision = 0; decision < 100; decision++ )
+				state = advance_ladder_recovery_decision( state, true );
+			if ( causal_shortfall_action( false, d.rungs[ 0 ].costNs,
+					d.rungs[ 0 ].samples, remainingNs, slotReferenceNs, 0u )
+				== CausalShortfallAction_t::Degrade )
+				state = note_ladder_recovery_degradation( state );
+		}
+		return state;
+	};
+
+	CHECK( replay( 0u ).backoffDecisions == k_uDeadlineRecoveryMaxBackoffDecisions );
+	CHECK( replay( slotNs ).backoffDecisions == k_uDeadlineRecoveryBaseBackoffDecisions );
+}

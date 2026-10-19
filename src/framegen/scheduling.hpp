@@ -592,6 +592,48 @@ struct DeadlineMissEvaluation_t
 		&& costNs > remainingBudgetNs && costNs <= slotBudgetNs;
 }
 
+// Nested backends have no KMS commit reservation: a generated slot is
+// composited at the compositor's own wake, which leads its vblank by the
+// vblank timer's draw-time reservation. The slot right after its real frame
+// therefore offers at most one refresh interval minus that wake lead. This is
+// the nested counterpart of fixed_refresh_slot_budget_ns and, like it, only
+// classifies a shortfall; admission still uses the decision's remaining time.
+[[nodiscard]] constexpr uint64_t nested_slot_budget_ns(
+	uint64_t vblankIntervalNs, uint64_t wakeLeadNs )
+{
+	return fixed_refresh_slot_budget_ns( vblankIntervalNs, wakeLeadNs, 0u );
+}
+
+enum class CausalShortfallAction_t : uint8_t
+{
+	// The mature rung fits a normally planned slot: skip this decision
+	// without degrading or touching recovery evidence.
+	SkipPhaseOnly,
+	// Post-degradation hold: skip and count the hold down.
+	SkipHeld,
+	// Capacity evidence: select a cheaper rung.
+	Degrade,
+};
+
+// What a causal decision whose current rung missed its remaining budget may
+// teach the ladder. slotBudgetNs is the capacity reference of a normally
+// planned slot (0 = none, which disables the phase-only classification).
+// A deadline miss that the miss hysteresis has already judged to degrade
+// bypasses both skips.
+[[nodiscard]] constexpr CausalShortfallAction_t causal_shortfall_action(
+	bool degradeForPriorMiss, uint64_t costNs, uint32_t samples,
+	uint64_t remainingBudgetNs, uint64_t slotBudgetNs, uint32_t holdFrames )
+{
+	if ( degradeForPriorMiss )
+		return CausalShortfallAction_t::Degrade;
+	if ( slotBudgetNs != 0u && deadline_shortfall_is_phase_only(
+			costNs, samples, remainingBudgetNs, slotBudgetNs ) )
+		return CausalShortfallAction_t::SkipPhaseOnly;
+	if ( holdFrames > 0u )
+		return CausalShortfallAction_t::SkipHeld;
+	return CausalShortfallAction_t::Degrade;
+}
+
 [[nodiscard]] constexpr uint32_t deadline_miss_count( uint32_t misses )
 {
 	uint32_t count = 0u;
