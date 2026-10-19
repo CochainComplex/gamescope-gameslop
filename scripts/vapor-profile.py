@@ -200,10 +200,11 @@ def launch_plan(args, environment):
                GAMESCOPE_FRAMEGEN_BIDIR=str(int(settings["framegen"] == "on" and settings["bidir"] == "on")),
                GAMESCOPE_FRAMEGEN_HUD=settings["hud"] if settings["framegen"] == "on" else "0",
                GAMESCOPE_FRAMEGEN_HUD_STYLE=settings["style"],
-               GAMESCOPE_FRAMEGEN_HUD_CORNER=settings["corner"],
-               # The menu's GPU DETAILS page reads the opt-in diagnostics
-               # global. While it is on, the game can bind it too.
-               GAMESCOPE_GPU_DIAGNOSTICS="1")
+               GAMESCOPE_FRAMEGEN_HUD_CORNER=settings["corner"])
+    # The menu's GPU DETAILS page reads the opt-in diagnostics global, so the
+    # launcher enables it by default. While it is on, the game can bind it too;
+    # an explicit GAMESCOPE_GPU_DIAGNOSTICS from the user (e.g. 0) is kept.
+    env.setdefault("GAMESCOPE_GPU_DIAGNOSTICS", "1")
     for field, variable in (("hud_opacity", "GAMESCOPE_FRAMEGEN_HUD_OPACITY"),
                             ("hud_scale", "GAMESCOPE_FRAMEGEN_HUD_SCALE")):
         if settings[field] == "auto":
