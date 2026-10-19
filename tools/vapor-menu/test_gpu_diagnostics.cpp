@@ -8,6 +8,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 using namespace gamescope::framegen;
 struct Client {
@@ -40,7 +42,10 @@ static const wl_registry_listener registryListener{
     },
     [](void *,wl_registry *,uint32_t) {},
 };
-int main() {
+int main(int argc, char **argv) {
+    // The global is opt-in: present only when GAMESCOPE_GPU_DIAGNOSTICS is on.
+    assert(argc==2 && (!std::strcmp(argv[1],"--expect-present") || !std::strcmp(argv[1],"--expect-absent")));
+    const bool expectPresent=!std::strcmp(argv[1],"--expect-present");
     alarm(15);
     for (int scenario=0;scenario<4;++scenario) {
         GpuDiagnostics inventory;
@@ -55,7 +60,11 @@ int main() {
         if (child==0) {
             close(sockets[1]);
             auto *server=wl_display_create(); assert(server);
-            if (scenario!=3) gamescope::create_gpu_diagnostics_global(server);
+            if (scenario!=3) {
+                const bool created=gamescope::create_gpu_diagnostics_global_if_requested(
+                    server,std::getenv("GAMESCOPE_GPU_DIAGNOSTICS"));
+                assert(created==expectPresent);
+            }
             assert(wl_client_create(server,sockets[0]));
             wl_display_run(server);
             _exit(0);
@@ -66,7 +75,8 @@ int main() {
         Client client;
         wl_registry_add_listener(registry,&registryListener,&client);
         assert(wl_display_roundtrip(display)>=0);
-        if (scenario==3) assert(!client.protocol); // Older hosts: no invented fallback data.
+        // Older hosts and hosts without the opt-in: no global, no invented data.
+        if (scenario==3 || !expectPresent) assert(!client.protocol);
         else {
             assert(client.protocol);
             for (int refresh=0;refresh<2;++refresh) {
@@ -91,5 +101,8 @@ int main() {
         wl_registry_destroy(registry); wl_display_disconnect(display);
         kill(child,SIGTERM); assert(waitpid(child,nullptr,0)==child);
     }
-    std::puts("GPU diagnostics Wayland IPC: inventory, inferred/ambiguous/unknown, refresh, destroy and older host PASS");
+    if (expectPresent)
+        std::puts("GPU diagnostics Wayland IPC: inventory, inferred/ambiguous/unknown, refresh, destroy and older host PASS");
+    else
+        std::puts("GPU diagnostics Wayland IPC: global absent without GAMESCOPE_GPU_DIAGNOSTICS PASS");
 }

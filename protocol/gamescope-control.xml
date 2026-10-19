@@ -163,6 +163,8 @@
       Renderer identity is inferred from the last composited base buffer, not
       a verified client device UUID. A nested outer presenter's GPU is unknown.
       No unsolicited updates are sent. Each get_snapshot ends with done.
+      Opt-in: the global is advertised only when the compositor runs with
+      GAMESCOPE_GPU_DIAGNOSTICS=1, since every client can bind it.
     </description>
     <request name="destroy" type="destructor"/>
     <request name="get_snapshot"/>

@@ -203,6 +203,16 @@ launching an NPU selection is refused. No SDK probe, compilation or helper is
 run at startup. This control is a visible availability indicator, not live NPU
 offload. Training remains on the GPU.
 
+**GPU DETAILS** opens a read-only page: the compositor/present GPU and the
+inferred game-render GPU (name, PCI address, vendor:device, DRM render node,
+Vulkan driver), the evidence for the inference, the buffer path and the build.
+It reads the `gamescope_gpu_diagnostics_v1` Wayland global, which is opt-in:
+gamescope advertises it only with `GAMESCOPE_GPU_DIAGNOSTICS=1`, because every
+Wayland client, the game included, can bind it. `scripts/vapor-profile.py` sets
+the variable for the gamescope it starts, so the launched game can read the same
+data while that session runs. Without it the page shows "GPU diagnostics
+disabled" and the menu keeps working.
+
 HUD labels use muted cyan (canonical cyan in CGA); measured values use bright
 white. Colons and pipe-delimited fields separate the readings, for example
 `SOURCE: 40 fps | GENERATED: 78 fps | FILL: 98%`. Sparklines, checkout hash and
