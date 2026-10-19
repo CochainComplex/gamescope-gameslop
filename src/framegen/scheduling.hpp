@@ -612,22 +612,6 @@ struct DeadlineMissEvaluation_t
 		: nested_slot_budget_ns( vblankIntervalNs, wakeLeadNs );
 }
 
-// Return the first admissible cheaper rung, or rungs.size() if none fits.
-// Phase-only shortfalls may use measured work, never a cold probe.
-[[nodiscard]] constexpr uint32_t select_causal_fallback_rung(
-	std::span<const LadderRungCost_t> rungs, uint64_t remainingBudgetNs,
-	bool matureOnly )
-{
-	for ( uint32_t rung = 0u; rung < rungs.size(); rung++ )
-	{
-		const bool mature = rungs[rung].costNs != 0u
-			&& rungs[rung].samples >= k_uDeadlineMinSamples;
-		if ( mature ? rungs[rung].costNs <= remainingBudgetNs : !matureOnly )
-			return rung;
-	}
-	return rungs.size();
-}
-
 enum class CausalShortfallAction_t : uint8_t
 {
 	// The mature rung fits a normally planned slot: skip this decision
@@ -635,8 +619,6 @@ enum class CausalShortfallAction_t : uint8_t
 	SkipPhaseOnly,
 	// Post-degradation hold: skip and count the hold down.
 	SkipHeld,
-	// Nested phase shortfall: admit only a mature fitting cheaper rung.
-	DegradePhaseOnly,
 	// Capacity evidence: select a cheaper rung.
 	Degrade,
 };
@@ -648,19 +630,13 @@ enum class CausalShortfallAction_t : uint8_t
 // bypasses both skips.
 [[nodiscard]] constexpr CausalShortfallAction_t causal_shortfall_action(
 	bool degradeForPriorMiss, uint64_t costNs, uint32_t samples,
-	uint64_t remainingBudgetNs, uint64_t slotBudgetNs, uint32_t holdFrames,
-	std::span<const LadderRungCost_t> phaseFallbackRungs = {} )
+	uint64_t remainingBudgetNs, uint64_t slotBudgetNs, uint32_t holdFrames )
 {
 	if ( degradeForPriorMiss )
 		return CausalShortfallAction_t::Degrade;
 	if ( slotBudgetNs != 0u && deadline_shortfall_is_phase_only(
 			costNs, samples, remainingBudgetNs, slotBudgetNs ) )
-	{
-		if ( select_causal_fallback_rung( phaseFallbackRungs,
-				remainingBudgetNs, true ) < phaseFallbackRungs.size() )
-			return CausalShortfallAction_t::DegradePhaseOnly;
 		return CausalShortfallAction_t::SkipPhaseOnly;
-	}
 	if ( holdFrames > 0u )
 		return CausalShortfallAction_t::SkipHeld;
 	return CausalShortfallAction_t::Degrade;
