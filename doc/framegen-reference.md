@@ -303,6 +303,7 @@ Tuning and experimental variables (`FB_TOL`, `DEBUG_EVERY`, `NET_LR`, `BIDIR_OCC
 | `GAMESCOPE_FRAMEGEN_HUD` | 0 to 2 (0) | On-screen HUD detail. See [HUD rows](#hud-rows). |
 | `GAMESCOPE_FRAMEGEN_HUD_SCALE` | 0 to 6 (0) | HUD scale. `0` means automatic: 2 to 3 based on output height (height / 720, clamped); explicit `1` is available for smaller text. |
 | `GAMESCOPE_FRAMEGEN_HUD_CORNER` | `tl`/`tr`/`bl`/`br`/`bc` (`br`) | HUD position. |
+| `GAMESCOPE_FRAMEGEN_HUD_STYLE` | `quiet`/`mallsoft`/`cga` (`quiet`) | HUD appearance at launch. Quiet/Mallsoft use the muted translucent palette; CGA uses cyan-to-magenta ordered pixel dithering with black/white lettering and the same text/graphs. Also set by the menu preset launcher. |
 | `GAMESCOPE_FRAMEGEN_NET` | path | Offline weights for the learned refiner: a bare GSFR blob from `scripts/framegen-net-train.py`. It is the starting point for every input encoding the profile has no set for. A per-game profile is rejected here; pass it as `NET_PROFILE`. |
 | `GAMESCOPE_FRAMEGEN_NET_EVERY` | >= 1 (1) | Train on every Nth real frame. Use `2` on an iGPU-class present GPU (pacing stays equal; it played best in the real-game test) and `1` on a desktop card. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE` | path | Per-game profile the in-situ net loads and, with `NET_ONLINE`, saves. Without `NET_ONLINE` it is served read-only. Give each game its own file. It holds one weight set per input encoding: the composited output in SDR, in HDR10 (PQ), or with colour management off, or the game's base layer by colourspace. A set is only served and trained under its own encoding. Spatial uses a separate role-keyed set inside this same file; the other learned pipelines share the legacy set. Format GSFP v1; any other file, including profiles from builds before 2026-10-17, is ignored and replaced by a fresh profile on the first save. |
@@ -377,9 +378,15 @@ prefix such as `--child -- %command%`). See `scripts/gamescope-hybrid.sh --help`
 
 ## HUD rows
 
-`GAMESCOPE_FRAMEGEN_HUD=1` draws four concise lines: source/generated rates and fill; mode/pipeline/multiplier and refresh/VRR; learning steps and loaded-profile status; recovery state, deadline hit rate and jitter. Requested-but-inactive net, bidirectional or VRR features add a fifth status line. `2` shows the full diagnostic rows below.
+`GAMESCOPE_FRAMEGEN_HUD=1` draws four concise lines: source/generated rates and fill; mode/pipeline/multiplier, refresh/VRR and Git checkout hash; learning steps and loaded-profile status; recovery state, deadline hit rate and jitter. A fifth line shows twelve-window deadline-hit and jitter sparklines (0–100% and 0–4 ms scales). Requested-but-inactive net, bidirectional or VRR features add a sixth status line. `2` shows the full diagnostic rows below.
 `GAMESCOPE_FRAMEGEN_HUD_SCALE` sizes it and `GAMESCOPE_FRAMEGEN_HUD_CORNER`
 places it (bottom right by default). The violet backing is only 14% opaque (86% of the underlying scene remains), with 86%-opacity text. The thin muted cyan/magenta edges, and smaller automatic font share the native settings menu palette. HDR HUD colors are blended in linear Rec.2020 at a 160-nit reference and then encoded to PQ; the underlying frame encoding is preserved.
+
+`GAMESCOPE_FRAMEGEN_HUD_OPACITY=0..100` overrides background opacity only;
+0 makes the backing clear, 100 makes it solid, and an unset value uses the style
+default (14% Quiet/Mallsoft, 36% CGA). Text remains independently readable.
+CGA uses white lettering with a black pixel outline, wider row spacing, and a
+cyan-to-magenta ordered dither. HUD Text Size in the menu offers Auto or 1–6×.
 
 Per-game settings can be edited with the optional [native Wayland menu](../tools/vapor-menu/README.md). Preset changes are saved for the next launch and do not replace learned weight files.
 

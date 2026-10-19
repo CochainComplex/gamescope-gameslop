@@ -12,6 +12,19 @@
 namespace gamescope::framegen
 {
 
+// Canonical high-intensity CGA cyan/magenta, mixed as visible ordered pixels.
+// Keep this Bayer order in sync with cs_framegen_hud.comp.
+inline constexpr std::array<uint32_t, 16> k_uFramegenHudCgaBayer = {
+	0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5
+};
+[[nodiscard]] constexpr uint32_t framegen_hud_cga_color(
+	uint32_t x, uint32_t y, uint32_t height )
+{
+	const uint32_t step = std::min( 16u, y * 16u / ( height > 1u ? height - 1u : 1u ) );
+	return k_uFramegenHudCgaBayer[( y % 4u ) * 4u + x % 4u] < step
+		? 0xff55ffu : 0x55ffffu;
+}
+
 inline constexpr uint32_t k_uFramegenHudMaxLines = 7u;
 inline constexpr uint32_t k_uFramegenHudMaxColumns = 72u;
 inline constexpr uint32_t k_uFramegenHudPackedTextWords =
@@ -439,7 +452,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 }
 
 // The everyday HUD keeps rates and effective quality visible without the
-// device/version inventory. Requested-but-inactive features remain explicit.
+// device inventory. Keep the checkout identity and requested-but-inactive features visible.
 [[nodiscard]] inline FramegenHudText_t format_framegen_hud(
 	uint32_t level, const FramegenHudSnapshot_t &snapshot )
 {
@@ -459,11 +472,14 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	framegen_hud_add_line( result, line );
 	char steps[24] = {}, state[24] = {};
 	framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
-	std::snprintf( line, sizeof( line ), "%s / %s x%u | %uHz%s",
+	const char *version = snapshot.version != nullptr ? snapshot.version : "unknown";
+	const char *checkout = std::strchr( version, '+' );
+	checkout = checkout != nullptr ? checkout + 1 : version;
+	std::snprintf( line, sizeof( line ), "%s / %s x%u | %uHz%s | git %.16s",
 		mode_name( snapshot.mode ), pipeline_name( snapshot.pipeline ),
 		std::clamp( snapshot.multiplier, 2u, 4u ),
 		std::min( 999u, ( snapshot.refreshMilliHz + 500u ) / 1000u ),
-		snapshot.vrrActive ? " VRR" : "" );
+		snapshot.vrrActive ? " VRR" : "", checkout );
 	framegen_hud_add_line( result, line );
 	std::snprintf( line, sizeof( line ), "learning %s%s%s | profile %s",
 		snapshot.netActive ? ( snapshot.netOnline ? "online " : "frozen " ) : "off",
@@ -474,6 +490,14 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	std::snprintf( line, sizeof( line ), "%s | deadline %u%% | jitter %u.%ums",
 		framegen_hud_ladder_state( state, sizeof( state ), snapshot ),
 		std::min( snapshot.deadlineHitPercent, 100u ), jitter / 10u, jitter % 10u );
+	framegen_hud_add_line( result, line );
+
+	// Keep the original twelve-window plots in the everyday HUD as well.
+	// Reuse the diagnostic scales: deadline hit 0..100%, jitter 0..4 ms.
+	const auto hitHistory = framegen_hud_sparkline( snapshot.deadlineHitHistory, 100.0 );
+	const auto jitterHistory = framegen_hud_sparkline( snapshot.pacingSdMsHistory, 4.0 );
+	std::snprintf( line, sizeof( line ), "deadline %s | jitter %s",
+		hitHistory.data(), jitterHistory.data() );
 	framegen_hud_add_line( result, line );
 	line[0] = '\0';
 	if ( snapshot.netRequested && !snapshot.netActive )
@@ -486,6 +510,18 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	return result;
 }
 
+// CGA gains breathing room between pixel-font rows. Quiet layouts retain
+// their current geometry. 101 is the CPU-side automatic-opacity sentinel.
+[[nodiscard]] constexpr uint32_t framegen_hud_line_pitch( bool cga ) { return cga ? 11u : 8u; }
+[[nodiscard]] constexpr uint32_t framegen_hud_height( uint32_t lines, bool cga )
+{
+	return lines * framegen_hud_line_pitch( cga ) + 8u;
+}
+[[nodiscard]] constexpr uint32_t framegen_hud_style_flags( bool cga, uint32_t opacity = 101u )
+{
+	return ( cga ? 1u : 0u ) | ( opacity <= 100u ? ( opacity + 1u ) << 8u : 0u );
+}
+
 // Scalar-layout UBO consumed by cs_framegen_hud.comp. Text is packed four
 // ASCII bytes per uint; the uint64_t font above is split explicitly so the GPU
 // ABI is independent of host endianness and uint64 shader support.
@@ -494,7 +530,7 @@ struct alignas( 16 ) FramegenHudUniform_t
 	uint32_t lineCount = 0u;
 	uint32_t widthChars = 0u;
 	uint32_t hdr = 0u;
-	uint32_t reserved = 0u;
+	uint32_t style = 0u; // bit 0: CGA; bits 8..15: opacity+1 (0 = automatic)
 	std::array<uint32_t, k_uFramegenHudMaxLines> lineLengths = {};
 	std::array<uint32_t, k_uFramegenHudPackedTextWords> text = {};
 	std::array<uint32_t, 256> font = {};
@@ -520,11 +556,12 @@ struct FramegenHudPush_t
 static_assert( sizeof( FramegenHudPush_t ) == 16u );
 
 [[nodiscard]] inline FramegenHudUniform_t make_framegen_hud_uniform(
-	const FramegenHudText_t &text, bool hdr )
+	const FramegenHudText_t &text, bool hdr, bool cga = false, uint32_t opacity = 101u )
 {
 	FramegenHudUniform_t result;
 	result.lineCount = std::min( text.lineCount, k_uFramegenHudMaxLines );
 	result.hdr = hdr;
+	result.style = framegen_hud_style_flags( cga, opacity );
 	for ( uint32_t line = 0u; line < result.lineCount; line++ )
 	{
 		const uint32_t length = static_cast<uint32_t>( std::min<size_t>(

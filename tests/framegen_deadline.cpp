@@ -119,6 +119,54 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 		"present  AMD Radeon Graphics render other-GPU           buffers xGPU" } );
 }
 
+TEST_CASE( "CGA HUD preserves its ABI and ordered two-color fade", "[framegen][hud]" )
+{
+	CHECK( framegen_hud_cga_color( 0u, 0u, 0u ) == 0x55ffffu );
+	CHECK( framegen_hud_cga_color( 0u, 0u, 1u ) == 0x55ffffu );
+	for ( uint32_t step = 0u; step < 16u; ++step )
+	{
+		uint32_t magenta = 0u;
+		for ( uint32_t y = 0u; y < 4u; ++y )
+			for ( uint32_t x = 0u; x < 4u; ++x )
+			{
+				const uint32_t color = framegen_hud_cga_color( x, step * 4u + y, 65u );
+				CHECK( ( color == 0x55ffffu || color == 0xff55ffu ) );
+				magenta += color == 0xff55ffu;
+			}
+		CHECK( magenta == step );
+	}
+	for ( uint32_t x = 0u; x < 4u; ++x )
+	{
+		CHECK( framegen_hud_cga_color( x, 0u, 65u ) == 0x55ffffu );
+		CHECK( framegen_hud_cga_color( x, 64u, 65u ) == 0xff55ffu );
+	}
+	FramegenHudText_t text;
+	framegen_hud_add_line( text, "CGA" );
+	const auto normal = make_framegen_hud_uniform( text, true );
+	const auto cga = make_framegen_hud_uniform( text, true, true );
+	CHECK( normal.style == 0u );
+	CHECK( cga.style == 1u );
+	CHECK( cga.hdr == 1u );
+	CHECK( cga.font == normal.font );
+	CHECK( cga.text == normal.text );
+	CHECK( cga.lineCount == normal.lineCount );
+	CHECK( sizeof( cga ) == 1584u );
+	CHECK( framegen_hud_line_pitch( false ) == 8u );
+	CHECK( framegen_hud_line_pitch( true ) == 11u );
+	CHECK( framegen_hud_height( 5u, false ) == 48u );
+	CHECK( framegen_hud_height( 5u, true ) == 63u );
+	const auto clear = make_framegen_hud_uniform( text, true, true, 0u );
+	const auto solid = make_framegen_hud_uniform( text, true, true, 100u );
+	CHECK( ( clear.style & 1u ) == 1u );
+	CHECK( ( ( clear.style >> 8u ) & 255u ) == 1u );
+	CHECK( ( ( solid.style >> 8u ) & 255u ) == 101u );
+	CHECK( ( cga.style >> 8u ) == 0u );
+	CHECK( clear.text == solid.text );
+	CHECK( clear.font == solid.font );
+	CHECK( make_framegen_hud_uniform( text, false, false, 50u ).style == ( 51u << 8u ) );
+
+}
+
 TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hud]" )
 {
 	const FramegenHudSnapshot_t snapshot = {
@@ -177,29 +225,50 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	};
 	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
 
-	REQUIRE( text.lineCount == 4u );
+	REQUIRE( text.lineCount == 5u );
 	CHECK( text.lines[0].data() == std::string_view{
 		"source 40fps | generated 78fps | fill 98%" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"motion / learned x2 | 120Hz" } );
+		"motion / learned x2 | 120Hz | git 76e6d5" } );
 	CHECK( text.lines[2].data() == std::string_view{
 		"learning off | profile not loaded" } );
 	CHECK( text.lines[3].data() == std::string_view{
 		"full | deadline 0% | jitter 0.0ms" } );
+	CHECK( text.lines[4].data() ==
+		"deadline " + std::string( 12, '\x01' ) + " | jitter " + std::string( 12, '\x01' ) );
+	auto buildIdentity = snapshot;
+	buildIdentity.version = "3.16.14+96ad25e89-dirty";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
+		"git 96ad25e89-dirty" ) != std::string_view::npos );
+	// Meson's dirty checkout marker is a trailing '+', not only '-dirty'.
+	buildIdentity.version = "0.1.0+96ad25e89+";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
+		"git 96ad25e89+" ) != std::string_view::npos );
+	buildIdentity.version = nullptr;
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
+		"git unknown" ) != std::string_view::npos );
+	const auto uniform = make_framegen_hud_uniform( text, false );
+	CHECK( uniform.lineCount == 5u );
+	CHECK( uniform.widthChars <= k_uFramegenHudMaxColumns );
+
 	auto warning = snapshot;
 	warning.netRequested = true;
 	warning.bidirRequested = true;
 	warning.vrrRequested = true;
 	const auto compact = format_framegen_hud( 1u, warning );
-	REQUIRE( compact.lineCount == 5u );
-	const std::string_view status = compact.lines[4].data();
+	REQUIRE( compact.lineCount == 6u );
+	const std::string_view status = compact.lines[5].data();
 	CHECK( status.find( "net:requested(OFF)" ) != std::string_view::npos );
 	CHECK( status.find( "bidir:requested(OFF)" ) != std::string_view::npos );
 	CHECK( status.find( "vrr:requested(off)" ) != std::string_view::npos );
 	warning.netActive = true;
 	warning.netOnline = true;
 	warning.netTrainedSteps = 1200u;
+	warning.deadlineHitHistory.fill( 100.0 );
+	warning.pacingSdMsHistory.fill( 4.0 );
 	const auto training = format_framegen_hud( 1u, warning );
+	CHECK( training.lines[4].data() ==
+		"deadline " + std::string( 12, '\x08' ) + " | jitter " + std::string( 12, '\x08' ) );
 	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
 }
 
