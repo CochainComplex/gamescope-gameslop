@@ -482,7 +482,12 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const char *version = snapshot.version != nullptr ? snapshot.version : "unknown";
 	const char *checkout = std::strchr( version, '+' );
 	checkout = checkout != nullptr ? checkout + 1 : version;
-	std::snprintf( line, sizeof( line ), "MODE: %s/%s%s x%u %uHz%s | GIT: %.16s",
+	// Keep the last 16 characters: a tag-style describe
+	// ("v3.16.1-120-gabcdef123+") must keep its hash and the dirty marker.
+	const size_t checkoutLength = std::strlen( checkout );
+	if ( checkoutLength > 16u )
+		checkout += checkoutLength - 16u;
+	std::snprintf( line, sizeof( line ), "MODE: %s/%s%s x%u %uHz%s | GIT: %s",
 		mode_name( snapshot.mode ), pipeline_name( snapshot.pipeline ),
 		std::strcmp( pipeline_name( snapshot.pipeline ), "spatial" ) == 0 ? "[EXP]" : "",
 		std::clamp( snapshot.multiplier, 2u, 4u ),
@@ -529,6 +534,14 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 {
 	return ( cga ? 1u : 0u ) | ( opacity <= 100u ? ( opacity + 1u ) << 8u : 0u );
 }
+// Lettering gets a 1-px dark outline where its backing cannot carry it: always
+// for CGA, and for Quiet/Mallsoft below 10% effective backing opacity (the
+// automatic 14% does not qualify). cs_framegen_hud.comp mirrors this test.
+inline constexpr uint32_t k_uFramegenHudOutlineBelowPercent = 10u;
+[[nodiscard]] constexpr bool framegen_hud_outlined( bool cga, uint32_t opacity = 101u )
+{
+	return cga || ( opacity <= 100u && opacity < k_uFramegenHudOutlineBelowPercent );
+}
 
 // Attribute bit lives in each existing packed character byte; font remains ASCII.
 // A colon separates label/value within each pipe-delimited field. Diagnostic
@@ -561,6 +574,7 @@ struct alignas( 16 ) FramegenHudUniform_t
 	std::array<uint32_t, 256> font = {};
 };
 
+static_assert( offsetof( FramegenHudUniform_t, style ) == 12u );
 static_assert( offsetof( FramegenHudUniform_t, lineLengths ) == 16u );
 static_assert( offsetof( FramegenHudUniform_t, text ) == 48u );
 static_assert( offsetof( FramegenHudUniform_t, font ) == 624u );

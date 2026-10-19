@@ -142,14 +142,19 @@ void main() {
         uvec2 p = logical - uvec2(kPadding);
         value = (text_byte(p.y / line_pitch(), p.x >> 3u) & 128u) != 0u;
     }
-    if (cga) {
-        // White pixel lettering with a crisp four-sided black outline;
-        // unlike an offset shadow, this does not create a second text image.
+    // Crisp four-sided dark outline; unlike an offset shadow, this does not
+    // create a second text image. CGA always has it. Quiet/Mallsoft get it
+    // below 10% effective backing opacity, where a bright scene would swallow
+    // the light lettering (framegen_hud_outlined in hud.hpp mirrors this).
+    if (cga || opacity < 0.10) {
         bool outline = !ink && (text_pixel(logical + uvec2(1u,0u))
             || text_pixel(logical - uvec2(1u,0u))
             || text_pixel(logical + uvec2(0u,1u))
             || text_pixel(logical - uvec2(0u,1u)));
         if (outline) result = mix(result, palette(vec3(0.0)), 0.98);
+    }
+    if (cga) {
+        // White values and cyan labels in pixel lettering.
         if (ink) result = mix(result, palette(value ? vec3(1.0) : vec3(1.0/3.0,1.0,1.0)), 0.98);
     } else if (ink) {
         vec3 color = value ? vec3(0.96,0.94,0.98) : vec3(0.63,0.80,0.82);

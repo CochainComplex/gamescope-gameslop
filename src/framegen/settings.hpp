@@ -62,6 +62,43 @@ parse_color_probe_sweep_setting( const char *value )
 	return std::nullopt;
 }
 
+enum class FramegenHudStyle : uint32_t
+{
+	Quiet = 0,
+	Mallsoft = 1,
+	Cga = 2,
+};
+
+// GAMESCOPE_FRAMEGEN_HUD_STYLE: quiet, mallsoft or cga, compared ASCII
+// case-insensitively. Anything else, including an empty value, is rejected so
+// the caller keeps its default and logs the value once.
+[[nodiscard]] inline std::optional<FramegenHudStyle> parse_hud_style_setting( const char *value )
+{
+	if ( value == nullptr )
+		return std::nullopt;
+
+	const std::string_view setting{ value };
+	const auto equals = [setting]( std::string_view name )
+	{
+		if ( setting.size() != name.size() )
+			return false;
+		for ( size_t i = 0; i < name.size(); i++ )
+		{
+			const char c = setting[i];
+			if ( ( c >= 'A' && c <= 'Z' ? char( c - 'A' + 'a' ) : c ) != name[i] )
+				return false;
+		}
+		return true;
+	};
+	if ( equals( "quiet" ) )
+		return FramegenHudStyle::Quiet;
+	if ( equals( "mallsoft" ) )
+		return FramegenHudStyle::Mallsoft;
+	if ( equals( "cga" ) )
+		return FramegenHudStyle::Cga;
+	return std::nullopt;
+}
+
 // Parse the complete string and reject non-finite values explicitly. Keeping
 // range policy at the call site makes clamp-vs-fallback behavior reviewable for
 // each setting while sharing one strict lexical contract.
