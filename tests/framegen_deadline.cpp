@@ -1516,6 +1516,13 @@ TEST_CASE( "nested correction wires the biased deadline and current work class i
 			"const bool bDiscard = gamescope::framegen::discard_pending_provisional_slot("
 			" correction, entry.ulAnchorRealFrameId, entry.bProvisional,"
 			" replacement.ulCostNs, replacement.uSamples, ulReplacementWakeNs, ulNowNs );" ) } );
+	// Even with enough budget, an in-flight batch blocks a replacement submit.
+	CHECK( statement( "const bool bCanReplace =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const bool bCanReplace = bDiscard"
+			" && g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );" ) } );
+	CHECK( statement( "return bCanReplace" )
+		== std::vector<std::string>{ framegen_canonical( "return bCanReplace;" ) } );
 }
 
 TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[framegen][deadline]" )
