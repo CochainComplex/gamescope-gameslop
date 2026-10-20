@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from common import HERE, digest, write_json
+from common import HERE, Terminated, digest, termination_signals, write_json
 from preparation import prepare
 
 
@@ -56,7 +56,27 @@ def cache_identity(cfg, probe, devices, model_hash):
             'adapters_sha256': digest(HERE / 'backends.py')}
 
 
+def arm_parent_death(parent_pid):
+    """Linux worker lifetime follows the supervisor, including the setup race."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        raise OSError(ctypes.get_errno(), 'PR_SET_PDEATHSIG failed')
+    if os.getppid() != parent_pid:
+        raise RuntimeError('supervisor exited before worker startup')
+
+
+@termination_signals()
 def worker(args):
+    try:
+        arm_parent_death(args.parent_pid)
+        run_worker(args)
+    except BaseException as exc:
+        failed_receipt(Path(args.result), 'failed', str(exc) or type(exc).__name__)
+        raise
+
+
+def run_worker(args):
     import fcntl
     from backends import BACKENDS, inventory, measure
 
@@ -87,20 +107,69 @@ def worker(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         cache.mkdir(exist_ok=True)
         state = cache / 'state.json'
-        if state.exists() and json.loads(state.read_text())['status'] != 'ready':
+        saved = json.loads(state.read_text()) if state.exists() else {}
+        compiled = saved.get('status') == 'ready' or saved.get('compiled', False)
+        if saved and not compiled:
             raise RuntimeError(f'incomplete/failed cache quarantined: {cache}; use a new cache root')
-        write_json(state, {'status': 'building', 'identity': identity})
-        start = time.perf_counter()
-        backend.load(bundle / 'model.onnx', cache, cfg.get('provider_options', {}))
-        load_ms = (time.perf_counter() - start) * 1000
-        measured = measure(backend, features, reference, args.runs, args.atol, args.rtol)
-        write_json(state, {'status': 'ready', 'identity': identity})
-    info.update(status='npu-raw-head-parity-passed', load_ms=load_ms,
+        info.update(status='running', cache_key=key,
+                    cache_state_before='warm' if compiled else 'cold',
+                    quality_validated=False)
+        write_json(Path(args.result), info)
+        try:
+            if not compiled:
+                write_json(state, {'status': 'building', 'identity': identity})
+            start = time.perf_counter()
+            backend.load(bundle / 'model.onnx', cache, cfg.get('provider_options', {}))
+            info['load_ms'] = (time.perf_counter() - start) * 1000
+            compiled = True
+            # Compilation succeeded independently of the following parity check.
+            write_json(state, {'status': 'ready', 'identity': identity, 'compiled': True})
+            write_json(Path(args.result), info)
+            measured = measure(backend, features, reference, args.runs, args.atol, args.rtol)
+        except BaseException as exc:
+            reason = str(exc) or type(exc).__name__
+            write_json(state, {'status': 'failed', 'identity': identity,
+                               'compiled': compiled, 'reason': reason})
+            info.update(status='failed', reason=reason)
+            if hasattr(exc, 'parity'):
+                info['parity'] = exc.parity
+            write_json(Path(args.result), info)
+            raise
+    info.update(status='npu-raw-head-parity-passed',
                 measurement=measured, manifest=manifest, cache_key=key,
                 quality_validated=False, live_integration=False)
     write_json(Path(args.result), info)
 
 
+def failed_receipt(result, status, reason, **extra):
+    """Preserve worker diagnostics, including a parity error, on supervisor failure."""
+    info = json.loads(result.read_text()) if result.exists() else {}
+    info.update(status=status, reason=reason if status == 'aborted' else info.get('reason', reason),
+                quality_validated=False, **extra)
+    write_json(result, info)
+    return info
+
+
+def interrupted_cache(args, info):
+    """The worker may have been stuck in native code when SIGKILL was needed."""
+    import fcntl
+    if 'cache_key' not in info:
+        return
+    key = info['cache_key']
+    root = Path(args.cache).resolve()
+    with (root / (key + '.lock')).open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # another run already owns this cache
+        state = root / key / 'state.json'
+        saved = json.loads(state.read_text()) if state.exists() else {}
+        saved.update(status='failed', reason=info['reason'],
+                     compiled=saved.get('status') == 'ready' or saved.get('compiled', False))
+        write_json(state, saved)
+
+
+@termination_signals()
 def supervise(args):
     cfg = config(args.config)
     out = Path(args.out).resolve()
@@ -113,6 +182,7 @@ def supervise(args):
     command = [cfg['python'], str(Path(__file__).resolve()), '_worker',
                '--action', args.action, '--config', str(Path(args.config).resolve()),
                '--result', str(result), '--runs', str(args.runs),
+               '--parent-pid', str(os.getpid()),
                '--atol', str(args.atol), '--rtol', str(args.rtol)]
     if args.action == 'run':
         if not args.bundle or not args.cache:
@@ -124,8 +194,13 @@ def supervise(args):
                                 stdout=log, stderr=subprocess.STDOUT)
         try:
             code = proc.wait(timeout=args.timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            os.killpg(proc.pid, signal.SIGTERM)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt, Terminated) as exc:
+            reason = (f'timeout after {args.timeout} seconds' if isinstance(exc, subprocess.TimeoutExpired)
+                      else str(exc) or type(exc).__name__)
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -136,15 +211,17 @@ def supervise(args):
             except ProcessLookupError:
                 pass
             proc.wait()
-            write_json(result, {'status': 'aborted', 'quality_validated': False})
+            info = failed_receipt(result, 'aborted', reason)
+            interrupted_cache(args, info)
             raise RuntimeError(f'helper aborted; see {out / "worker.log"}') from None
     if code or not result.exists():
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        write_json(result, {'status': 'failed', 'worker_exit': code,
-                            'quality_validated': False})
+        info = failed_receipt(result, 'failed', f'worker exited with status {code}',
+                              worker_exit=code)
+        interrupted_cache(args, info)
         raise RuntimeError(f'helper failed; see {out / "worker.log"}')
     print(result.read_text())
 
@@ -190,6 +267,7 @@ def main():
         p.add_argument('--bundle')
         p.add_argument('--cache')
         if name == '_worker':
+            p.add_argument('--parent-pid', type=positive, required=True)
             p.add_argument('--action', choices=('probe', 'run'), required=True)
             p.add_argument('--result', required=True)
             p.set_defaults(func=worker)
@@ -201,7 +279,7 @@ def main():
     args = ap.parse_args()
     try:
         args.func(args)
-    except (ValueError, OSError, RuntimeError, ImportError, subprocess.SubprocessError) as e:
+    except (ValueError, OSError, RuntimeError, ImportError, subprocess.SubprocessError, Terminated) as e:
         ap.exit(1, f'{e}\n')
 
 

@@ -79,11 +79,19 @@ Other campaign facts:
   bounded residual [est]; whether that is visible must come from the offline gate, not from parity.
 - **CPU-trained weights drift more under BF16** (2.3–2.8× the GPU-trained error).
 - **CPU training cost:** 20,000 NumPy steps take ~70 s on one core per benchmark.
-- **A parity miss quarantines the compiled cache** (`backends.py:121`, `experiment.py:90-97`); reruns
-  need a new cache root. A failure also hides the error magnitude (fixed for future runs: the
-  campaign records `max_abs_error`).
+- **The original module quarantined a compiled cache after a parity miss.** Future runs preserve
+  compile success separately: `ready` is never reset to `building`, and a failure records its
+  reason plus whether the compile is reusable. Parity failures include `max_abs_error` in
+  `result.json`; a successful compile can be measured again with a new run directory.
+  Results and campaign tables label `load_ms` as cold or warm (`cache_state_before`).
 - **Fixture coverage:** only 3 of 4 fixture directions were distinct per bundle; the duplicate check
-  only rejects four identical directions.
+  only rejects four identical directions. Future bundles select the highest mean-motion pair and
+  a distinct pair with the highest mean confidence, each in both directions, rather than the
+  first/last capture frames. This improves coverage without establishing image quality.
+
+Module follow-up: see the README for
+[cache states and subprocess lifecycle](../tools/framegen-npu/README.md#explicit-npu-execution)
+and [campaign timeout budgets](../tools/framegen-npu/README.md#campaign).
 
 ## 4. Data lessons (why the first quality comparison was invalid)
 
@@ -101,10 +109,12 @@ Fixes now in place:
 - The harness records **one 120 s run per benchmark** (`run.py record`), drops start-up, takes
   training (20–60 s) and held-out (80–110 s) from **separate time windows**, removes static
   samples and refuses a capture with too few moving samples.
-- Windows use each sample's publish time, not its index: `GAMESCOPE_FRAMEGEN_RECORD` has a single
-  readback slot and writes a sample only after the previous one is on disk, so it samples at a
-  load-dependent ~7–17 samples/s, far below the frame rate. Its header sequence number is a GPU
-  submission counter, not a frame counter.
+- Windows use each sample's publish time, not its index. `GAMESCOPE_FRAMEGEN_RECORD` samples
+  on every new motion preparation, including cheaper motion rungs; extrapolation is excluded.
+  It is not restricted to rung 0. The observed load-dependent ~7–17 samples/s does not by itself
+  identify the bottleneck: the single readback slot and synchronous disk writes need counters
+  for eligible/prepared/copied/flushed samples and skipped reasons before changing the ring.
+  Its header sequence number is a GPU submission counter, not a frame counter.
 - `scripts/framegen-net-eval.py` computes `conf-resid` only over frames with confidence and
   reports how many were skipped; if no frame has confidence the value is NaN (refused by the
   campaign) instead of 0.
@@ -125,6 +135,14 @@ Per real frame, 890M, 1440p, learned x2 [measured unless marked]:
 
 Removing the ~1 ms refiner dispatch also removes a non-preemptible compute pass from the queue that
 composites and flips, which helps frame-time consistency beyond the average.
+
+Keep pass cost separate from added queue latency: the internal Xonotic A/B report
+shows Spatial-frozen adding **4.25/4.5 ms** over framegen off: `src_flip_ms_p50`
+5/6 → 9.25/10.5 ms (ref/tip). These are medians of two valid 40 s repetitions on a
+headless 2048×1280@120 host, source 60 fps, x2. The internal run log
+identifies the AMD 890M compositor and RTX PRO 500 game renderer. Noise is material: Learned-frozen is
+6.5/7.25 ms, Checked changes from 7.5 to 5 ms. Source-ready queue residence is not input
+latency; offloading the refiner alone does not establish that this delay disappears.
 
 ## 6. Why the NPU is slow today, and the fast-path enablers
 

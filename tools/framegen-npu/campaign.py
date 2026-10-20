@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import sys
 
-from common import HERE, ROOT, digest, module, write_json
+from common import HERE, ROOT, Terminated, digest, module, termination_signals, write_json
 import preparation
 
 
@@ -42,12 +42,20 @@ def name(value):
         raise ValueError('names must be safe path components (letters, digits, underscore, hyphen)')
 
 
+def timeouts(spec):
+    return tuple(spec.get(key, spec.get('timeout')) for key in ('train_timeout', 'npu_timeout'))
+
+
 def validate_spec(value):
-    fields(value, ('config', 'cache', 'out', 'runs', 'atol', 'rtol', 'timeout', 'benches'))
+    fields(value, ('config', 'cache', 'out', 'runs', 'atol', 'rtol', 'benches'),
+           ('timeout', 'train_timeout', 'npu_timeout'))
     for key in ('config', 'cache', 'out'):
         absolute(value[key])
     integer(value['runs'])
-    integer(value['timeout'])
+    if 'timeout' in value:
+        integer(value['timeout'])
+    for budget in timeouts(value):
+        integer(budget)
     for key in ('atol', 'rtol'):
         v = value[key]
         if type(v) not in (int, float) or not math.isfinite(v) or v < 0:
@@ -178,14 +186,18 @@ def evaluate(path, heldout, net=None, key=None):
     return metrics
 
 
-def prepare(path, bench, source):
+def preparation_args(path, bench, source):
     cpu = source['name'] == 'cpu'
-    preparation.prepare(argparse.Namespace(
+    return argparse.Namespace(
         out=str(path), data=bench['train'], net=None if cpu else source['net'],
         net_key=None if cpu else source['key'],
         profile_key=source['profile_key'] if cpu else source['key'],
         train_steps=source['steps'] if cpu else 0,
-        crop=source['crop'] if cpu else 32, training_timeout=source['timeout']))
+        crop=source['crop'] if cpu else 32, training_timeout=source['train_timeout'])
+
+
+def prepare(path, bench, source):
+    preparation.prepare(preparation_args(path, bench, source))
     manifest = json.loads((path / 'manifest.json').read_text())
     expected = {'model.onnx', 'fixture.npz', 'candidate.gsfr'}
     if (manifest.get('schema') != 1 or set(manifest['files']) != expected
@@ -195,17 +207,27 @@ def prepare(path, bench, source):
             'cpu_train_seconds': manifest['cpu_train_seconds']}
 
 
+def train_cpu(path, bench, source):
+    """Train an evaluation-only candidate without an ONNX/parity bundle."""
+    args = preparation_args(path, bench, source)
+    preparation.validate_request(args)
+    path.mkdir(parents=True, exist_ok=False)
+    _, seconds = preparation.candidate_params(args, path)
+    return {'cpu_train_steps': source['steps'], 'cpu_train_seconds': seconds}
+
+
 def run_npu(path, bundle, spec):
     from experiment import supervise
     supervise(argparse.Namespace(action='run', config=spec['config'],
                                  out=str(path), bundle=str(bundle), cache=spec['cache'],
                                  runs=spec['runs'], atol=spec['atol'], rtol=spec['rtol'],
-                                 timeout=spec['timeout']))
+                                 timeout=timeouts(spec)[1]))
     result = json.loads((path / 'result.json').read_text())
     if result.get('status') != 'npu-raw-head-parity-passed':
         raise RuntimeError(f'incomplete NPU result: {path}')
     m = result['measurement']
     return {'status': result['status'], 'load_ms': result['load_ms'],
+            'cache_state_before': result['cache_state_before'],
             'p50_ms': m['call_ms_p50'], 'p99_ms': m['call_ms_p99'],
             'parity': {'passed': True, 'max_abs_error': m['max_abs_error'],
                        'atol': m['atol'], 'rtol': m['rtol']}}
@@ -219,8 +241,8 @@ def markdown(report):
         return '—' if v is None else f'{v:.6g}'
     for bench in report['benches']:
         lines += [f"## {bench['name']}", '',
-                  '| source | resid | conf-resid | bad (%) | ssim | edge | temporal_sigma | delta vs neutral (source − neutral) | CPU train steps/seconds | NPU status | load_ms | p50/p99 ms | parity |',
-                  '|---|' + '---:|' * 8 + '---|' + '---:|' * 2 + '---|']
+                  '| source | resid | conf-resid | bad (%) | ssim | edge | temporal_sigma | delta vs neutral (source − neutral) | CPU train steps/seconds | NPU status | load_ms | cache before | p50/p99 ms | parity |',
+                  '|---|' + '---:|' * 8 + '---|' + '---:|' + '---|' + '---:|' + '---|']
         for row in bench['rows']:
             npu = row['npu']
             delta = ', '.join(f'{k} {v:+.6g}' for k, v in row['delta_vs_neutral'].items())
@@ -228,8 +250,10 @@ def markdown(report):
             cells = [row['name'], *(fmt(row['metrics'][k]) for k in METRICS), delta,
                      f"{row['cpu_train_steps']} / {fmt(row['cpu_train_seconds'])}",
                      npu['status'], fmt(npu.get('load_ms')),
+                     npu.get('cache_state_before', '—'),
                      f"{fmt(npu.get('p50_ms'))} / {fmt(npu.get('p99_ms'))}",
-                     ('passed; max_abs_error=' + fmt(parity['max_abs_error'])) if parity else '—']
+                     (('passed' if parity['passed'] else 'failed') +
+                      '; max_abs_error=' + fmt(parity['max_abs_error'])) if parity else '—']
             lines.append('| ' + ' | '.join(cells) + ' |')
         lines.append('')
     if report.get('error'):
@@ -237,6 +261,7 @@ def markdown(report):
     return '\n'.join(lines)
 
 
+@termination_signals()
 def campaign(args):
     spec = validate_spec(json.loads(absolute(args.spec).read_text()))
     inputs = identity(spec)
@@ -280,13 +305,18 @@ def campaign(args):
             if 'cpu' in bench:
                 sources.append({'name': 'cpu', **bench['cpu']})
             for source in sources:
-                source = {**source, 'timeout': spec['timeout']}
+                source = {**source, 'train_timeout': timeouts(spec)[0]}
                 bundle = base / ('bundle-' + source['name'])
                 if source['name'] != 'cpu':
                     metrics = perform(base / ('eval-' + source['name']),
                                       lambda p: evaluate(p, bench['heldout'],
                                                          source['net'], source['key']))
-                training = perform(bundle, lambda p: prepare(p, bench, source))
+                training = {'cpu_train_steps': 0, 'cpu_train_seconds': None}
+                if source['npu']:
+                    training = perform(bundle, lambda p: prepare(p, bench, source))
+                elif source['name'] == 'cpu':
+                    bundle = base / 'train-cpu'
+                    training = perform(bundle, lambda p: train_cpu(p, bench, source))
                 if source['name'] == 'cpu':
                     metrics = perform(base / 'eval-cpu', lambda p: evaluate(
                         p, bench['heldout'], bundle / 'candidate.gsfr'))
@@ -303,15 +333,21 @@ def campaign(args):
             save()
             try:
                 row['npu'] = perform(path, lambda p: run_npu(p, bundle, spec))
-            except Exception:
+            except (Exception, Terminated, KeyboardInterrupt):
                 row['npu'] = {'status': 'failed-or-incomplete'}
+                result = path / 'result.json'
+                if result.exists():
+                    failed = json.loads(result.read_text())
+                    row['npu'].update({k: failed[k] for k in
+                                       ('reason', 'parity', 'load_ms', 'cache_state_before')
+                                       if k in failed})
                 raise
             save()
         if identity(spec) != inputs:
             raise RuntimeError('campaign inputs changed; use frozen copies and a new out')
         report['status'] = 'complete'
         save()
-    except Exception as exc:
+    except (Exception, Terminated, KeyboardInterrupt) as exc:
         report.update(status='stopped', error=str(exc))
         save()
         raise

@@ -45,6 +45,23 @@ def candidate_params(args, out):
     return evaluate.load_blob(out / 'candidate.gsfr'), seconds
 
 
+def select_fixtures(paths):
+    """Cover strongest motion and confidence, using distinct recorded pairs."""
+    import numpy as np
+    train = module('framegen-net-train')
+    scores = []
+    for path in paths:
+        lp, lc, ff, fr = train.load_sample(path)
+        if not all(np.isfinite(a).all() for a in (lp, lc, ff, fr)):
+            raise ValueError('recorded sample contains non-finite values')
+        motion = sum(float(np.linalg.norm(f[..., :2], axis=-1).mean()) for f in (ff, fr))
+        confidence = sum(float(f[..., 2].mean()) for f in (ff, fr))
+        scores.append((path, motion, confidence))
+    moving = max(scores, key=lambda s: (s[1], s[2]))
+    confident = max((s for s in scores if s[0] != moving[0]), key=lambda s: (s[2], s[1]))
+    return moving[0], confident[0]
+
+
 def fixtures(params, paths):
     import numpy as np
     train, evaluate = module('framegen-net-train'), module('framegen-net-eval')
@@ -100,7 +117,7 @@ def prepare(args):
     params, train_seconds = candidate_params(args, out)
     if not np.any(params['W3']) and not np.any(params['b3']):
         raise ValueError('zero-head model is not a useful execution canary; supply trained weights')
-    selected = (files[0], files[-1])
+    selected = select_fixtures(files)
     features, reference = fixtures(params, selected)
     export_model(params, features.shape[1:], reference.shape[1:], out / 'model.onnx')
     np.savez(out / 'fixture.npz', features=features, reference=reference)
@@ -113,6 +130,7 @@ def prepare(args):
                 'source_net_sha256': source_net,
                 'training_files': source if args.train_steps else {},
                 'fixture_files': {str(p): source[str(p)] for p in selected},
+                'fixture_selection': 'highest-mean-motion-then-distinct-highest-mean-confidence',
                 'files': {p: digest(out / p) for p in
                           ('model.onnx', 'fixture.npz', 'candidate.gsfr')},
                 'trainer_sha256': digest(ROOT / 'scripts/framegen-net-train.py'),
