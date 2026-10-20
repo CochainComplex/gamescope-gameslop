@@ -453,6 +453,16 @@ run is labeled `TOTAL w=N`. Extract the lines with
 the end of the line, so parsers that read fields by name keep working. Fields
 that were not measured print `0` (or `0.000`).
 
+Learning diagnostics count one skip per recorded real, finalized at the next real or shutdown; a recorded step wins over later skips. `train_skip` selects the deepest observed gate, then the most frequent reason (enum order breaks ties), not a full histogram. Uninstrumented routes (bidir, VRR hybrid, classic refill) fall back to `no_batch`; all labels describe scheduler/resource states independent of vendor, GPU count or backend.
+
+| Learning fields | Meaning |
+|---|---|
+| `train_online` | Whether online learning is enabled. |
+| `train_recorded`, `train_published` | Steps recorded / credited by a validated CPU snapshot in this window (`TOTAL`: whole run). Publication credits all progress since the previous snapshot, including dropped or non-finite steps; it does not certify each intermediate result. |
+| `train_recorded_total`, `train_published_total`, `train_saved_total` | Session watermarks at emission: recorded, published, successfully saved. |
+| `train_skip`, `train_skip_n` | Dominant skip and its count in the window (`TOTAL`: whole run). Reasons: `none` (no skips), `no_batch` (no attributed batch), `history` (missing history/anchor), `gpu_busy` (prior batch incomplete), `cadence` (stabilizing), `no_slot` (no generation slot), `budget` (deadline), `output_pool` (no output), `color_probe` (probe), `reuse` (cached motion), `pipeline` (below Learned), `motion` (unavailable), `net_unavailable` (refiner inactive), `resources` (training resources absent), `net_every` (configured training cadence). |
+| `train_rb_dropped`, `train_rb_rejected` | Unconsumed snapshots discarded / non-finite snapshots rejected in the window (`TOTAL`: whole run). Events accumulate even with METRICS/HUD off, like other pending metrics. |
+
 ### Key fields to watch
 
 Read these first when comparing runs. Thresholds are rules of thumb, not
@@ -509,7 +519,7 @@ them otherwise.
 | `gen_late` | Generated frames that flipped more than half a refresh late. |
 | `real_wait` | Times a real frame had to wait while a generated frame was being produced. |
 | `src_flip_ms_p50`, `_p90`, `_p95`, `_fs` | Latency of live real frames from source-ready to the actual flip, in ms. `_fs` is the histogram full scale (256 ms); a percentile at full scale only says the value is beyond it. |
-| `src_rec_ms_p50`, `src_rec_ms_p95`, `rec_flip_ms_p50`, `rec_flip_ms_p95` | The two parts of the `src_flip_ms_*` latency of live real frames, in ms. `src_rec_ms_*` runs from source-ready to the first paint (latch) of that frame; `rec_flip_ms_*` runs from the latch to the actual flip. Same full-scale rule as `src_flip_ms_*`. These are the last four fields on the line, and they are recorded with framegen off too (with `GAMESCOPE_FRAMEGEN_METRICS=1`). |
+| `src_rec_ms_p50`, `src_rec_ms_p95`, `rec_flip_ms_p50`, `rec_flip_ms_p95` | The two parts of the `src_flip_ms_*` latency of live real frames, in ms. `src_rec_ms_*` runs from source-ready to the first paint (latch) of that frame; `rec_flip_ms_*` runs from the latch to the actual flip. Same full-scale rule as `src_flip_ms_*`. Recorded with framegen off too (with `GAMESCOPE_FRAMEGEN_METRICS=1`). |
 | `dreal_flip_ms_p50`, `_p90`, `_p95`, `_fs` | Latency of delayed real frames from their record to the actual flip, in ms (bidirectional mode only). Same full-scale rule. |
 | `bidir_delay_ms` | Largest target delay D in force during the window, in bidirectional mode: how late real frames are shown relative to live. 0 outside bidirectional mode. How D is chosen: [Bidirectional delay controller](framegen-architecture.md#bidirectional-delay-controller). |
 | `ring_ovf` | Bidirectional queue fronts that the output-ring ceiling forced out ahead of their planned slot in the window. Each is an overflow the ring bound learns from. 0 outside bidirectional mode. |

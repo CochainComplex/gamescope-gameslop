@@ -10,6 +10,75 @@
 namespace gamescope::framegen
 {
 
+enum class NetLearningSkip : uint8_t
+{
+	NoSkip, NoBatch, History, Busy, Cadence, NoSlot, Budget, OutputPool, ColorProbe,
+	Reuse, Pipeline, Motion, NetUnavailable, Resources, Every, Count
+};
+
+inline const char *net_learning_skip_name( NetLearningSkip reason )
+{
+	static constexpr std::array names = { "none", "no_batch", "history", "gpu_busy",
+		"cadence", "no_slot", "budget", "output_pool", "color_probe", "reuse",
+		"pipeline", "motion", "net_unavailable", "resources", "net_every" };
+	static_assert( names.size() == static_cast<size_t>( NetLearningSkip::Count ) );
+	const auto index = static_cast<size_t>( reason );
+	return index < names.size() ? names[index] : "unknown";
+}
+
+struct NetLearningSkips
+{
+	std::array<uint64_t, static_cast<size_t>( NetLearningSkip::Count )> counts = {};
+	void add( NetLearningSkip reason )
+	{
+		if ( reason != NetLearningSkip::NoSkip && reason != NetLearningSkip::Count )
+			counts[ static_cast<size_t>( reason ) ]++;
+	}
+	NetLearningSkips &operator+=( const NetLearningSkips &other )
+	{
+		for ( size_t i = 0; i < counts.size(); i++ )
+			counts[i] += other.counts[i];
+		return *this;
+	}
+	NetLearningSkip dominant() const
+	{
+		// Stable enum-order tie break; an empty window has no skip reason.
+		return static_cast<NetLearningSkip>( std::max_element( counts.begin(), counts.end() ) - counts.begin() );
+	}
+};
+
+// One skip per recorded real, finalized at the next real or shutdown.
+// Deepest gate (enum order) wins; a step overrides every skip/refill.
+struct NetLearningPair
+{
+	uint64_t realId = 0;
+	bool stepped = false;
+	NetLearningSkip reason = NetLearningSkip::NoBatch;
+
+	NetLearningSkip finish()
+	{
+		const auto result = realId != 0 && !stepped ? reason : NetLearningSkip::NoSkip;
+		realId = 0;
+		return result;
+	}
+	NetLearningSkip begin( uint64_t id )
+	{
+		if ( id == 0 || id == realId )
+			return NetLearningSkip::NoSkip;
+		const auto result = finish();
+		realId = id;
+		stepped = false;
+		reason = NetLearningSkip::NoBatch;
+		return result;
+	}
+	void skip( NetLearningSkip value )
+	{
+		if ( value > reason && value < NetLearningSkip::Count )
+			reason = value;
+	}
+	void step() { stepped = true; }
+};
+
 // Fixed-width histogram over nanosecond samples, reported in milliseconds.
 //
 // StepNs is the bucket width and Buckets the bucket count, so full scale is
