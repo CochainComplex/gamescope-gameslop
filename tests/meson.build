@@ -66,6 +66,13 @@ test_framegen_deadline = executable(
 )
 test('framegen_deadline', test_framegen_deadline)
 
+test(
+	'gpu_diagnostics',
+	find_program('python3'),
+	args: files('../tools/vapor-menu/test_gpu_diagnostics.py'),
+	timeout: 360,
+)
+
 test_swapchain_policy = executable(
 	'test_swapchain_policy',
 	['test_swapchain_policy.cpp'],
