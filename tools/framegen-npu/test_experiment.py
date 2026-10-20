@@ -118,7 +118,8 @@ class Contracts(unittest.TestCase):
             for sig in previous:
                 self.assertEqual(signal.getsignal(sig), signal.SIG_IGN)
         for sig, handler in previous.items():
-            self.assertEqual(signal.getsignal(sig), handler)
+            self.assertEqual(signal.getsignal(sig), signal.SIG_IGN)
+            signal.signal(sig, handler)
 
     def test_measure_rejects_wrong_finite_nan_and_shape(self):
         x = np.ones((2, 1, 1, 2, 2), np.float32)
@@ -719,6 +720,43 @@ campaign.campaign(argparse.Namespace(spec={str(spec)!r}))
         saved = json.loads((Path(self.spec['out']) / 'campaign.json').read_text())
         self.assertEqual(saved['status'], 'stopped')
         self.assertIn('SIGTERM', saved['error'])
+
+    def test_second_signal_during_campaign_cleanup_records_stopped(self):
+        self.fixture()
+        spec = self.root / 'spec.json'
+        E.write_json(spec, self.spec)
+        script = f'''
+import argparse, os, signal, sys
+sys.path.insert(0, {str(E.HERE)!r})
+import campaign as C
+from common import Terminated, termination_signals
+# Keep campaign orchestration/receipt writes real; substitute the SDK and CPU work.
+C.evaluate = lambda *_: dict.fromkeys(C.METRICS, 0.0)
+C.prepare = C.train_cpu = lambda *_: {{'cpu_train_steps': 0, 'cpu_train_seconds': None}}
+C.step = lambda path, request, operation: operation(path)
+def run_npu(*_):
+    with termination_signals():
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Terminated:
+            raise RuntimeError('helper aborted') from None
+C.run_npu = run_npu
+write = C.write_json
+def cleanup_write(path, value):
+    if path.name == 'campaign.json' and value.get('status') == 'stopped':
+        os.kill(os.getpid(), signal.SIGTERM)
+    write(path, value)
+C.write_json = cleanup_write
+C.campaign(argparse.Namespace(spec={str(spec)!r}))
+'''
+        proc = subprocess.run([sys.executable, '-c', script], capture_output=True,
+                              text=True, timeout=10)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        saved = json.loads((Path(self.spec['out']) / 'campaign.json').read_text())
+        self.assertEqual(saved['status'], 'stopped')
+        self.assertEqual(saved['error'], 'helper aborted')
+        self.assertEqual(saved['benches'][0]['rows'][1]['npu']['status'],
+                         'failed-or-incomplete')
 
     def test_resume_and_summary_with_real_evaluator(self):
         self.fixture()
