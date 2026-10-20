@@ -104,6 +104,73 @@ TEST_CASE("GPU diagnostics distinguish candidates from verified device inventory
     for (uint32_t i=0;i<hud.lineCount;++i) CHECK(std::strlen(hud.lines[i].data())<=k_uFramegenHudMaxColumns);
 }
 
+TEST_CASE( "GPU buffer observations retain their packed wire values", "[framegen][gpu-diagnostics]" )
+{
+    const struct { const char *origin; uint32_t kind; } cases[] = {
+        {nullptr, 0}, {"", 0}, {"cpu", 1}, {"linear", 2}, {"AMD", 3},
+        {"NVIDIA", 4}, {"Intel", 5}, {"vendor0xaa", 6}, {"amd", 6}, {"CPU", 6},
+    };
+    for (const auto &c : cases) {
+        CAPTURE(c.origin, c.kind);
+        CHECK(gpu_buffer_observation(c.origin, false) == c.kind);
+        CHECK(gpu_buffer_observation(c.origin, true) == (c.kind | 256u));
+    }
+}
+
+TEST_CASE( "GPU diagnostics preserve evidence and ignore software candidates", "[framegen][gpu-diagnostics]" )
+{
+    GpuDiagnostics inventory;
+    inventory.cards = {
+        {"AMD", "", "", "", 0x1002, 0, false},
+        {"Software NVIDIA", "", "", "", 0x10de, 0, true},
+        {"Intel", "", "", "", 0x8086, 0, false},
+    };
+    inventory.presenter = 0;
+    inventory.renderer = 0; // Every resolution must discard stale inference.
+    inventory.evidence = "stale";
+    inventory.transport = "stale";
+    inventory.scope = "test scope";
+    inventory.build = "test build";
+    const struct {
+        uint32_t observation, renderer;
+        const char *evidence, *transport;
+    } cases[] = {
+        {0, kUnknownGpu, "No composited client buffer observed", "not observed"},
+        {256, kUnknownGpu, "No composited client buffer observed", "not observed"},
+        {1, kUnknownGpu, "CPU/shared-memory buffer; GPU producer unknown", "imported / not staged"},
+        {257, kUnknownGpu, "CPU/shared-memory buffer; GPU producer unknown", "staged / copied"},
+        {2, kUnknownGpu, "Unknown: linear buffer has no GPU identity", "imported / not staged"},
+        {258, 2, "Inferred: staged linear buffer, one other GPU", "staged / copied"},
+        {3, 0, "Inferred: modifier vendor, one matching GPU", "imported / not staged"},
+        {259, 0, "Inferred: modifier vendor, one matching GPU", "staged / copied"},
+        {4, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "imported / not staged"},
+        {260, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "staged / copied"},
+        {5, 2, "Inferred: modifier vendor, one matching GPU", "imported / not staged"},
+        {261, 2, "Inferred: modifier vendor, one matching GPU", "staged / copied"},
+        {6, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "imported / not staged"},
+        {262, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "staged / copied"},
+        {511, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "staged / copied"},
+    };
+    for (const auto &c : cases) {
+        CAPTURE(c.observation);
+        const auto result = resolve_gpu_diagnostics(inventory, c.observation);
+        CHECK(result.renderer == c.renderer);
+        CHECK(result.evidence == c.evidence);
+        CHECK(result.transport == c.transport);
+        CHECK(result.presenter == inventory.presenter);
+        CHECK(result.cards.size() == inventory.cards.size());
+        CHECK(result.scope == inventory.scope);
+        CHECK(result.build == inventory.build);
+    }
+    // Two real alternatives are ambiguous, even when the presenter is unknown.
+    inventory.presenter = kUnknownGpu;
+    CHECK(resolve_gpu_diagnostics(inventory, 258).evidence
+        == "Ambiguous: multiple matching GPUs; no exact address");
+    inventory.cards.clear();
+    CHECK(resolve_gpu_diagnostics(inventory, 258).renderer == kUnknownGpu);
+    CHECK(resolve_gpu_diagnostics(inventory, 3).renderer == kUnknownGpu);
+}
+
 TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]" )
 {
 	const FramegenHudSnapshot_t snapshot = {
