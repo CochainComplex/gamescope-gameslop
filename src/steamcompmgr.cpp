@@ -7846,6 +7846,10 @@ steamcompmgr_exit(void)
 	// after the final GPU readback, writing only if progress advanced.
 	vulkan_framegen_flush_profile();
 
+	// EIS pointer events use the backend as well as Wayland state. Stop them
+	// before either is torn down, with no Wayland lock held during the join.
+	wlserver_shutdown_input();
+
 	g_ImageWaiter.Shutdown();
 
 	// Clean up any commits.

@@ -1978,7 +1978,7 @@ gamescope_xwayland_server_t::gamescope_xwayland_server_t(wl_display *display, in
 	if (!xwayland_server)
 	{
 		wl_log.errorf("Failed to create Xwayland server");
-		exit(1);
+		gamescope_exit(1);
 	}
 	wl_signal_add(&xwayland_server->events.ready, &xwayland_ready_listener);
 
@@ -2184,6 +2184,19 @@ static gamescope::CAsyncWaiter g_LibEisWaiter( "gamescope-eis" );
 // TODO: Move me into some ownership of eg. wlserver.
 static std::unique_ptr<gamescope::GamescopeInputServer> g_InputServer;
 #endif
+
+void wlserver_shutdown_input()
+{
+#if HAVE_LIBEIS
+	// Both compositor exit and a Wayland-loop error can get here. Join only
+	// once, without the Wayland lock: input callbacks may be waiting for it.
+	static std::once_flag once;
+	std::call_once( once, [] {
+		g_LibEisWaiter.Shutdown();
+		g_InputServer = nullptr;
+	} );
+#endif
+}
 
 static void wlserver_update_keymap();
 
@@ -2564,6 +2577,8 @@ void wlserver_run(void)
 	wlserver.bWaylandServerRunning = false;
 	wlserver.bWaylandServerRunning.notify_all();
 
+	wlserver_shutdown_input();
+
 	{
 		wlserver_lock();
 		{
@@ -2579,12 +2594,6 @@ void wlserver_run(void)
 		std::unique_lock lock2(g_wlserver_xdg_shell_windows_lock);
 		wlserver.xdg_wins.clear();
 	}
-
-#if HAVE_LIBEIS
-	// The EIS waiter thread may still be dispatching on the context; join it before freeing that.
-	g_LibEisWaiter.Shutdown();
-	g_InputServer = nullptr;
-#endif
 
 	// Released when steamcompmgr closes.
 	std::unique_lock<std::mutex> xwayland_server_guard(g_SteamCompMgrXWaylandServerMutex);
