@@ -30,6 +30,7 @@ def main():
         "CWaylandInputThread::CWaylandInputThread()",
         "CWaylandInputThread::~CWaylandInputThread()",
         "std::weak_ptr<std::atomic<bool>> CWaylandConnector::GetFullscreenState() const",
+        "void CWaylandConnector::UpdateFullscreenState()",
         "CWaylandConnector::~CWaylandConnector()",
         "std::shared_ptr<IBackendConnector> CWaylandBackend::CreateVirtualConnector( uint64_t ulVirtualConnectorKey )",
         "void CWaylandInputThread::SetFullscreenState( std::weak_ptr<std::atomic<bool>> pState )",
@@ -49,11 +50,15 @@ def main():
         directory = Path(directory)
         (directory / "wayland_fullscreen_waiter.inc").write_text(waiter)
         (directory / "wayland_fullscreen_methods.inc").write_text(
-            "\n".join(function(source, signature) for signature in methods) + worker)
+            "\n".join(function(source, signature).replace(
+                "if ( auto pState = m_pFullscreenState.load().lock() )",
+                "if ( auto pState = m_pFullscreenState.load().lock(); pState && after_request_pin() )")
+                for signature in methods) + worker)
         for filename, member in (
             ("connector_state", "m_pDesiredFullscreenState ="),
             ("input_state", "m_pFullscreenState;"),
             ("focus", "m_pFocusConnector;"),
+            ("visibility", "bool m_bVisible ="),
         ):
             (directory / f"wayland_fullscreen_{filename}.inc").write_text(declaration(source, member))
         (directory / "wayland_fullscreen_connector_destroyed.inc").write_text(
@@ -64,7 +69,8 @@ def main():
                        + ["-std=c++20", "-pthread", "-Wall", "-Wextra", "-I", str(directory),
                           str(root / "tests/test_wayland_fullscreen.cpp"), "-o", str(binary)],
                        check=True, timeout=60)
-        for case in ("startup", "current", "expired", "pinned", "replacement", "failed-replacement", "old-destroy"):
+        for case in ("startup", "current", "double-toggle", "request-during-apply", "invisible", "initializing",
+                     "expired", "pinned", "replacement", "failed-replacement", "old-destroy"):
             subprocess.run([str(binary), case], check=True, timeout=10)
             print(f"Wayland fullscreen {case}: PASS", flush=True)
 
