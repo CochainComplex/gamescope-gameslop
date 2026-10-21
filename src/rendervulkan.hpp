@@ -166,6 +166,37 @@ public:
 		// VK_SHARING_MODE_CONCURRENT instead of explicit ownership transfers.
 		bool bFramegenShared : 1;
 		VkImageType imageType;
+
+		static createFlags LinearCapture( bool exportable )
+		{
+			createFlags flags;
+			flags.bMappable = true;
+			flags.bTransferDst = true;
+			flags.bStorage = true;
+			flags.bExportable = exportable;
+			flags.bLinear = exportable;
+			return flags;
+		}
+
+		VkImageUsageFlags imageUsage() const
+		{
+			VkImageUsageFlags usage = 0;
+			if ( bSampled ) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+			if ( bStorage ) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+			if ( bColorAttachment ) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+			if ( bTransferSrc ) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+			if ( bTransferDst ) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			return usage;
+		}
+
+		VkImageCreateFlags imageCreateFlags( VkFormat format, VkFormat alternateFormat ) const
+		{
+			VkImageCreateFlags flags = format != alternateFormat ? VkImageCreateFlags( VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT ) : 0u;
+			// Storage support comes from compatible NV12 plane views.
+			if ( format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM && bStorage )
+				flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+			return flags;
+		}
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
@@ -650,6 +681,7 @@ bool vulkan_framegen_spatial_guard();
 
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
+bool vulkan_supports_pipewire_dmabuf( uint32_t drmFormat );
 uint32_t vulkan_get_rgb10_capture_format( void );
 
 bool vulkan_present_to_window( void );

@@ -160,6 +160,11 @@ available. Verify even NV12 allocation extents for odd content dimensions,
 separate logical content dimensions, and clamping of padded edges during
 conversion. Driver-reported plane offsets, pitches and allocation size
 remain authoritative. An allocation-wide raw dump is not a packed NV12 file.
+PipeWire advertises its linear DMA-BUF option only when Vulkan reports support
+for the actual capture format, usage and image flags; otherwise its mapped
+MemFd option remains available. A consumer requiring unsupported DMA-BUF caps
+should fail negotiation rather than receive an invalid export or a mislabeled
+MemFd buffer.
 
 Run the existing nested SDL smoke cases as well as nested Wayland captures:
 they exercise different device-extension and presentation paths. Native DRM,

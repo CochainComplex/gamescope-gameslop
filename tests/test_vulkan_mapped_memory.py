@@ -12,44 +12,86 @@ def between(source, start, end):
     return source[begin:source.index(end, begin)]
 
 
-def check_nv12_contracts(source, directory):
+def check_nv12_contracts(source, header, directory):
     """Execute production view/export/pool branches with real Vulkan ABI types."""
     init = between(source, "bool CVulkanTexture::BInit(", "bool CVulkanTexture::BInitFromSwapchain(")
     views = between(init, "\tif ( flags.bStorage || flags.bSampled || flags.bColorAttachment )",
                     "\n\tif ( flags.bMappable )\n")
-    flags = between(init, "\tif ( drmFormat == DRM_FORMAT_NV12 && flags.bStorage )",
-                    "\n\tif ( pDMA != nullptr )")
+    flags = between(header, "\tstruct createFlags {", "\n\tbool BInit(")
+    usage = next(line for line in init.splitlines() if "VkImageUsageFlags usage = flags.imageUsage();" in line)
+    create_flags = next(line for line in init.splitlines() if "imageInfo.flags = flags.imageCreateFlags(" in line)
+    capability = between(source, "static VkResult getExternalImageFormatProps(",
+                         "\nstatic VkImageViewType VulkanImageTypeToViewType(")
+    guard = between(init, "\tif ( flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&",
+                    "\n\tres = g_device.vk.CreateImage(")
     external = between(init, "\tif ( pDMA != nullptr || flags.bExportable )",
                        "\n\tm_width = width;")
     pool = between(source, "static gamescope::Rc<CVulkanTexture> acquire_pooled_texture(",
                    "\ngamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(")
-    for name, body in (("views", views), ("flags", flags), ("external", external), ("pool", pool)):
+    for name, body in (("views", views), ("create_flags", flags), ("usage", usage),
+                       ("flags", create_flags), ("capability", capability), ("guard", guard),
+                       ("external", external), ("pool", pool)):
         (directory / f"nv12_{name}.inc").write_text(body)
     fixture = r'''
 #include <vulkan/vulkan.h>
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cinttypes>
 #include <utility>
 #include <vector>
 constexpr uint32_t DRM_FORMAT_NV12 = 1, RGB = 2;
+constexpr uint64_t DRM_FORMAT_MOD_INVALID = ~uint64_t{0};
 using EStreamColorspace = int;
 namespace gamescope { template<class T> using Rc = T*; }
-static VkFormat DRMFormatToVulkan(uint32_t format, bool) {
-    return format == DRM_FORMAT_NV12 ? VK_FORMAT_G8_B8R8_2PLANE_420_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+static VkFormat DRMFormatToVulkan(uint32_t format, bool srgb) {
+    return format == DRM_FORMAT_NV12 ? VK_FORMAT_G8_B8R8_2PLANE_420_UNORM : srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
 }
 static VkImageViewType VulkanImageTypeToViewType(VkImageType) { return VK_IMAGE_VIEW_TYPE_2D; }
 static void vk_errorf(VkResult, const char*) {}
+struct Log { template<class... Args> void errorf(const char*,Args...) {} } vk_log;
+template<class Target,class Base> static const Target* pNextFind(const Base* base,VkStructureType type) {
+    for (auto p=static_cast<const VkBaseInStructure*>(base->pNext);p;p=p->pNext)
+        if (p->sType==type) return reinterpret_cast<const Target*>(p);
+    return nullptr;
+}
 struct Observed { VkFormat format; VkImageAspectFlags aspect; VkImageUsageFlags usage; bool conversion; };
 struct Device {
     unsigned fail = 0;
+    VkResult query_result=VK_SUCCESS;
+    VkExternalMemoryFeatureFlags external_features=VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+    VkExternalMemoryHandleTypeFlags compatible=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkImageTiling query_tiling{};
+    VkImageUsageFlags query_usage{};
+    VkImageCreateFlags query_flags{};
+    bool query_modifier=false, query_formats=false;
+    std::vector<uint32_t> query_families;
     std::vector<Observed> views;
     VkDevice device() { return VK_NULL_HANDLE; }
+    VkPhysicalDevice physDev() { return VK_NULL_HANDLE; }
     VkSamplerYcbcrConversion ycbcrConversion() { return reinterpret_cast<VkSamplerYcbcrConversion>(uintptr_t{71}); }
     struct Calls {
         VkResult CreateImageView(VkDevice, const VkImageViewCreateInfo* info, void*, VkImageView* view);
+        VkResult GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice,const VkPhysicalDeviceImageFormatInfo2*,VkImageFormatProperties2*);
     } vk;
 } g_device;
+VkResult Device::Calls::GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice,const VkPhysicalDeviceImageFormatInfo2* info,VkImageFormatProperties2* out) {
+    g_device.query_tiling=info->tiling; g_device.query_usage=info->usage; g_device.query_flags=info->flags;
+    auto external=pNextFind<VkPhysicalDeviceExternalImageFormatInfo>(info,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+    assert(external && external->handleType==VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+    auto modifier=pNextFind<VkPhysicalDeviceImageDrmFormatModifierInfoEXT>(info,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+    g_device.query_modifier=modifier;
+    g_device.query_families.clear();
+    if (modifier) {
+        assert(modifier->sharingMode==VK_SHARING_MODE_CONCURRENT);
+        g_device.query_families.assign(modifier->pQueueFamilyIndices,modifier->pQueueFamilyIndices+modifier->queueFamilyIndexCount);
+    }
+    g_device.query_formats=pNextFind<VkImageFormatListCreateInfo>(info,VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+    auto properties=static_cast<VkExternalImageFormatProperties*>(out->pNext);
+    properties->externalMemoryProperties.externalMemoryFeatures=g_device.external_features;
+    properties->externalMemoryProperties.compatibleHandleTypes=g_device.compatible;
+    return g_device.query_result;
+}
 VkResult Device::Calls::CreateImageView(VkDevice, const VkImageViewCreateInfo* info, void*, VkImageView* view) {
     VkImageUsageFlags usage = 0;
     bool conversion = false;
@@ -69,11 +111,8 @@ VkResult Device::Calls::CreateImageView(VkDevice, const VkImageViewCreateInfo* i
 }
 class CVulkanTexture {
 public:
-    struct createFlags {
-        bool bStorage=false, bSampled=false, bColorAttachment=false, bMappable=false;
-        bool bTransferDst=false, bExportable=false, bLinear=false;
-        VkImageType imageType=VK_IMAGE_TYPE_2D;
-    } requested;
+#include "nv12_create_flags.inc"
+    createFlags requested;
     uint32_t w=0,h=0,cw=0,ch=0,format=0;
     unsigned refs=0;
     int color=0;
@@ -94,12 +133,23 @@ public:
         VkResult res=VK_SUCCESS;
         bool bHasAlpha=false;
         VkImageCreateInfo imageInfo{};
-        imageInfo.usage = (flags.bStorage ? VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT) : 0u) |
-                          (flags.bSampled ? VkImageUsageFlags(VK_IMAGE_USAGE_SAMPLED_BIT) : 0u);
+#include "nv12_usage.inc"
+        imageInfo.usage=usage;
 #include "nv12_views.inc"
         return true;
     }
 };
+#include "nv12_capability.inc"
+static bool export_guard(bool exportable,bool imported,VkImageTiling tiling) {
+    const auto flags=CVulkanTexture::createFlags::LinearCapture(exportable);
+    const void* pDMA=imported ? &flags : nullptr;
+    const uint32_t drmFormat=DRM_FORMAT_NV12;
+    VkImageCreateInfo imageInfo{};
+    imageInfo.format=DRMFormatToVulkan(drmFormat,false);imageInfo.tiling=tiling;
+    imageInfo.usage=flags.imageUsage();imageInfo.flags=flags.imageCreateFlags(imageInfo.format,imageInfo.format);
+#include "nv12_guard.inc"
+    return true;
+}
 struct Slot {
     CVulkanTexture* p=nullptr;
     ~Slot() { delete p; }
@@ -131,11 +181,58 @@ int main() {
     }
     for (uint32_t drmFormat : {RGB,DRM_FORMAT_NV12}) for (bool storage : {false,true}) {
         CVulkanTexture::createFlags flags; flags.bStorage=storage;
+        std::array<VkFormat,2> formats={DRMFormatToVulkan(drmFormat,false),DRMFormatToVulkan(drmFormat,true)};
         VkImageCreateInfo imageInfo{};
 #include "nv12_flags.inc"
         assert(bool(imageInfo.flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) == (drmFormat==DRM_FORMAT_NV12 && storage));
-        assert(bool(imageInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) == (drmFormat==DRM_FORMAT_NV12 && storage));
+        assert(bool(imageInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) == (drmFormat==RGB || storage));
+        assert(flags.imageCreateFlags(formats[0],formats[0]) == (drmFormat==DRM_FORMAT_NV12 && storage ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT|VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0u));
     }
+    const std::array<VkImageUsageFlags,5> bits={VK_IMAGE_USAGE_SAMPLED_BIT,VK_IMAGE_USAGE_STORAGE_BIT,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,VK_IMAGE_USAGE_TRANSFER_SRC_BIT,VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    for (unsigned mask=0;mask<32;mask++) {
+        CVulkanTexture::createFlags flags;
+        flags.bSampled=mask&1;flags.bStorage=mask&2;flags.bColorAttachment=mask&4;
+        flags.bTransferSrc=mask&8;flags.bTransferDst=mask&16;
+        VkImageUsageFlags expected=0;
+        for (unsigned bit=0;bit<5;bit++) if (mask&(1u<<bit)) expected|=bits[bit];
+        assert(flags.imageUsage()==expected);
+    }
+    for (bool exported : {false,true}) {
+        auto flags=CVulkanTexture::createFlags::LinearCapture(exported);
+        assert(flags.bMappable && flags.bStorage && flags.bTransferDst && !flags.bSampled && !flags.bTransferSrc && !flags.bColorAttachment);
+        assert(flags.bExportable==exported && flags.bLinear==exported && flags.imageType==VK_IMAGE_TYPE_2D);
+    }
+    for (int rejected=0;rejected<4;rejected++) {
+        g_device.query_result=rejected==1 ? VK_ERROR_FORMAT_NOT_SUPPORTED : VK_SUCCESS;
+        g_device.external_features=rejected==2 ? 0u : VkExternalMemoryFeatureFlags(VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+        g_device.compatible=rejected==3 ? 0u : VkExternalMemoryHandleTypeFlags(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+        for (uint32_t format : {RGB,DRM_FORMAT_NV12}) {
+            assert(vulkan_supports_pipewire_dmabuf(format)==(rejected==0));
+            assert(!g_device.query_modifier && g_device.query_tiling==VK_IMAGE_TILING_LINEAR);
+            assert(g_device.query_formats==(format==RGB));
+            assert(g_device.query_usage==CVulkanTexture::createFlags::LinearCapture(true).imageUsage());
+            assert(g_device.query_flags==CVulkanTexture::createFlags::LinearCapture(true).imageCreateFlags(DRMFormatToVulkan(format,false),DRMFormatToVulkan(format,true)));
+        }
+    }
+    g_device.query_result=VK_SUCCESS;
+    const uint32_t families[2]={1,3};
+    VkImageCreateInfo query{};query.tiling=VK_IMAGE_TILING_LINEAR;query.sharingMode=VK_SHARING_MODE_CONCURRENT;
+    query.queueFamilyIndexCount=2;query.pQueueFamilyIndices=families;
+    VkExternalImageFormatProperties properties{};
+    assert(getExternalImageFormatProps(&query,0,&properties)==VK_SUCCESS);
+    assert(g_device.query_modifier && g_device.query_tiling==VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+    assert(g_device.query_families==std::vector<uint32_t>({1,3}));
+    assert(getExternalImageFormatProps(&query,DRM_FORMAT_MOD_INVALID,&properties)==VK_SUCCESS);
+    assert(!g_device.query_modifier && g_device.query_tiling==VK_IMAGE_TILING_LINEAR);
+    g_device.query_result=VK_ERROR_FORMAT_NOT_SUPPORTED;
+    assert(!export_guard(true,false,VK_IMAGE_TILING_LINEAR));
+    assert(export_guard(false,false,VK_IMAGE_TILING_LINEAR));
+    assert(export_guard(true,true,VK_IMAGE_TILING_LINEAR));
+    assert(export_guard(true,false,VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT));
+    g_device.query_result=VK_SUCCESS;
+    g_device.external_features=VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+    g_device.compatible=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    assert(export_guard(true,false,VK_IMAGE_TILING_LINEAR));
     for (bool imported : {false,true}) for (bool exported : {false,true}) {
         CVulkanTexture::createFlags flags; flags.bExportable=exported;
         const void* pDMA=imported ? &flags : nullptr;
@@ -278,7 +375,7 @@ def main():
                           str(root / "tests/test_vulkan_mapped_memory.cpp"),
                           "-o", str(binary)], check=True, timeout=60)
         subprocess.run([str(binary)], check=True, timeout=10)
-        check_nv12_contracts(source, directory)
+        check_nv12_contracts(source, header, directory)
 
 
 if __name__ == "__main__":

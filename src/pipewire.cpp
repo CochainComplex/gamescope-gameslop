@@ -94,6 +94,16 @@ static void calculate_capture_size()
 	s_nCaptureHeight = SPA_ROUND_UP_N(s_nCaptureHeight, kCaptureAlign);
 }
 
+uint32_t spa_format_to_drm(uint32_t spa_format)
+{
+	switch (spa_format)
+	{
+		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
+		default:
+		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
+	}
+}
+
 static void build_format_params(struct spa_pod_builder *builder, spa_video_format format, std::vector<const struct spa_pod *> &params) {
 	struct spa_rectangle size = SPA_RECTANGLE(s_nCaptureWidth, s_nCaptureHeight);
 	struct spa_rectangle min_requested_size = { 0, 0 };
@@ -129,7 +139,9 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
 	spa_pod_builder_long(builder, modifier); // default
 	spa_pod_builder_long(builder, modifier);
 	spa_pod_builder_pop(builder, &choice_frame);
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
+	const auto *dmabuf_param = (const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame);
+	if ( vulkan_supports_pipewire_dmabuf( spa_format_to_drm( format ) ) )
+		params.push_back(dmabuf_param);
 
 	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
 	spa_pod_builder_add(builder,
@@ -446,16 +458,6 @@ static int anonymous_shm_open(void)
 	return -1;
 }
 
-uint32_t spa_format_to_drm(uint32_t spa_format)
-{
-	switch (spa_format)
-	{
-		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
-		default:
-		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
-	}
-}
-
 static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffer)
 {
 	struct pipewire_state *state = (struct pipewire_state *) user_data;
@@ -504,15 +506,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
 
 	buffer->texture = new CVulkanTexture();
-	CVulkanTexture::createFlags screenshotImageFlags;
-	screenshotImageFlags.bMappable = true;
-	screenshotImageFlags.bTransferDst = true;
-	screenshotImageFlags.bStorage = true;
-	if (is_dmabuf)
-	{
-		screenshotImageFlags.bExportable = true;
-		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
-	}
+	auto screenshotImageFlags = CVulkanTexture::createFlags::LinearCapture( is_dmabuf );
 	bool bImageInitSuccess = buffer->texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, screenshotImageFlags );
 	if ( !bImageInitSuccess )
 	{

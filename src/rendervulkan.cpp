@@ -3385,17 +3385,19 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 	return true;
 }
 
-static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
+static VkResult getExternalImageFormatProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
 {
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
 		.drmFormatModifier = modifier,
 		.sharingMode = imageInfo->sharingMode,
+		.queueFamilyIndexCount = imageInfo->queueFamilyIndexCount,
+		.pQueueFamilyIndices = imageInfo->pQueueFamilyIndices,
 	};
 
 	VkPhysicalDeviceExternalImageFormatInfo externalImageFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-		.pNext = &modifierFormatInfo,
+		.pNext = modifier != DRM_FORMAT_MOD_INVALID ? &modifierFormatInfo : nullptr,
 		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 	};
 
@@ -3404,7 +3406,7 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 		.pNext = &externalImageFormatInfo,
 		.format = imageInfo->format,
 		.type = imageInfo->imageType,
-		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+		.tiling = modifier != DRM_FORMAT_MOD_INVALID ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT : imageInfo->tiling,
 		.usage = imageInfo->usage,
 		.flags = imageInfo->flags,
 	};
@@ -3423,6 +3425,39 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 	};
 
 	return g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, &imageProps);
+}
+
+static bool supportsNonModifierExport( const VkImageCreateInfo &imageInfo )
+{
+	VkExternalImageFormatProperties properties = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+	};
+	return getExternalImageFormatProps( &imageInfo, DRM_FORMAT_MOD_INVALID, &properties ) == VK_SUCCESS &&
+		( properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) &&
+		( properties.externalMemoryProperties.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT );
+}
+
+bool vulkan_supports_pipewire_dmabuf( uint32_t drmFormat )
+{
+	const auto flags = CVulkanTexture::createFlags::LinearCapture( true );
+	std::array<VkFormat, 2> formats = {
+		DRMFormatToVulkan( drmFormat, false ), DRMFormatToVulkan( drmFormat, true ),
+	};
+	VkImageFormatListCreateInfo formatList = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+		.viewFormatCount = uint32_t( formats.size() ),
+		.pViewFormats = formats.data(),
+	};
+	VkImageCreateInfo imageInfo = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.pNext = formats[0] != formats[1] ? &formatList : nullptr,
+		.flags = flags.imageCreateFlags( formats[0], formats[1] ),
+		.imageType = flags.imageType,
+		.format = formats[0],
+		.tiling = VK_IMAGE_TILING_LINEAR,
+		.usage = flags.imageUsage(),
+	};
+	return supportsNonModifierExport( imageInfo );
 }
 
 static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
@@ -3496,37 +3531,12 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
 
 	VkImageTiling tiling = (flags.bMappable || flags.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
-	VkImageUsageFlags usage = 0;
+	VkImageUsageFlags usage = flags.imageUsage();
 	VkMemoryPropertyFlags properties;
-
-	if ( flags.bSampled == true )
-	{
-		usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-	}
-
-	if ( flags.bStorage == true )
-	{
-		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-	}
-
-	if ( flags.bColorAttachment == true )
-	{
-		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	}
 
 	if ( flags.bFlippable == true )
 	{
 		flags.bExportable = true;
-	}
-
-	if ( flags.bTransferSrc == true )
-	{
-		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	}
-
-	if ( flags.bTransferDst == true )
-	{
-		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	}
 
 	if ( flags.bMappable == true )
@@ -3645,15 +3655,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.pViewFormats = formats.data(),
 	};
 
+	imageInfo.flags = flags.imageCreateFlags( formats[0], formats[1] );
 	if ( formats[0] != formats[1] )
 	{
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
-		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-	}
-	if ( drmFormat == DRM_FORMAT_NV12 && flags.bStorage )
-	{
-		// Storage is supported by the R8/RG8 plane views, not the full NV12 view.
-		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
 	}
 
 	if ( pDMA != nullptr )
@@ -3667,15 +3672,15 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
 		};
 
-		res = getModifierProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+		res = getExternalImageFormatProps( &imageInfo, pDMA->modifier, &externalImageProperties );
 		if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED && flags.bTransferSrc )
 		{
 			flags.bTransferSrc = false;
 			imageInfo.usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-			res = getModifierProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+			res = getExternalImageFormatProps( &imageInfo, pDMA->modifier, &externalImageProperties );
 		}
 		if ( res != VK_SUCCESS && res != VK_ERROR_FORMAT_NOT_SUPPORTED ) {
-			vk_errorf( res, "getModifierProps failed" );
+			vk_errorf( res, "getExternalImageFormatProps failed" );
 			return false;
 		}
 
@@ -3769,11 +3774,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				VkExternalImageFormatProperties externalFormatProps = {
 					.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
 				};
-				res = getModifierProps( &imageInfo, modifier, &externalFormatProps );
+				res = getExternalImageFormatProps( &imageInfo, modifier, &externalFormatProps );
 				if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
 					continue;
 				else if ( res != VK_SUCCESS ) {
-					vk_errorf( res, "getModifierProps failed" );
+					vk_errorf( res, "getExternalImageFormatProps failed" );
 					return false;
 				}
 
@@ -3856,6 +3861,13 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	}
 
 	m_format = imageInfo.format;
+
+	if ( flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+		!supportsNonModifierExport( imageInfo ) )
+	{
+		vk_log.errorf( "dma-buf export is unsupported for DRM format 0x%" PRIX32 " with tiling %d", drmFormat, tiling );
+		return false;
+	}
 
 	res = g_device.vk.CreateImage(g_device.device(), &imageInfo, nullptr, &m_vkImage);
 	if (res != VK_SUCCESS) {
@@ -6218,15 +6230,8 @@ static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_
 		{
 			pTexture = new CVulkanTexture();
 
-			CVulkanTexture::createFlags textureFlags;
-			textureFlags.bMappable = true;
-			textureFlags.bTransferDst = true;
-			textureFlags.bStorage = true;
+			auto textureFlags = CVulkanTexture::createFlags::LinearCapture( exportable );
 			textureFlags.bSampled = drmFormat != DRM_FORMAT_NV12; // RGB source for RGB-to-NV12 conversion
-			if (exportable) {
-				textureFlags.bExportable = true;
-				textureFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
-			}
 
 			if ( !pTexture->BInit( width, height, 1u, drmFormat, textureFlags, nullptr, contentWidth, contentHeight ) )
 			{
