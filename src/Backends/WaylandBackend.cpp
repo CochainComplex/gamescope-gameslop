@@ -416,7 +416,7 @@ namespace gamescope
 
         bool UpdateEdid();
         bool Init();
-        void SetFullscreen( bool bFullscreen ); // Thread safe, can be called from the input thread.
+        std::weak_ptr<std::atomic<bool>> GetFullscreenState() const;
         void UpdateFullscreenState();
 
 
@@ -492,7 +492,7 @@ namespace gamescope
         // One backing plane plus every layer steamcompmgr can hand us.
         CWaylandPlane m_Planes[k_nMaxLayers + 1];
         bool m_bVisible = true;
-        std::atomic<bool> m_bDesiredFullscreenState = { false };
+        std::shared_ptr<std::atomic<bool>> m_pDesiredFullscreenState = std::make_shared<std::atomic<bool>>( false );
 
         bool m_bHostCompositorIsCurrentlyVRR = false;
     };
@@ -545,6 +545,7 @@ namespace gamescope
         std::shared_ptr<T> QueueLaunder( T* pObject );
 
         void SetRelativePointer( bool bRelative );
+        void SetFullscreenState( std::weak_ptr<std::atomic<bool>> pState );
 
     private:
 
@@ -553,6 +554,7 @@ namespace gamescope
         void ReleaseHeldKeys();
 
         CWaylandBackend *m_pBackend = nullptr;
+        std::atomic<std::weak_ptr<std::atomic<bool>>> m_pFullscreenState;
 
         CWaiter<4> m_Waiter;
 
@@ -828,8 +830,6 @@ namespace gamescope
         void Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource );
         static const zwp_primary_selection_source_v1_listener s_PrimarySelectionSourceListener;
 
-        CWaylandInputThread m_InputThread;
-
         wl_display *m_pDisplay = nullptr;
         wl_shm *m_pShm = nullptr;
         wl_compositor *m_pCompositor = nullptr;
@@ -901,6 +901,9 @@ namespace gamescope
         wl_surface *m_pCursorSurface = nullptr;
         std::shared_ptr<INestedHints::CursorInfo> m_pDefaultCursorInfo;
         wl_surface *m_pDefaultCursorSurface = nullptr;
+
+        // Stop and join before the backend state used by input callbacks dies.
+        CWaylandInputThread m_InputThread;
     };
     const wl_registry_listener CWaylandBackend::s_RegistryListener =
     {
@@ -1072,7 +1075,7 @@ namespace gamescope
 
         if ( g_bFullscreen )
         {
-            m_bDesiredFullscreenState = true;
+            *m_pDesiredFullscreenState = true;
             g_bFullscreen = false;
             UpdateFullscreenState();
         }
@@ -1086,9 +1089,9 @@ namespace gamescope
         return true;
     }
 
-    void CWaylandConnector::SetFullscreen( bool bFullscreen )
+    std::weak_ptr<std::atomic<bool>> CWaylandConnector::GetFullscreenState() const
     {
-        m_bDesiredFullscreenState = bFullscreen;
+        return m_pDesiredFullscreenState;
     }
 
     void CWaylandConnector::UpdateFullscreenState()
@@ -1096,14 +1099,14 @@ namespace gamescope
         if ( !m_bVisible )
             g_bFullscreen = false;
 
-        if ( m_bDesiredFullscreenState != g_bFullscreen && m_bVisible )
+        if ( *m_pDesiredFullscreenState != g_bFullscreen && m_bVisible )
         {
-            if ( m_bDesiredFullscreenState )
+            if ( *m_pDesiredFullscreenState )
                 libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
             else
                 libdecor_frame_unset_fullscreen( m_Planes[0].GetFrame() );
 
-            g_bFullscreen = m_bDesiredFullscreenState;
+            g_bFullscreen = *m_pDesiredFullscreenState;
         }
     }
 
@@ -2530,6 +2533,7 @@ namespace gamescope
     {
         std::shared_ptr<CWaylandConnector> pConnector = std::make_shared<CWaylandConnector>( this, ulVirtualConnectorKey );
         m_pFocusConnector = pConnector.get();
+        m_InputThread.SetFullscreenState( pConnector->GetFullscreenState() );
 
         if ( !pConnector->Init() )
         {
@@ -2944,16 +2948,19 @@ namespace gamescope
     ///////////////////////
 
     CWaylandInputThread::CWaylandInputThread()
-        : m_Thread{ [this](){ this->ThreadFunc(); } }
     {
+        // ThreadFunc first reads the init gate, so construct all members first.
+        m_Thread = std::thread{ [this](){ this->ThreadFunc(); } };
     }
 
     CWaylandInputThread::~CWaylandInputThread()
     {
+        // Startup can fail before Init publishes the backend. Stop first so a
+        // worker released from the init gate returns before reading it.
+        m_Waiter.Shutdown();
         m_bInitted = true;
         m_bInitted.notify_all();
 
-        m_Waiter.Shutdown();
         m_Thread.join();
     }
 
@@ -3096,6 +3103,11 @@ namespace gamescope
         return std::shared_ptr<T>{ pObjectWrapper, []( T *pThing ){ wl_proxy_wrapper_destroy( (void *)pThing ); } };
     }
 
+    void CWaylandInputThread::SetFullscreenState( std::weak_ptr<std::atomic<bool>> pState )
+    {
+        m_pFullscreenState = std::move( pState );
+    }
+
     void CWaylandInputThread::SetRelativePointer( bool bRelative )
     {
         if ( bRelative == !!m_pRelativePointer.load() )
@@ -3164,8 +3176,14 @@ namespace gamescope
         switch ( uKey )
         {
             case KEY_F:
-                static_cast< CWaylandConnector * >( m_pBackend->GetCurrentConnector() )->SetFullscreen( !g_bFullscreen );
+            {
+                // A queued release can outlive its connector. Pin only the request
+                // flag so GUI objects still die on the compositor thread. A late
+                // write to an orphaned flag cannot change the next connector.
+                if ( auto pState = m_pFullscreenState.load().lock() )
+                    *pState = !g_bFullscreen;
                 break;
+            }
 
             case KEY_N:
                 g_wantedUpscaleFilter = GamescopeUpscaleFilter::PIXEL;

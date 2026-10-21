@@ -72,6 +72,9 @@ test('wlserver_shutdown', find_program('python3'),
 test('vulkan_mapped_memory', find_program('python3'),
 	args: files('test_vulkan_mapped_memory.py'), timeout: 90)
 
+test('wayland_fullscreen', find_program('python3'),
+	args: files('test_wayland_fullscreen.py'), timeout: 90)
+
 test(
 	'gpu_diagnostics',
 	find_program('python3'),
