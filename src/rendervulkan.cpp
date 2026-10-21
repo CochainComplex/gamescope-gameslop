@@ -3853,7 +3853,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkMemoryAllocateInfo allocInfo = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.allocationSize = memRequirements.size,
-		.memoryTypeIndex = uint32_t(g_device.findMemoryType(properties, memRequirements.memoryTypeBits)),
 	};
 
 	m_size = allocInfo.allocationSize;
@@ -3963,6 +3962,26 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 					.fd = fd,
 			};
 		}
+		else
+		{
+			// HOST_CACHED improves CPU readback, but is not required for mapping.
+			// Keep HOST_COHERENT: mapped callers do not flush or invalidate caches.
+			int32_t nMemoryTypeIndex = g_device.findMemoryType( properties, memRequirements.memoryTypeBits );
+			if ( nMemoryTypeIndex < 0 && flags.bMappable )
+			{
+				nMemoryTypeIndex = g_device.findMemoryType( properties & ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT, memRequirements.memoryTypeBits );
+				if ( nMemoryTypeIndex >= 0 )
+					vk_log.debugf( "host-cached image memory unavailable; using coherent memory type %d", nMemoryTypeIndex );
+			}
+			if ( nMemoryTypeIndex < 0 )
+			{
+				vk_errorf( VK_ERROR_FEATURE_NOT_PRESENT, "no compatible memory type for image allocation" );
+				g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
+				m_vkImage = VK_NULL_HANDLE;
+				return false;
+			}
+			allocInfo.memoryTypeIndex = uint32_t( nMemoryTypeIndex );
+		}
 		
 		res = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &memoryHandle );
 		if ( res != VK_SUCCESS )
@@ -4008,6 +4027,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &image_subresource, &image_layout);
 
 		m_unRowPitch = image_layout.rowPitch;
+		m_mappedOffset = image_layout.offset;
 
 		if (isYcbcr())
 		{
@@ -11658,13 +11678,13 @@ static void framegen_adapt_consume( GamescopeFramegenPipeline ePipeline )
 	FramegenHistory_t &h = g_framegenHistory;
 	if ( h.ulAdaptStatsSeqNo == 0 || h.ulAdaptStatsSeqNo == h.ulAdaptConsumedSeqNo
 		|| g_framegenMotion.statsReadback == nullptr
-		|| g_framegenMotion.statsReadback->mappedData() == nullptr
+		|| g_framegenMotion.statsReadback->mappedPixels() == nullptr
 		|| !g_device.hasCompletedFramegen( h.ulAdaptStatsSeqNo ) )
 		return;
 	h.ulAdaptConsumedSeqNo = h.ulAdaptStatsSeqNo;
 
 	std::array<uint32_t, gamescope::framegen::k_uAdaptationStatsCount> stats;
-	memcpy( stats.data(), g_framegenMotion.statsReadback->mappedData(), sizeof( stats ) );
+	memcpy( stats.data(), g_framegenMotion.statsReadback->mappedPixels(), sizeof( stats ) );
 	const auto measurement = gamescope::framegen::decode_adaptation_stats( stats );
 	if ( !measurement.has_value() )
 		return;
@@ -11820,7 +11840,7 @@ static __attribute__((noinline)) void framegen_record_consume()
 			|| pTex->width() != g_framegenMotion.width
 			|| pTex->height() != g_framegenMotion.height )
 			return false;
-		const uint8_t *pData = pTex->mappedData();
+		const uint8_t *pData = pTex->mappedPixels();
 		if ( pData == nullptr )
 			return false;
 		for ( uint32_t y = 0; bOk && y < pTex->height(); y++ )
@@ -11918,7 +11938,7 @@ static bool framegen_color_probe_prepare( uint32_t width, uint32_t height, uint3
 		flags.bFramegenShared = true;
 		*ppTex = new CVulkanTexture();
 		return ( *ppTex )->BInit( width, height, 1u, drmFormat, flags )
-			&& ( *ppTex )->mappedData() != nullptr;
+			&& ( *ppTex )->mappedPixels() != nullptr;
 	};
 
 	bool bAllocated = true;
@@ -11986,7 +12006,7 @@ static void framegen_color_probe_consume()
 		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
 			|| pTex->width() != c.width || pTex->height() != c.height )
 			return false;
-		const uint8_t *pData = pTex->mappedData();
+		const uint8_t *pData = pTex->mappedPixels();
 		if ( pData == nullptr )
 			return false;
 		for ( uint32_t y = 0; bOk && y < c.height; y++ )
@@ -12156,7 +12176,7 @@ static void framegen_net_stage_weights( const std::vector<float> &weights )
 	for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
 	{
 		const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, k_uFramegenNetFloats - y * k_uFramegenNetTexW );
-		memcpy( g_framegenMotion.netWeightsUpload->mappedData() + (size_t)y * g_framegenMotion.netWeightsUpload->rowPitch(),
+		memcpy( g_framegenMotion.netWeightsUpload->mappedPixels() + (size_t)y * g_framegenMotion.netWeightsUpload->rowPitch(),
 			weights.data() + (size_t)y * k_uFramegenNetTexW, uRowFloats * sizeof( float ) );
 	}
 }
@@ -12491,12 +12511,12 @@ static void framegen_net_profile_consume()
 	FramegenHistory_t &h = g_framegenHistory;
 	if ( h.ulNetProfileSeqNo == 0 || h.ulNetProfileSeqNo == h.ulNetProfileConsumedSeqNo
 		|| g_framegenMotion.netProfileReadback == nullptr
-		|| g_framegenMotion.netProfileReadback->mappedData() == nullptr
+		|| g_framegenMotion.netProfileReadback->mappedPixels() == nullptr
 		|| !g_device.hasCompletedFramegen( h.ulNetProfileSeqNo ) )
 		return;
 	h.ulNetProfileConsumedSeqNo = h.ulNetProfileSeqNo;
 
-	const uint8_t *pData = g_framegenMotion.netProfileReadback->mappedData();
+	const uint8_t *pData = g_framegenMotion.netProfileReadback->mappedPixels();
 	g_framegenNetReadbackWeights.resize( k_uFramegenNetFloats );
 	for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
 	{
@@ -12672,7 +12692,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				stagingFlags.bFramegenShared = true;
 				g_framegenMotion.netWeightsUpload = new CVulkanTexture();
 				bNetOk = bNetOk && g_framegenMotion.netWeightsUpload->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, stagingFlags )
-					&& g_framegenMotion.netWeightsUpload->mappedData() != nullptr;
+					&& g_framegenMotion.netWeightsUpload->mappedPixels() != nullptr;
 				if ( bNetOk )
 				{
 					// Warm-start after a resize/format reset from the latest served
@@ -12722,7 +12742,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 						readbackFlags.bFramegenShared = true;
 						g_framegenMotion.netProfileReadback = new CVulkanTexture();
 						bOnlineOk = g_framegenMotion.netProfileReadback->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, readbackFlags )
-							&& g_framegenMotion.netProfileReadback->mappedData() != nullptr;
+							&& g_framegenMotion.netProfileReadback->mappedPixels() != nullptr;
 					}
 					if ( !bOnlineOk )
 					{
@@ -12765,7 +12785,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				flags.bTransferDst = true;
 				flags.bFramegenShared = true;
 				*ppTex = new CVulkanTexture();
-				return ( *ppTex )->BInit( w, h, 1u, fmt, flags ) && ( *ppTex )->mappedData() != nullptr;
+				return ( *ppTex )->BInit( w, h, 1u, fmt, flags ) && ( *ppTex )->mappedPixels() != nullptr;
 			};
 			const bool bRecOk = makeReadback( &g_framegenMotion.recLumaPrev, lowW, lowH, dispatch.motionLumaFormat )
 				&& makeReadback( &g_framegenMotion.recLumaCur, lowW, lowH, dispatch.motionLumaFormat )

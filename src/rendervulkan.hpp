@@ -188,7 +188,10 @@ public:
 	inline uint32_t contentHeight() {return m_contentHeight; }
 	inline uint32_t rowPitch() { return m_unRowPitch; }
 	inline gamescope::IBackendFb* GetBackendFb() { return m_pBackendFb.get(); }
+	// Allocation base, for callers that explicitly apply subresource/plane offsets.
 	inline uint8_t *mappedData() { return m_pMappedData; }
+	// First texel of a single-plane image; rowPitch() still includes row padding.
+	inline uint8_t *mappedPixels() { return m_pMappedData ? m_pMappedData + m_mappedOffset : nullptr; }
 	inline VkFormat format() const { return m_format; }
 	inline bool transferSrc() const { return m_bTransferSrc; }
 	inline const struct wlr_dmabuf_attributes& dmabuf() { return m_dmabuf; }
@@ -260,6 +263,7 @@ private:
 	uint32_t m_contentHeight = 0;
 
 	uint32_t m_unRowPitch = 0;
+	VkDeviceSize m_mappedOffset = 0;
 	VkDeviceSize m_size = 0;
 
 	uint32_t m_lumaOffset = 0;
