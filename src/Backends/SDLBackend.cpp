@@ -448,14 +448,14 @@ namespace gamescope
 		// produced it, as the DRM and nested-Wayland present paths do.
 		vulkan_framegen_note_present_composite_seqno( *oCompositeResult );
 
+		// Complete the composite and its present-layout transition before
+		// queueing presentation; queue issue order alone does not cover it.
+		vulkan_wait( *oCompositeResult, true );
+
 		// PresentationFeedback is hooked up inside vulkan_present_to_window():
 		// this backend's completion signal is VK_KHR_present_wait, published from
 		// the present-wait thread.
 		const bool bPresented = vulkan_present_to_window();
-
-		// Wait for the composite result on our side *after* we
-		// commit the buffer to the compositor to avoid a bubble.
-		vulkan_wait( *oCompositeResult, true );
 
 		// No image reached the swapchain; rendervulkan has arranged a retry
 		// (or shutdown), so keep the requests this frame was meant to service.

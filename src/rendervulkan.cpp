@@ -5404,11 +5404,10 @@ int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFram
 	if ( !oSeqNo )
 		return -EINVAL;
 
-	// Present first, wait after: the composite submit and the present both go to
-	// g_device.queue(), so the present is already ordered behind the blit and the
-	// wait is only for our own bookkeeping. Same ordering the real path uses.
-	const bool bPresented = vulkan_present_to_window();
+	// Complete the final composite and its present-layout transition before
+	// queueing presentation, as on the real-frame path.
 	vulkan_wait( *oSeqNo, true );
+	const bool bPresented = vulkan_present_to_window();
 	return bPresented ? 0 : -EAGAIN;
 }
 
