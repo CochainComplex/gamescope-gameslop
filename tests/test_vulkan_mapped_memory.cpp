@@ -8,12 +8,16 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
 using VkMemoryPropertyFlags = uint32_t;
 using VkDeviceMemory = uint64_t;
 using VkDeviceSize = uint64_t;
 using VkImage = uint64_t;
+using VkImageView = uint64_t;
+using VkFormat = uint32_t;
 using VkResult = int32_t;
 constexpr VkImage VK_NULL_HANDLE = 0;
 constexpr VkDeviceSize VK_WHOLE_SIZE = ~VkDeviceSize{0};
@@ -22,6 +26,11 @@ constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT = 1;
 constexpr uint32_t VK_IMAGE_ASPECT_PLANE_0_BIT = 16, VK_IMAGE_ASPECT_PLANE_1_BIT = 32;
 constexpr uint32_t VK_IMAGE_TILING_LINEAR = 1, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT = 1000158000;
 constexpr uint64_t DRM_FORMAT_MOD_INVALID = ~uint64_t{0};
+constexpr uint32_t DRM_FORMAT_INVALID = 0, VK_FORMAT_UNDEFINED = 0;
+constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15;
+constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO = 1000117002;
+constexpr uint32_t VK_IMAGE_VIEW_TYPE_2D = 1, VK_COMPONENT_SWIZZLE_IDENTITY = 0;
+constexpr uint32_t VK_IMAGE_USAGE_SAMPLED_BIT = 4;
 constexpr uint32_t VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5;
 constexpr VkMemoryPropertyFlags VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 1;
 constexpr VkMemoryPropertyFlags VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 2;
@@ -45,6 +54,28 @@ struct VkMemoryAllocateInfo
 
 struct VkImageSubresource { uint32_t aspectMask; };
 struct VkSubresourceLayout { VkDeviceSize offset = 0, rowPitch = 0; };
+struct VkImageCreateInfo {};
+struct VkImageViewCreateInfo
+{
+    uint32_t sType;
+    const void *pNext;
+    VkImage image;
+    uint32_t viewType;
+    VkFormat format;
+    struct { uint32_t r, g, b, a; } components;
+    struct { uint32_t aspectMask, levelCount, layerCount; } subresourceRange;
+};
+struct VkImageViewUsageCreateInfo { uint32_t sType, usage; };
+static uint32_t VulkanFormatToDRM(VkFormat format) { return format; }
+static VkFormat ToLinearVulkanFormat(VkFormat format) { return format; }
+static VkFormat ToSrgbVulkanFormat(VkFormat format) { return format; }
+struct FixtureDmabuf
+{
+    int n_planes = 0;
+    uint64_t modifier = 0;
+    uint32_t offset[4] = {}, stride[4] = {};
+};
+static void wlr_dmabuf_attributes_finish(FixtureDmabuf *) {}
 
 class CVulkanDevice
 {
@@ -63,6 +94,10 @@ public:
         uint32_t calls = 0, selected = 0;
         uint32_t destroy_calls = 0;
         uint32_t map_calls = 0;
+        uint32_t create_calls = 0, view_calls = 0, fail_view_call = 0;
+        VkImage next_image = 1;
+        VkResult create_result = VK_SUCCESS, allocate_result = VK_SUCCESS;
+        std::vector<std::string> cleanup;
         void *mapped_base = nullptr;
         bool nv12 = false;
         VkSubresourceLayout color_layout{32, 20};
@@ -87,17 +122,48 @@ public:
                 *layout = color_layout;
             }
         }
-        VkResult AllocateMemory(void *, const VkMemoryAllocateInfo *info, void *, VkDeviceMemory *)
+        VkResult CreateImage(void *, const VkImageCreateInfo *, void *, VkImage *image)
+        {
+            ++create_calls;
+            if (create_result == VK_SUCCESS)
+                *image = next_image++;
+            return create_result;
+        }
+        VkResult CreateImageView(void *, const VkImageViewCreateInfo *, void *, VkImageView *view)
+        {
+            ++view_calls;
+            if (view_calls == fail_view_call)
+                return -1;
+            *view = 200 + view_calls;
+            return VK_SUCCESS;
+        }
+        VkResult AllocateMemory(void *, const VkMemoryAllocateInfo *info, void *, VkDeviceMemory *memory)
         {
             ++calls;
             selected = info->memoryTypeIndex;
             require(selected < 4, "invalid memory type reached Vulkan allocation");
-            return VK_SUCCESS;
+            if (allocate_result == VK_SUCCESS)
+                *memory = 101;
+            return allocate_result;
         }
         void DestroyImage(void *, VkImage image, void *)
         {
-            require(image == 1, "rejected allocation destroyed the wrong image");
+            require(image != VK_NULL_HANDLE, "destroyed a null image");
             ++destroy_calls;
+            cleanup.push_back("image:" + std::to_string(image));
+        }
+        void DestroyImageView(void *, VkImageView view, void *)
+        {
+            require(view != VK_NULL_HANDLE, "destroyed a null view");
+            cleanup.push_back("view:" + std::to_string(view));
+        }
+        void FreeMemory(void *, VkDeviceMemory memory, void *)
+        {
+            cleanup.push_back("memory:" + std::to_string(memory));
+        }
+        void UnmapMemory(void *, VkDeviceMemory memory)
+        {
+            cleanup.push_back("unmap:" + std::to_string(memory));
         }
         VkResult MapMemory(void *, VkDeviceMemory, VkDeviceSize offset, VkDeviceSize size,
                            uint32_t, void **data)
@@ -110,7 +176,11 @@ public:
     } vk;
 } g_device;
 
-struct { template<class... T> void debugf(T...) {} } vk_log;
+struct
+{
+    template<class... T> void debugf(T...) {}
+    template<class... T> void infof(T...) {}
+} vk_log;
 static uint32_t errors = 0;
 void vk_errorf(VkResult, const char *) { ++errors; }
 
@@ -123,7 +193,9 @@ static bool allocate_image(bool mappable, uint32_t type_bits, VkImage &m_vkImage
     VkMemoryPropertyFlags properties;
     VkResult res;
     VkDeviceMemory memoryHandle;
+    bool m_bOwnsImage = true;
 #include "image_allocation.inc"
+    (void)m_bOwnsImage;
     return res == VK_SUCCESS;
 }
 
@@ -148,14 +220,41 @@ class CVulkanTexture
 {
 public:
 #include "mapped_members.inc"
+    ~CVulkanTexture();
+    bool BInitFromSwapchain(VkImage image, uint32_t width, uint32_t height,
+                            VkFormat format, VkResult *pResult);
+    void *m_pBackendFb = nullptr;
+    FixtureDmabuf m_dmabuf;
     bool ycbcr = false;
     bool isYcbcr() const { return ycbcr; }
-    struct
+    FixtureDmabuf dmabuf;
+    bool create_image()
     {
-        int n_planes = 0;
-        uint64_t modifier = 0;
-        uint32_t offset[4] = {}, stride[4] = {};
-    } dmabuf;
+        const VkImageCreateInfo imageInfo{};
+        VkResult res;
+#include "image_create.inc"
+        return true;
+    }
+    bool allocate_memory()
+    {
+        struct { bool bMappable; } flags{true};
+        struct { uint64_t size; uint32_t memoryTypeBits; } memRequirements{256, 1};
+        VkMemoryPropertyFlags properties;
+        VkResult res;
+        VkDeviceMemory memoryHandle = VK_NULL_HANDLE;
+        const void *pDMA = nullptr;
+        struct { int fd = -1; } importMemoryInfo;
+#include "image_allocation.inc"
+#include "image_allocation_tail.inc"
+        m_size = allocInfo.allocationSize;
+        return true;
+    }
+    VkDeviceMemory reuse_memory(CVulkanTexture *pExistingImageToReuseMemory)
+    {
+        VkDeviceMemory memoryHandle = VK_NULL_HANDLE;
+#include "image_reuse.inc"
+        return memoryHandle;
+    }
     void query_layout(bool mappable, bool exportable)
     {
         struct { bool bMappable, bExportable; } flags{mappable, exportable};
@@ -183,6 +282,9 @@ public:
         return true;
     }
 };
+
+#include "image_destructor.inc"
+#include "image_swapchain.inc"
 
 constexpr uint32_t k_uFramegenNetTexW = 3, k_uFramegenNetTexH = 2, k_uFramegenNetFloats = 5;
 struct
@@ -354,6 +456,128 @@ static void check_mapped_pixels()
     require(zero_offset.mappedPixels() == storage.data(), "zero-offset layout changed");
 }
 
+static void prepare_lifetime()
+{
+    g_device = {};
+    errors = 0;
+    g_device.m_memoryProperties.memoryTypeCount = 1;
+    g_device.m_memoryProperties.memoryTypes[0].propertyFlags = coherent;
+}
+
+static void check_image_ownership()
+{
+    prepare_lifetime();
+    {
+        CVulkanTexture texture;
+        require(!texture.m_bOwnsImage && texture.m_vkImage == VK_NULL_HANDLE,
+                "default texture must not own an image");
+    }
+    require(g_device.vk.cleanup.empty(), "default texture destroyed resources");
+
+    prepare_lifetime();
+    g_device.vk.create_result = -1;
+    {
+        CVulkanTexture texture;
+        require(!texture.create_image(), "failed image creation succeeded");
+        require(!texture.m_bOwnsImage, "failed image creation took ownership");
+    }
+    require(g_device.vk.cleanup.empty(), "failed image creation destroyed resources");
+
+    prepare_lifetime();
+    {
+        CVulkanTexture texture;
+        require(texture.create_image() && texture.m_bOwnsImage,
+                "successful image creation did not take ownership");
+        // Model an early BInit return before memory allocation (e.g. an import
+        // rejection). The real create prefix and real destructor execute.
+    }
+    require(g_device.vk.cleanup == std::vector<std::string>{"image:1"},
+            "preallocation exit did not destroy its image exactly once");
+
+    prepare_lifetime();
+    g_device.vk.allocate_result = -1;
+    {
+        CVulkanTexture texture;
+        require(texture.create_image(), "allocation-failure image creation failed");
+        require(!texture.allocate_memory(), "failed memory allocation succeeded");
+        require(texture.m_vkImageMemory == VK_NULL_HANDLE, "failed allocation retained memory");
+    }
+    require(g_device.vk.cleanup == std::vector<std::string>{"image:1"},
+            "allocation failure leaked image or freed unowned memory");
+
+    prepare_lifetime();
+    g_device.m_memoryProperties.memoryTypeCount = 0;
+    {
+        CVulkanTexture texture;
+        require(texture.create_image(), "no-type image creation failed");
+        require(!texture.allocate_memory(), "missing memory type was accepted");
+        require(texture.m_vkImage == VK_NULL_HANDLE && !texture.m_bOwnsImage,
+                "explicit no-type cleanup did not clear image ownership");
+        require(g_device.vk.cleanup == std::vector<std::string>{"image:1"},
+                "no-type rejection did not destroy image immediately");
+    }
+    require(g_device.vk.cleanup == std::vector<std::string>{"image:1"},
+            "no-type rejection destroyed image twice");
+
+    prepare_lifetime();
+    std::array<uint8_t, 256> storage{};
+    g_device.vk.mapped_base = storage.data();
+    {
+        CVulkanTexture texture;
+        require(texture.create_image() && texture.allocate_memory(), "owned image fixture failed");
+        require(texture.map(), "owned image mapping failed");
+        // Distinct handles represent all four independently-created views.
+        texture.m_srgbView = 201;
+        texture.m_linearView = 202;
+        texture.m_lumaView = 203;
+        texture.m_chromaView = 204;
+    }
+    require(g_device.vk.cleanup == std::vector<std::string>{
+                "unmap:101", "view:201", "view:202", "view:203", "view:204", "image:1", "memory:101"},
+            "owned texture must destroy all views before image before memory");
+
+    prepare_lifetime();
+    {
+        CVulkanTexture owner;
+        require(owner.create_image() && owner.allocate_memory(), "reuse owner fixture failed");
+        {
+            CVulkanTexture alias;
+            require(alias.create_image(), "reuse alias creation failed");
+            require(alias.reuse_memory(&owner) == owner.m_vkImageMemory,
+                    "reuse lost the source allocation handle");
+            require(alias.m_vkImageMemory == VK_NULL_HANDLE && alias.m_bOwnsImage,
+                    "reuse confused image ownership with allocation ownership");
+        }
+        require(g_device.vk.cleanup == std::vector<std::string>{"image:2"},
+                "reused allocation alias leaked its image or freed shared memory");
+        require(owner.m_vkImageMemory == 101, "alias cleanup changed source allocation");
+    }
+    require(g_device.vk.cleanup == std::vector<std::string>{"image:2", "image:1", "memory:101"},
+            "reused allocation owner cleanup changed");
+
+    for (uint32_t fail_call : {0u, 1u, 2u})
+    {
+        prepare_lifetime();
+        g_device.vk.fail_view_call = fail_call;
+        VkResult result = -99;
+        {
+            CVulkanTexture borrowed;
+            require(borrowed.BInitFromSwapchain(77, 8, 8, 1, &result) == (fail_call == 0),
+                    "borrowed swapchain result ignored view failure");
+            require((result == VK_SUCCESS) == (fail_call == 0), "swapchain result output changed");
+            require(!borrowed.m_bOwnsImage && borrowed.m_vkImageMemory == VK_NULL_HANDLE,
+                    "swapchain wrapper took image or allocation ownership");
+        }
+        std::vector<std::string> expected;
+        if (fail_call != 1)
+            expected.push_back("view:201");
+        if (fail_call == 0)
+            expected.push_back("view:202");
+        require(g_device.vk.cleanup == expected,
+                "swapchain cleanup leaked views or destroyed borrowed image/allocation");
+    }
+}
+
 int main()
 {
     // Prefer cached even when an uncached coherent type precedes it.
@@ -374,4 +598,6 @@ int main()
     std::cout << "Vulkan mapped image addressing: PASS\n";
     check_screenshot_allocation();
     std::cout << "Vulkan screenshot allocation addressing: PASS\n";
+    check_image_ownership();
+    std::cout << "Vulkan image ownership and destructor cleanup: PASS\n";
 }

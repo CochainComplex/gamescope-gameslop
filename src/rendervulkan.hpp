@@ -241,6 +241,8 @@ private:
 	bool m_bTransferSrc = false;
 	bool m_bConcurrentSharing = false;
 	bool m_bOutputImage = false;
+	// Swapchain images are borrowed; an owned image may borrow its allocation.
+	bool m_bOwnsImage = false;
 	bool m_bDeviceLocal = false;
 	bool m_bDeviceLocalStagingImage = false;
 

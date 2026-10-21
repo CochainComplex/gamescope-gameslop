@@ -3846,6 +3846,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		vk_errorf( res, "vkCreateImage failed" );
 		return false;
 	}
+	m_bOwnsImage = true;
 	
 	VkMemoryRequirements memRequirements;
 	g_device.vk.GetImageMemoryRequirements(g_device.device(), m_vkImage, &memRequirements);
@@ -3978,6 +3979,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				vk_errorf( VK_ERROR_FEATURE_NOT_PRESENT, "no compatible memory type for image allocation" );
 				g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
 				m_vkImage = VK_NULL_HANDLE;
+				m_bOwnsImage = false;
 				return false;
 			}
 			allocInfo.memoryTypeIndex = uint32_t( nMemoryTypeIndex );
@@ -4253,6 +4255,7 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
 {
 	m_drmFormat = VulkanFormatToDRM( format );
 	m_vkImage = image;
+	m_bOwnsImage = false;
 	m_vkImageMemory = VK_NULL_HANDLE;
 	m_width = width;
 	m_height = height;
@@ -4402,29 +4405,27 @@ CVulkanTexture::~CVulkanTexture( void )
 		m_pMappedData = nullptr;
 	}
 
-	if ( m_srgbView != VK_NULL_HANDLE )
+	for ( VkImageView *pView : { &m_srgbView, &m_linearView, &m_lumaView, &m_chromaView } )
 	{
-		g_device.vk.DestroyImageView( g_device.device(), m_srgbView, nullptr );
-		m_srgbView = VK_NULL_HANDLE;
-	}
-
-	if ( m_linearView != VK_NULL_HANDLE )
-	{
-		g_device.vk.DestroyImageView( g_device.device(), m_linearView, nullptr );
-		m_linearView = VK_NULL_HANDLE;
+		if ( *pView != VK_NULL_HANDLE )
+		{
+			g_device.vk.DestroyImageView( g_device.device(), *pView, nullptr );
+			*pView = VK_NULL_HANDLE;
+		}
 	}
 
 	if ( m_pBackendFb != nullptr )
 		m_pBackendFb = nullptr;
 
+	if ( m_bOwnsImage && m_vkImage != VK_NULL_HANDLE )
+	{
+		g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
+		m_vkImage = VK_NULL_HANDLE;
+		m_bOwnsImage = false;
+	}
+
 	if ( m_vkImageMemory != VK_NULL_HANDLE )
 	{
-		if ( m_vkImage != VK_NULL_HANDLE )
-		{
-			g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
-			m_vkImage = VK_NULL_HANDLE;
-		}
-
 		g_device.vk.FreeMemory( g_device.device(), m_vkImageMemory, nullptr );
 		m_vkImageMemory = VK_NULL_HANDLE;
 	}
