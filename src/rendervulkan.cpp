@@ -10215,7 +10215,7 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	//    into the acquired swapchain image, so it is ALWAYS a sampled source
 	//    there and must not depend on the cursor-split env var.
 	createFlags.bSampled = framegen_cursor_split_enabled() || !framegen_owns_output_ring();
-	createFlags.bOutputImage = true;
+	createFlags.bOutputImage = framegen_owns_output_ring();
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
