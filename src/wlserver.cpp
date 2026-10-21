@@ -108,6 +108,7 @@ std::mutex g_wlserver_xdg_shell_windows_lock;
 static struct wl_list pending_surfaces = {0};
 
 static std::atomic<bool> g_bShutdownWLServer{ false };
+static std::atomic<bool> g_bWaylandDispatchStopped{ false };
 
 static void wlserver_x11_surface_info_set_wlr( struct wlserver_x11_surface_info *surf, struct wlr_surface *wlr_surf, bool override );
 wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf);
@@ -2595,6 +2596,11 @@ void wlserver_run(void)
 		wlserver.xdg_wins.clear();
 	}
 
+	// No more dispatch or deferred backend notifications. Acknowledge before
+	// waiting for the compositor's mutex: it keeps the backend alive until here.
+	g_bWaylandDispatchStopped = true;
+	g_bWaylandDispatchStopped.notify_all();
+
 	// Released when steamcompmgr closes.
 	std::unique_lock<std::mutex> xwayland_server_guard(g_SteamCompMgrXWaylandServerMutex);
 	// We need to shutdown Xwayland before disconnecting all clients, otherwise
@@ -2622,15 +2628,21 @@ void wlserver_run(void)
 
 void wlserver_shutdown()
 {
-    assert( wlserver_is_lock_held() );
-
+	wlserver_lock();
 	g_bShutdownWLServer = true;
 
-    if (wlserver.display)
-    {
-        if ( write( g_wlserverNudgePipe[ 1 ], "\n", 1 ) < 0 )
-            wl_log.errorf_errno( "wlserver_force_shutdown: write failed" );
-    }
+	// Running publishes the pipe FDs. Before startup no wake is needed: the
+	// loop will observe the stop request without polling or dispatching.
+	if ( wlserver.bWaylandServerRunning )
+	{
+		if ( write( g_wlserverNudgePipe[ 1 ], "\n", 1 ) < 0 )
+			wl_log.errorf_errno( "wlserver_force_shutdown: write failed" );
+	}
+	wlserver_unlock(false);
+
+	// Also covers the callback deliberately made outside waylock. Starting
+	// false makes a stop before wlserver_run wait for its acknowledgement too.
+	g_bWaylandDispatchStopped.wait( false );
 }
 
 void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain )

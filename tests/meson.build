@@ -66,6 +66,9 @@ test_framegen_deadline = executable(
 )
 test('framegen_deadline', test_framegen_deadline)
 
+test('wlserver_shutdown', find_program('python3'),
+	args: files('test_wlserver_shutdown.py'), timeout: 90)
+
 test(
 	'gpu_diagnostics',
 	find_program('python3'),

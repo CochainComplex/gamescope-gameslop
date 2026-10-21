@@ -326,6 +326,7 @@ void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle
 
 void wlserver_app_presented( uint32_t app_id, uint64_t frametime_ns );
 
+// Stop dispatch and wait for backend users; call without the Wayland lock.
 void wlserver_shutdown();
 void wlserver_shutdown_input();
 

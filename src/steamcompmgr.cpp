@@ -7893,11 +7893,11 @@ steamcompmgr_exit(void)
 	// while the backend is still alive.
 	vulkan_framegen_shutdown();
 
-    gamescope::IBackend::Set( nullptr );
+	// Retire Wayland callbacks, including notifications outside waylock,
+	// before deleting their backend. This wait must not hold waylock.
+	wlserver_shutdown();
 
-    wlserver_lock();
-    wlserver_shutdown();
-    wlserver_unlock(false);
+	gamescope::IBackend::Set( nullptr );
 }
 
 // Set at the top of steamcompmgr_main; read by handle_io_error on any thread.
