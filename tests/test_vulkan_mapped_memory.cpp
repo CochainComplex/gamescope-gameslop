@@ -2,6 +2,7 @@
 // extracted verbatim from rendervulkan.cpp by test_vulkan_mapped_memory.py.
 #include <array>
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,10 @@ using VkResult = int32_t;
 constexpr VkImage VK_NULL_HANDLE = 0;
 constexpr VkDeviceSize VK_WHOLE_SIZE = ~VkDeviceSize{0};
 constexpr VkResult VK_SUCCESS = 0, VK_ERROR_FEATURE_NOT_PRESENT = -8;
+constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT = 1;
+constexpr uint32_t VK_IMAGE_ASPECT_PLANE_0_BIT = 16, VK_IMAGE_ASPECT_PLANE_1_BIT = 32;
+constexpr uint32_t VK_IMAGE_TILING_LINEAR = 1, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT = 1000158000;
+constexpr uint64_t DRM_FORMAT_MOD_INVALID = ~uint64_t{0};
 constexpr uint32_t VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5;
 constexpr VkMemoryPropertyFlags VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 1;
 constexpr VkMemoryPropertyFlags VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 2;
@@ -38,6 +43,9 @@ struct VkMemoryAllocateInfo
     uint32_t memoryTypeIndex;
 };
 
+struct VkImageSubresource { uint32_t aspectMask; };
+struct VkSubresourceLayout { VkDeviceSize offset = 0, rowPitch = 0; };
+
 class CVulkanDevice
 {
 public:
@@ -56,6 +64,29 @@ public:
         uint32_t destroy_calls = 0;
         uint32_t map_calls = 0;
         void *mapped_base = nullptr;
+        bool nv12 = false;
+        VkSubresourceLayout color_layout{32, 20};
+        VkSubresourceLayout luma_layout{16, 24}, chroma_layout{96, 28};
+        std::vector<uint32_t> layout_queries;
+        void GetImageSubresourceLayout(void *, VkImage image,
+                                      const VkImageSubresource *subresource, VkSubresourceLayout *layout)
+        {
+            require(image == 1, "layout query used the wrong image");
+            layout_queries.push_back(subresource->aspectMask);
+            if (nv12)
+            {
+                require(subresource->aspectMask == VK_IMAGE_ASPECT_PLANE_0_BIT ||
+                        subresource->aspectMask == VK_IMAGE_ASPECT_PLANE_1_BIT,
+                        "NV12 layout query must select a format plane, not COLOR");
+                *layout = subresource->aspectMask == VK_IMAGE_ASPECT_PLANE_0_BIT ? luma_layout : chroma_layout;
+            }
+            else
+            {
+                require(subresource->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT,
+                        "RGB layout query must select COLOR");
+                *layout = color_layout;
+            }
+        }
         VkResult AllocateMemory(void *, const VkMemoryAllocateInfo *info, void *, VkDeviceMemory *)
         {
             ++calls;
@@ -119,10 +150,29 @@ public:
 #include "mapped_members.inc"
     bool ycbcr = false;
     bool isYcbcr() const { return ycbcr; }
+    struct
+    {
+        int n_planes = 0;
+        uint64_t modifier = 0;
+        uint32_t offset[4] = {}, stride[4] = {};
+    } dmabuf;
+    void query_layout(bool mappable, bool exportable)
+    {
+        struct { bool bMappable, bExportable; } flags{mappable, exportable};
+        const uint32_t tiling = VK_IMAGE_TILING_LINEAR;
+        const VkImage m_vkImage = 1;
+        g_device.vk.nv12 = ycbcr;
+        g_device.vk.layout_queries.clear();
+#include "mapped_layout.inc"
+        if (flags.bExportable)
+        {
+#include "export_layout.inc"
+        }
+    }
     void set_layout(VkDeviceSize offset, uint32_t pitch)
     {
-        struct { VkDeviceSize offset; uint32_t rowPitch; } image_layout{offset, pitch};
-#include "mapped_layout.inc"
+        g_device.vk.color_layout = {offset, pitch};
+        query_layout(true, false);
     }
     bool map(CVulkanTexture *pExistingImageToReuseMemory = nullptr)
     {
@@ -192,15 +242,63 @@ static void check_screenshot_allocation()
     require(screenshot.map(), "screenshot mapping fixture failed");
     require(screenshot_data(&screenshot) == storage.data() + 16,
             "single-plane screenshot lost its texel offset");
-    screenshot.ycbcr = true;
-    require(screenshot_data(&screenshot) == storage.data(), "NV12 screenshot used a shifted pointer");
-    write_nv12_screenshot(&screenshot);
+    CVulkanTexture nv12;
+    nv12.ycbcr = true;
+    g_device.vk.luma_layout = {16, 8};
+    g_device.vk.chroma_layout = {48, 12};
+    nv12.query_layout(true, true);
+    nv12.m_size = 64;
+    require(nv12.map(), "NV12 screenshot mapping fixture failed");
+    require(screenshot_data(&nv12) == storage.data(), "NV12 screenshot used a shifted pointer");
+    write_nv12_screenshot(&nv12);
     require(screenshot_write_data == storage.data(), "whole-allocation fwrite lost its allocation base");
     require(screenshot_write_bytes == 64, "whole-allocation fwrite changed its byte count");
     require(screenshot_output == std::vector<uint8_t>(storage.begin(), storage.begin() + 64),
             "NV12 screenshot copied shifted pixels or the trailing canary");
     require(std::all_of(storage.begin() + 64, storage.end(), [](uint8_t byte) { return byte == 0xe5; }),
             "screenshot fixture modified the trailing canary");
+}
+
+static void check_layout_queries()
+{
+    for (bool nv12 : {false, true})
+    {
+        for (bool mappable : {false, true})
+        {
+            CVulkanTexture texture;
+            texture.ycbcr = nv12;
+            g_device.vk.color_layout = {32, 20};
+            g_device.vk.luma_layout = {16, 24};
+            g_device.vk.chroma_layout = {96, 28};
+            texture.query_layout(mappable, true);
+            std::vector<uint32_t> expected;
+            if (mappable)
+            {
+                if (nv12)
+                    expected = {VK_IMAGE_ASPECT_PLANE_0_BIT, VK_IMAGE_ASPECT_PLANE_1_BIT};
+                else
+                    expected = {VK_IMAGE_ASPECT_COLOR_BIT};
+                require(texture.m_mappedOffset == (nv12 ? 16u : 32u), "mapped offset lost queried layout");
+                require(texture.rowPitch() == (nv12 ? 24u : 20u), "mapped pitch lost queried layout");
+                if (nv12)
+                {
+                    require(texture.m_lumaOffset == 16 && texture.m_lumaPitch == 24,
+                            "NV12 luma layout assignments changed");
+                    require(texture.m_chromaOffset == 96 && texture.m_chromaPitch == 28,
+                            "NV12 chroma layout assignments changed");
+                }
+            }
+            else
+                require(texture.m_mappedOffset == 0 && texture.rowPitch() == 0,
+                        "nonmappable export changed mapped layout");
+            expected.push_back(nv12 ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+            require(g_device.vk.layout_queries == expected, "unexpected layout query sequence");
+            require(texture.dmabuf.n_planes == 1 && texture.dmabuf.modifier == DRM_FORMAT_MOD_INVALID,
+                    "nonmodifier export metadata changed");
+            require(texture.dmabuf.offset[0] == 0 && texture.dmabuf.stride[0] == (nv12 ? 24u : 20u),
+                    "nonmodifier export layout assignments changed");
+        }
+    }
 }
 
 static void check_mapped_pixels()
@@ -270,6 +368,8 @@ int main()
     check({coherent, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT}, false, 3, 1);
     check({coherent}, false, 1, -1);
     std::cout << "Vulkan image memory selection: PASS\n";
+    check_layout_queries();
+    std::cout << "Vulkan RGB/NV12 mapped and export layout queries: PASS\n";
     check_mapped_pixels();
     std::cout << "Vulkan mapped image addressing: PASS\n";
     check_screenshot_allocation();
