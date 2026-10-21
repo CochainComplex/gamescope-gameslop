@@ -1228,6 +1228,7 @@ public:
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
 	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
+	inline VkSamplerYcbcrConversion ycbcrConversion() const { return m_ycbcrConversion; }
 	inline bool supportsStorageImageExtendedFormats() { return m_bSupportsStorageImageExtendedFormats; }
 	inline bool supportsSync2() { return m_bSupportsSync2; }
 	inline uint32_t maxComputeSharedMemorySize() const { return m_uMaxComputeSharedMemorySize; }
@@ -1309,6 +1310,8 @@ protected:
 	VkQueue m_generalQueue = nullptr;
 	VkSamplerYcbcrConversion m_ycbcrConversion = VK_NULL_HANDLE;
 	VkSampler m_ycbcrSampler = VK_NULL_HANDLE;
+	// Outlives command buffers that reference the immutable YCbCr binding.
+	gamescope::OwningRc<CVulkanTexture> m_ycbcrPlaceholder;
 	VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

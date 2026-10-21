@@ -684,6 +684,22 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 	m_pendingFramegenCmdBufs.reserve( k_uInitialSubmissionCapacity );
 	m_framegenQuerySlotBySeqNo.reserve( k_uInitialSubmissionCapacity );
 
+	// Immutable conversion samplers require a valid converted image view even
+	// in slots the shader never samples. Initialize its layout once at startup.
+	CVulkanTexture::createFlags placeholderFlags;
+	placeholderFlags.bSampled = true;
+	placeholderFlags.bFramegenShared = true;
+	m_ycbcrPlaceholder = new CVulkanTexture();
+	if ( !m_ycbcrPlaceholder->BInit( 2, 2, 1, DRM_FORMAT_NV12, placeholderFlags ) )
+		return false;
+	auto placeholderCmd = commandBuffer();
+	if ( !placeholderCmd )
+		return false;
+	placeholderCmd->discardImage( m_ycbcrPlaceholder.get() );
+	placeholderCmd->insertBarrier();
+	submit( std::move( placeholderCmd ) );
+	waitIdle();
+
 	// Frame generation is opt-in, so pay its fixed pipeline creation cost at
 	// compositor startup instead of on the first generated frame. A lazy miss in
 	// pipeline() calls vkCreateComputePipelines on the compositor thread and is a
@@ -1309,7 +1325,7 @@ bool CVulkanDevice::createDevice()
 
 	VkPhysicalDeviceFeatures2 features2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-		.pNext = &presentIdFeatures,
+		.pNext = GetBackend()->UsesVulkanSwapchain() ? static_cast<void *>( &presentIdFeatures ) : &features13,
 		.features = {
 			.shaderInt16 = m_bSupportsFp16,
 		},
@@ -2875,6 +2891,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		imageDescriptors[i].sampler = m_device->sampler(m_samplerState[i]);
 		imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		ycbcrImageDescriptors[i].imageView = m_device->m_ycbcrPlaceholder->linearView();
 		if (m_boundTextures[i] == nullptr)
 			continue;
 
@@ -2896,13 +2913,13 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		nearestState.bUnnormalized = false;
 
 		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
-		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
 		// I need to change this, it's so utterly stupid and confusing.
 		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
 
 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
-		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
 	}
 
@@ -3633,6 +3650,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
 		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	}
+	if ( drmFormat == DRM_FORMAT_NV12 && flags.bStorage )
+	{
+		// Storage is supported by the R8/RG8 plane views, not the full NV12 view.
+		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+	}
 
 	if ( pDMA != nullptr )
 	{
@@ -3782,12 +3804,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.pDrmFormatModifiers = modifiers.data(),
 		};
 
-		externalImageCreateInfo = {
-			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-			.pNext = std::exchange(imageInfo.pNext, &externalImageCreateInfo),
-			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-		};
-
 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 	}
 
@@ -3815,7 +3831,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		};
 	}
 	
-	if ( pDMA != nullptr )
+	if ( pDMA != nullptr || flags.bExportable )
 	{
 		externalImageCreateInfo = {
 			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -4154,8 +4170,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	if ( flags.bStorage || flags.bSampled || flags.bColorAttachment )
 	{
+		VkImageViewUsageCreateInfo viewUsageInfo = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+			.usage = imageInfo.usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
+		};
+		VkSamplerYcbcrConversionInfo conversionInfo = {
+			.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+			.pNext = &viewUsageInfo,
+			.conversion = g_device.ycbcrConversion(),
+		};
 		VkImageViewCreateInfo createInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.pNext = isYcbcr() ? &conversionInfo : nullptr,
 			.image = m_vkImage,
 			.viewType = VulkanImageTypeToViewType(flags.imageType),
 			.format = DRMFormatToVulkan(drmFormat, false),
@@ -4163,7 +4189,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
-				.a = bHasAlpha ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
+				.a = bHasAlpha || isYcbcr() ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
 			},
 			.subresourceRange = {
 				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -4172,19 +4198,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			},
 		};
 
-		res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
-		if ( res != VK_SUCCESS ) {
-			vk_errorf( res, "vkCreateImageView failed" );
-			return false;
+		if ( !isYcbcr() || flags.bSampled )
+		{
+			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
+			if ( res != VK_SUCCESS ) {
+				vk_errorf( res, "vkCreateImageView failed" );
+				return false;
+			}
 		}
 
 		if ( flags.bSampled )
 		{
-			VkImageViewUsageCreateInfo viewUsageInfo = {
-				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-				.usage = usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
-			};
-			createInfo.pNext = &viewUsageInfo;
+			createInfo.pNext = isYcbcr() ? static_cast<void *>( &conversionInfo ) : &viewUsageInfo;
 			createInfo.format = DRMFormatToVulkan(drmFormat, true);
 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_linearView);
 			if ( res != VK_SUCCESS ) {
@@ -4194,9 +4219,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		}
 
 
-		if ( isYcbcr() )
+		if ( isYcbcr() && flags.bStorage )
 		{
-			createInfo.pNext = NULL;
+			viewUsageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+			createInfo.pNext = &viewUsageInfo;
 			createInfo.format = VK_FORMAT_R8_UNORM;
 
 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
@@ -4206,7 +4232,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				return false;
 			}
 
-			createInfo.pNext = NULL;
 			createInfo.format = VK_FORMAT_R8G8_UNORM;
 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_chromaView);
@@ -6166,13 +6191,25 @@ void vulkan_garbage_collect( void )
 
 static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace )
 {
+	const uint32_t contentWidth = width;
+	const uint32_t contentHeight = height;
+	if ( drmFormat == DRM_FORMAT_NV12 )
+	{
+		// Preserve every content pixel and pad only the chroma alignment edge.
+		width = ( width + 1u ) & ~1u;
+		height = ( height + 1u ) & ~1u;
+	}
+	auto matches = [&]( CVulkanTexture *texture )
+	{
+		return texture->width() == width && texture->height() == height &&
+			texture->contentWidth() == contentWidth && texture->contentHeight() == contentHeight &&
+			texture->drmFormat() == drmFormat && texture->externalImage() == exportable &&
+			texture->streamColorspace() == colorspace;
+	};
 	for (auto& pTexture : pool)
 	{
 		// Evict a stale texture and reuse the slot
-		if (pTexture && pTexture->GetRefCount() == 0 &&
-			(width != pTexture->width() ||
-			 height != pTexture->height() ||
-			 drmFormat != pTexture->drmFormat()))
+		if (pTexture && pTexture->GetRefCount() == 0 && !matches( pTexture.get() ))
 		{
 			pTexture = nullptr;
 		}
@@ -6185,22 +6222,21 @@ static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_
 			textureFlags.bMappable = true;
 			textureFlags.bTransferDst = true;
 			textureFlags.bStorage = true;
-			textureFlags.bSampled = true; // required for RGB-to-NV12 shader to sample this texture
-			if (exportable || drmFormat == DRM_FORMAT_NV12) {
+			textureFlags.bSampled = drmFormat != DRM_FORMAT_NV12; // RGB source for RGB-to-NV12 conversion
+			if (exportable) {
 				textureFlags.bExportable = true;
 				textureFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
 			}
 
-			bool bSuccess = pTexture->BInit( width, height, 1u, drmFormat, textureFlags );
+			if ( !pTexture->BInit( width, height, 1u, drmFormat, textureFlags, nullptr, contentWidth, contentHeight ) )
+			{
+				pTexture = nullptr;
+				return nullptr;
+			}
 			pTexture->setStreamColorspace(colorspace);
-
-			assert( bSuccess );
 		}
 
-		if (pTexture->GetRefCount() != 0 ||
-			width != pTexture->width() ||
-			height != pTexture->height() ||
-			drmFormat != pTexture->drmFormat())
+		if (pTexture->GetRefCount() != 0 || !matches( pTexture.get() ))
 			continue;
 
 		return pTexture.get();
@@ -6270,6 +6306,7 @@ struct BlitPushData_t
     float u_itmTargetNits; // unset
 
 	uint32_t u_rotation;
+	vec2_t textureSize[k_nMaxLayers] = {};
 
 	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo, uint32_t rotation = 0)
 	{
@@ -6279,6 +6316,7 @@ struct BlitPushData_t
 
 		for (int i = 0; i < frameInfo->layers.count(); i++) {
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
+			textureSize[i] = { float( layer->tex->width() ), float( layer->tex->height() ) };
 			scale[i] = layer->scale;
 			offset[i] = layer->offsetPixelCenter();
 			opacity[i] = layer->opacity;
@@ -6338,6 +6376,10 @@ struct BlitPushData_t
 		u_itmTargetNits = g_flHDRItmTargetNits;
 	}
 };
+
+// Scalar GLSL layout in blit_push_data.h, including the appended vec2 array.
+static_assert( offsetof( BlitPushData_t, textureSize ) == 68 * k_nMaxLayers + 40 );
+static_assert( sizeof( BlitPushData_t ) == 76 * k_nMaxLayers + 40 );
 
 struct CaptureConvertBlitData_t
 {
@@ -6421,6 +6463,7 @@ struct RcasPushData_t
     float u_itmTargetNits; // unset
 
 	uint32_t u_rotation;
+	vec2_t textureSize[k_nMaxLayers] = {};
 
 	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness, uint32_t rotation = 0)
 	{
@@ -6439,6 +6482,7 @@ struct RcasPushData_t
 		{
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
 
+			textureSize[i] = { float( layer->tex->width() ), float( layer->tex->height() ) };
             GamescopeUpscaleFilter eFilter = layer->filter == GamescopeUpscaleFilter::SGSR ? GamescopeUpscaleFilter::LINEAR : layer->filter;
             if (i == 0 || layer->isScreenSize() || (eFilter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
                 u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
@@ -6476,6 +6520,10 @@ struct RcasPushData_t
 		}
 	}
 };
+
+// Scalar GLSL layout shared by cs_composite_rcas{,_1px}.comp.
+static_assert( offsetof( RcasPushData_t, textureSize ) == 68 * k_nMaxLayers + 32 );
+static_assert( sizeof( RcasPushData_t ) == 76 * k_nMaxLayers + 32 );
 
 struct NisPushData_t
 {
@@ -6538,7 +6586,7 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 
 	if ( pYUVOutTexture != nullptr )
 	{
-		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->width();
+		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->contentWidth();
 
 		CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pYUVOutTexture->streamColorspace() ) );
 		constants.halfExtent[0] = pYUVOutTexture->width() / 2.0f;

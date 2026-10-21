@@ -18,5 +18,6 @@ uniform layers_t {
     float u_itmTargetNits;
 
     uint u_rotation;
+    vec2 u_textureSize[VKR_MAX_LAYERS];
 };
 

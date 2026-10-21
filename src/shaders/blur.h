@@ -1,6 +1,6 @@
 
 vec4 textureCond(sampler2D layerSampler, uint layerIdx, vec2 pos, bool unnormalized) {
-    vec2 texSize = textureSize(layerSampler, 0);
+    vec2 texSize = u_textureSize[layerIdx];
     vec2 coord = pos;
 #ifndef BLUR_DONT_SCALE
     coord = ((coord + u_offset[layerIdx]) * u_scale[layerIdx]);
@@ -13,7 +13,7 @@ vec4 textureCond(sampler2D layerSampler, uint layerIdx, vec2 pos, bool unnormali
 #endif
 
     if (!unnormalized)
-        pos /= texSize;
+        coord /= texSize;
 
     return textureLod(layerSampler, coord, 0.0f);
 }
