@@ -77,6 +77,9 @@ if pipewire_dep.found()
 		args: files('test_pipewire_buffers.py'), timeout: 90)
 endif
 
+test('buffer_import', find_program('python3'),
+	args: files('test_buffer_import.py'), timeout: 90)
+
 test('env_gamescope_local', find_program('python3'),
 	args: files('test_env_gamescope_local.py'), timeout: 15)
 
