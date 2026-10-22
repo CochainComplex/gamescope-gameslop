@@ -5326,10 +5326,10 @@ bool vulkan_present_to_window( void )
 // texture. A swapchain image cannot be blitted into — vulkan_make_swapchain
 // requests SAMPLED | STORAGE | TRANSFER_SRC, no TRANSFER_DST — so the generated,
 // already output-sized and output-encoded frame is written with a one-layer
-// compute composite instead. That is not a workaround: it is the identical
-// colour path a real frame takes, so HDR and colour management are preserved by
-// construction, and it is the only way to get the framegen HUD onto a generated
-// frame.
+// compute composite instead. Its source must pass through unchanged: colour
+// management and output encoding already ran in the late composite. Decoding
+// again would alternate brightness between real and generated frames. This
+// pass also draws the framegen HUD onto the generated frame.
 int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo )
 {
 	if ( pFrame == nullptr || pPresentFrameInfo == nullptr )
@@ -5355,8 +5355,7 @@ int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFram
 	pBaseLayer->applyColorMgmt = false;
 	pBaseLayer->filter = GamescopeUpscaleFilter::NEAREST;
 	pBaseLayer->ctm = nullptr;
-	pBaseLayer->colorspace = pPresentFrameInfo->outputEncodingEOTF == EOTF_PQ
-		? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+	pBaseLayer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
 
 	// pOutputOverride == the acquired swapchain image keeps this composite out of
 	// framegen_record_real_frame and off the ring index, exactly as
