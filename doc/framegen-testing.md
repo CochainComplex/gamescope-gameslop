@@ -14,6 +14,7 @@ Related: [Documentation index](README.md) · [User guide](framegen-howto.md) · 
 In file order. "Procedure" sections stay valid as the code changes. "Evidence" sections are dated results from specific games, builds and panels: read them as history, not as a contract.
 
 - [Overview and quick commands](#overview-and-quick-commands) (procedure)
+- [Vulkan validation](#vulkan-validation) (procedure)
 - [Smoke harness: setup and options](#smoke-harness-setup-and-options) (procedure)
 - [Case catalogue](#case-catalogue) (procedure)
 - [Fault-injection grammar](#fault-injection-grammar) (procedure)
@@ -121,6 +122,50 @@ scripts/framegen-showcase.sh --compare base.json       # judge a candidate: exit
 
 Use the same `W`, `H`, `HZ`, `RENDER_DEV`, `PRESENT_DEV` and `CLIENT` on
 `--compare` as on `--baseline`, or the sessions are not comparable (exit 2).
+
+## Vulkan validation
+
+Use `VK_LAYER_KHRONOS_validation` with synchronization validation enabled, and
+retain loader output proving which layer library was loaded:
+
+```bash
+export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+export VK_LOADER_DEBUG=layer
+```
+
+The local environment wrapper adds its WSI layer without hiding system layers.
+For a private validation-layer installation, set `VK_LAYER_PATH` explicitly to
+its manifest directory; the wrapper also includes the local WSI manifest.
+Record the manifest's library path, layer version, binary hash, enabled checks
+and complete log. A process exit of zero alone is insufficient: require no
+validation errors or synchronization hazards and verify layer activation.
+
+Older layers can themselves issue invalid driver queries. In particular, the
+1.3.275 SDK layer omits DRM modifier information in its pre-bind external-memory
+query; use a layer containing the
+[upstream modifier-query fix](https://github.com/KhronosGroup/Vulkan-ValidationLayers/commit/048f58ec45d70e934ea2ce967efd82e4aa81097a)
+before interpreting that crash as an application bind failure. Version 1.4.304
+contains that fix. Preserve the failing log when comparing layer versions.
+
+Mesa's private WSI allocation structure also needs its actual type and ABI size
+registered with layers that copy unknown `pNext` structures. On the tested
+x86-64 ABI, `VK_LAYER_CUSTOM_STYPE_LIST=1000001003,24` declares that structure;
+verify the size against the build when using another ABI. This is a declaration
+of the private node, not a reason to disable general parameter validation.
+
+Exercise RGB composition, sampled NV12 input, RGB-to-NV12 capture, replacement
+of capture textures, and both requested DMA-BUF and mapped MemFd paths where
+available. Verify even NV12 allocation extents for odd content dimensions,
+separate logical content dimensions, and clamping of padded edges during
+conversion. Driver-reported plane offsets, pitches and allocation size
+remain authoritative. An allocation-wide raw dump is not a packed NV12 file.
+
+Run the existing nested SDL smoke cases as well as nested Wayland captures:
+they exercise different device-extension and presentation paths. Native DRM,
+VRR, HDR and another vendor still need their own hardware checks. Validation
+instrumentation changes timing, so these runs establish API correctness within
+their exercised scope, not latency, jitter or visual quality.
 
 ## Smoke harness: setup and options
 
