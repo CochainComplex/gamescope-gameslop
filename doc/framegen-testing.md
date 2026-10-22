@@ -160,6 +160,14 @@ available. Verify even NV12 allocation extents for odd content dimensions,
 separate logical content dimensions, and clamping of padded edges during
 conversion. Driver-reported plane offsets, pitches and allocation size
 remain authoritative. An allocation-wide raw dump is not a packed NV12 file.
+For NV12 DMA-BUF delivery, verify both plane descriptors against the Vulkan
+layout, including unequal pitches and interplane gaps. A single Y stride does
+not describe the UV plane. Consumers may concatenate separately described
+blocks, so their logical UV offset need not equal the physical FD offset.
+Require non-overlapping active plane ranges and checked buffer bounds; compare
+known color patches after decoding, not just buffer counts or alternating hashes.
+The `pipewire_buffers` CPU contract exercises descriptor layout and invalid
+geometry when PipeWire support is built.
 PipeWire advertises its linear DMA-BUF option only when Vulkan reports support
 for the actual capture format, usage and image flags; otherwise its mapped
 MemFd option remains available. A consumer requiring unsupported DMA-BUF caps

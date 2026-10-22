@@ -72,6 +72,11 @@ test('wlserver_shutdown', find_program('python3'),
 test('vulkan_mapped_memory', find_program('python3'),
 	args: files('test_vulkan_mapped_memory.py'), timeout: 90)
 
+if pipewire_dep.found()
+	test('pipewire_buffers', find_program('python3'),
+		args: files('test_pipewire_buffers.py'), timeout: 90)
+endif
+
 test('env_gamescope_local', find_program('python3'),
 	args: files('test_env_gamescope_local.py'), timeout: 15)
 
