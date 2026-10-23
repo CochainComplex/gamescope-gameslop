@@ -168,6 +168,12 @@ Require non-overlapping active plane ranges and checked buffer bounds; compare
 known color patches after decoding, not just buffer counts or alternating hashes.
 The `pipewire_buffers` CPU contract exercises descriptor layout and invalid
 geometry when PipeWire support is built.
+SDL and headless presentation do not require DMA-BUF exports for internal
+textures. `backend_exports` checks that their allocation policy preserves
+explicit capture exports and that completed software uploads use known-ready
+handling after explicit event/timeline precedence. Native DRM, Wayland and
+OpenVR retain their existing backend handoff requirements and need separate
+hardware validation.
 Capture checks using software clients must also establish scene progress:
 reused software buffers need fresh per-commit uploads, while live DMA-BUF
 imports retain memoization. The `buffer_import` contract checks both paths,

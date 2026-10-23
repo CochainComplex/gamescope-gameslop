@@ -3525,6 +3525,7 @@ void CVulkanTexture::setRenderOrigin( const char *origin )
 
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
+	flags.bFlippable = flags.bFlippable && GetBackend()->UsesDmabufForPresentation();
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
 	m_renderOrigin = dmabuf_render_origin( pDMA );
@@ -4469,22 +4470,6 @@ CVulkanTexture::~CVulkanTexture( void )
 	}
 
 	m_bInitialized = false;
-}
-
-int CVulkanTexture::memoryFence()
-{
-	const VkMemoryGetFdInfoKHR memory_get_fd_info = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-		.memory = m_vkImageMemory,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	int fence = -1;
-	VkResult res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &fence);
-	if ( res != VK_SUCCESS ) {
-		fprintf( stderr, "vkGetMemoryFdKHR failed\n" );
-	}
-
-	return fence;
 }
 
 static bool is_image_format_modifier_supported(VkFormat format, uint32_t drmFormat, uint64_t modifier)

@@ -8837,7 +8837,8 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		}
 		else
 		{
-			fence = pClientTexture->memoryFence();
+			// The software-buffer upload completed synchronously during import.
+			bKnownReady = true;
 		}
 	}
 

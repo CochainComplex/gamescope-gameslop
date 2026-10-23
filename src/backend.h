@@ -364,6 +364,9 @@ namespace gamescope
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) = 0;
 
         virtual bool UsesModifiers() const = 0;
+        // Whether compositor-owned presentation images need a DMA-BUF handoff.
+        // Keep native, Wayland and VR allocation policy unless a backend opts out.
+        virtual bool UsesDmabufForPresentation() const { return true; }
         virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const = 0;
 		inline bool SupportsFormat( uint32_t uDrmFormat ) const
 		{
