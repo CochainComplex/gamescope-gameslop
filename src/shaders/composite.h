@@ -26,6 +26,28 @@ vec4 sampleRegular(sampler2D tex, vec2 coord, uint colorspace) {
     return color;
 }
 
+// Converted sampler arrays require constant indices. Keep the fetch global too:
+// some drivers lose the immutable conversion across opaque sampler parameters.
+vec4 sampleYcbcr(uint samplerSlot, vec2 coord) {
+    switch (samplerSlot) {
+        case 0u: return textureLod(s_ycbcr_samplers[0], coord, 0.0);
+        case 1u: return textureLod(s_ycbcr_samplers[1], coord, 0.0);
+        case 2u: return textureLod(s_ycbcr_samplers[2], coord, 0.0);
+        case 3u: return textureLod(s_ycbcr_samplers[3], coord, 0.0);
+        case 4u: return textureLod(s_ycbcr_samplers[4], coord, 0.0);
+        case 5u: return textureLod(s_ycbcr_samplers[5], coord, 0.0);
+        case 6u: return textureLod(s_ycbcr_samplers[6], coord, 0.0);
+        case 7u: return textureLod(s_ycbcr_samplers[7], coord, 0.0);
+    }
+    return vec4(0.0);
+}
+
+vec4 sampleRegularYcbcr(uint samplerSlot, vec2 coord, uint colorspace) {
+    vec4 color = sampleYcbcr(samplerSlot, coord);
+    color.rgb = colorspace_plane_degamma_tf(color.rgb, colorspace);
+    return color;
+}
+
 // To be considered pseudo-bandlimited, upscaling factor must be at least 2x.
 
 const float bandlimited_PI = 3.14159265359;
@@ -37,7 +59,7 @@ const float bandlimited_PI_half = 0.5 * bandlimited_PI;
 //   For uniform scaling, none of this matters.
 //   extent can be multiplied to achieve LOD bias.
 //   extent must be at least 1.0 / 256.0.
-vec4 sampleBandLimited(sampler2D samp, vec2 uv, vec2 size, vec2 inv_size, vec2 extent, uint colorspace, bool unnormalized)
+vec2 bandLimitedCoord(vec2 uv, vec2 size, vec2 inv_size, vec2 extent, bool unnormalized)
 {
     // Josh:
     // Clamp to behaviour like 4x scale (0.25).
@@ -57,7 +79,12 @@ vec4 sampleBandLimited(sampler2D samp, vec2 uv, vec2 size, vec2 inv_size, vec2 e
 	vec2 shift = 0.5 + 0.5 * sin(bandlimited_PI_half * clamp((phase - 0.5) / min(extent, vec2(max_extent)), -1.0, 1.0));
 	uv = (base_pixel + 0.5 + shift) * (unnormalized ? vec2(1.0f) : inv_size);
 
-	return sampleRegular(samp, uv, colorspace);
+	return uv;
+}
+
+vec4 sampleBandLimited(sampler2D samp, vec2 uv, vec2 size, vec2 inv_size, vec2 extent, uint colorspace, bool unnormalized)
+{
+	return sampleRegular(samp, bandLimitedCoord(uv, size, inv_size, extent, unnormalized), colorspace);
 }
 
 uint pseudo_random(uint seed) {
@@ -211,7 +238,7 @@ vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceL
 
 // Conversion-enabled samplers permit sampling operations only. Keep this
 // call tree separate from RGB's size queries and gather-based bilinear path.
-vec4 sampleLayerYcbcr(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceLayerIdx, vec2 uv, vec2 texSize) {
+vec4 sampleLayerYcbcr(uint samplerSlot, uint offsetLayerIdx, uint colorspaceLayerIdx, vec2 uv, vec2 texSize) {
     vec2 coord = ((uv + u_offset[offsetLayerIdx]) * u_scale[offsetLayerIdx]);
     vec4 color;
     if (layerBorder(coord, texSize, offsetLayerIdx, color))
@@ -222,19 +249,19 @@ vec4 sampleLayerYcbcr(sampler2D layerSampler, uint offsetLayerIdx, uint colorspa
     if (get_layer_shaderfilter(offsetLayerIdx) == filter_pixel) {
         vec2 output_res = texSize / u_scale[offsetLayerIdx];
         vec2 extent = max((texSize / output_res), vec2(1.0 / 256.0));
-        color = sampleBandLimited(layerSampler, coord, texSize, vec2(1.0f) / texSize, extent, colorspace, false);
+        color = sampleRegularYcbcr(samplerSlot, bandLimitedCoord(coord, texSize, vec2(1.0f) / texSize, extent, false), colorspace);
     }
     else if (get_layer_shaderfilter(offsetLayerIdx) == filter_linear_emulated) {
         vec2 pixCoord = coord * texSize - 0.5f;
         vec2 originPixCoord = floor(pixCoord);
-        vec4 c00 = textureLod(layerSampler, (originPixCoord + vec2(0.5, 0.5)) / texSize, 0.0);
-        vec4 c01 = textureLod(layerSampler, (originPixCoord + vec2(0.5, 1.5)) / texSize, 0.0);
-        vec4 c11 = textureLod(layerSampler, (originPixCoord + vec2(1.5, 1.5)) / texSize, 0.0);
-        vec4 c10 = textureLod(layerSampler, (originPixCoord + vec2(1.5, 0.5)) / texSize, 0.0);
+        vec4 c00 = sampleYcbcr(samplerSlot, (originPixCoord + vec2(0.5, 0.5)) / texSize);
+        vec4 c01 = sampleYcbcr(samplerSlot, (originPixCoord + vec2(0.5, 1.5)) / texSize);
+        vec4 c11 = sampleYcbcr(samplerSlot, (originPixCoord + vec2(1.5, 1.5)) / texSize);
+        vec4 c10 = sampleYcbcr(samplerSlot, (originPixCoord + vec2(1.5, 0.5)) / texSize);
         color = blendBilinearSamples(c00, c01, c11, c10, pixCoord - originPixCoord, colorspace);
     }
     else {
-        color = sampleRegular(layerSampler, coord, colorspace);
+        color = sampleRegularYcbcr(samplerSlot, coord, colorspace);
     }
     return finishLayerSample(color, offsetLayerIdx, colorspaceLayerIdx, colorspace);
 }

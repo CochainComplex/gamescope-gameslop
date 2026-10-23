@@ -166,6 +166,14 @@ not describe the UV plane. Consumers may concatenate separately described
 blocks, so their logical UV offset need not equal the physical FD offset.
 Require non-overlapping active plane ranges and checked buffer bounds; compare
 known color patches after decoding, not just buffer counts or alternating hashes.
+The `ycbcr_samplers` contract inspects the compositor's six compiled SPIR-V
+modules: converted descriptors use literal layer indices, feed local explicit-LOD
+sampling, and never cross function calls as opaque sampler arguments. Filtering
+and color helpers exchange ordinary coordinates and texel values. This catches
+resource-selection regressions that can pass validation yet render differently
+across drivers. Also check actual normal/scaled/blur pixels and moving content on
+each available GPU, including an RGB replacement frame; compiled contracts alone
+do not prove conversion, resource retirement, native presentation or performance.
 The `pipewire_buffers` CPU contract exercises descriptor layout and invalid
 geometry when PipeWire support is built.
 SDL and headless presentation do not require DMA-BUF exports for internal
