@@ -635,41 +635,7 @@ namespace gamescope
 
             m_pIPCResourceManager = vr::VRIPCResourceManager();
 
-            if ( !g_bAllowDeferredBackend )
-            {
-                if ( m_pIPCResourceManager )
-                {
-                    uint32_t uFormatCount = 0;
-                    m_pIPCResourceManager->GetDmabufFormats( &uFormatCount, nullptr );
-
-                    if ( uFormatCount )
-                    {
-                        std::vector<uint32_t> uFormats;
-                        uFormats.resize( uFormatCount );
-                        m_pIPCResourceManager->GetDmabufFormats( &uFormatCount, uFormats.data() );
-
-                        for ( uint32_t i = 0; i < uFormatCount; i++ )
-                        {
-                            uint32_t uFormat = uFormats[i];
-                            uint32_t uModifierCount = 0;
-                            m_pIPCResourceManager->GetDmabufModifiers( vr::VRApplication_Overlay, uFormat, &uModifierCount, nullptr );
-
-                            if ( uModifierCount )
-                            {
-                                std::vector<uint64_t> ulModifiers;
-                                ulModifiers.resize( uModifierCount );
-                                m_pIPCResourceManager->GetDmabufModifiers( vr::VRApplication_Overlay, uFormat, &uModifierCount, ulModifiers.data() );
-
-                                for ( uint64_t ulModifier : ulModifiers )
-                                {
-                                    if ( ulModifier != DRM_FORMAT_MOD_INVALID )
-                                        m_FormatModifiers[uFormat].emplace_back( ulModifier );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            InitFormatModifiers();
 
             if ( UsesModifiers() )
             {
@@ -1060,6 +1026,40 @@ namespace gamescope
 		}
 
 	private:
+
+        void InitFormatModifiers()
+        {
+            if ( g_bAllowDeferredBackend || !m_pIPCResourceManager )
+                return;
+
+            uint32_t uFormatCount = 0;
+            m_pIPCResourceManager->GetDmabufFormats( &uFormatCount, nullptr );
+            if ( !uFormatCount )
+                return;
+
+            std::vector<uint32_t> uFormats;
+            uFormats.resize( uFormatCount );
+            m_pIPCResourceManager->GetDmabufFormats( &uFormatCount, uFormats.data() );
+
+            for ( uint32_t i = 0; i < uFormatCount; i++ )
+            {
+                uint32_t uFormat = uFormats[i];
+                uint32_t uModifierCount = 0;
+                m_pIPCResourceManager->GetDmabufModifiers( vr::VRApplication_Overlay, uFormat, &uModifierCount, nullptr );
+                if ( !uModifierCount )
+                    continue;
+
+                std::vector<uint64_t> ulModifiers;
+                ulModifiers.resize( uModifierCount );
+                m_pIPCResourceManager->GetDmabufModifiers( vr::VRApplication_Overlay, uFormat, &uModifierCount, ulModifiers.data() );
+
+                for ( uint64_t ulModifier : ulModifiers )
+                {
+                    if ( ulModifier != DRM_FORMAT_MOD_INVALID )
+                        m_FormatModifiers[uFormat].emplace_back( ulModifier );
+                }
+            }
+        }
 
         void WaitUntilVisible()
         {
