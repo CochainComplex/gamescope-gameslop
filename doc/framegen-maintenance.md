@@ -333,6 +333,14 @@ bare shape-compatible versions warn without legacy shading migration, bare
 trailing bytes are rejected, and profile sets require the current version.
 Format refactors need exact bytes, array layout and error/stream comparisons.
 
+`scripts/framegen_net.py` owns the shared NumPy convolution, forward/backward
+passes and initialization for the fixed offline refiner. It imports the existing
+layout constants from the format leaf; trainer aliases preserve analysis callers.
+Keep features, loss, optimizer and CLI policy in the trainer. Preserve expression
+order, ReLU masks, cache ownership and RNG progression (the zero head and biases
+consume no draws). Verify nonzero-head gradients as well as neutral output;
+neutral-only comparisons can hide changes in the earlier layers.
+
 ## Validation by change class
 
 **Documentation, launchers, comments:**
