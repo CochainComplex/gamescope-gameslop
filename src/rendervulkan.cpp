@@ -3114,6 +3114,8 @@ void CVulkanCmdBuffer::emitExternalAcquireBarriers()
 		state.discarded = false;
 		state.dirty = false;
 		state.needsImport = false;
+		state.visibleReadStage = 0;
+		state.visibleReadAccess = 0;
 	}
 
 	if ( !m_imageBarriers.empty() )
@@ -3145,14 +3147,26 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 		const bool bHasPriorUse = state->lastAccess != 0;
 		const bool bWriteHazard = bHasPriorUse && state->bLastWasWrite;
 		const bool bReadToWriteHazard = bHasPriorUse && !state->bLastWasWrite && use.bWrite;
-		if ( state->discarded || bWriteHazard || bReadToWriteHazard )
+		const bool bReadScopeExpansion = !state->bLastWasWrite && !use.bWrite
+			&& state->visibleReadStage != 0
+			&& ( ( use.stage & ~state->visibleReadStage ) != 0
+				|| ( use.access & ~state->visibleReadAccess ) != 0 );
+		if ( state->discarded || bWriteHazard || bReadToWriteHazard || bReadScopeExpansion )
 		{
+			// Prior RAW/layout publication made the producer available, but only
+			// visible to its destination scope. Chain a new reader's visibility
+			// from the accumulated readers. Publish the whole stored rectangle:
+			// merely OR-ing metadata would falsely cover unbarriered stage/access pairs.
+			const VkPipelineStageFlags2 dstStage = bReadScopeExpansion
+				? state->visibleReadStage | use.stage : use.stage;
+			const VkAccessFlags2 dstAccess = bReadScopeExpansion
+				? state->visibleReadAccess | use.access : use.access;
 			m_imageBarriers2.push_back( VkImageMemoryBarrier2{
 				.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
 				.srcStageMask = state->discarded ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : state->lastStage,
 				.srcAccessMask = !state->discarded && bWriteHazard ? state->lastAccess : 0u,
-				.dstStageMask = use.stage,
-				.dstAccessMask = use.access,
+				.dstStageMask = dstStage,
+				.dstAccessMask = dstAccess,
 				.oldLayout = state->discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 				.newLayout = VK_IMAGE_LAYOUT_GENERAL,
 				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -3160,6 +3174,11 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 				.image = use.pTexture->vkImage(),
 				.subresourceRange = subResRange,
 			} );
+			if ( !use.bWrite )
+			{
+				state->visibleReadStage = dstStage;
+				state->visibleReadAccess = dstAccess;
+			}
 		}
 	}
 
@@ -3181,7 +3200,8 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 		// A clean first use needs no barrier: submission order plus the producing
 		// command buffer's 3d951b7 flush barrier supplies cross-buffer visibility.
 		// Keep consecutive read stages accumulated so a later WAR waits on every
-		// outstanding reader even though read -> read itself needs no barrier.
+		// outstanding reader. Visibility of an internal producer is tracked
+		// separately: a new read scope can need a memory dependency too.
 		if ( bHasPriorUse && !state->bLastWasWrite && !use.bWrite )
 		{
 			state->lastStage |= use.stage;
@@ -3193,6 +3213,14 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 			state->lastAccess = use.access;
 		}
 		state->bLastWasWrite = use.bWrite;
+		if ( use.bWrite )
+		{
+			state->visibleReadStage = 0;
+			state->visibleReadAccess = 0;
+		}
+		// Layout transitions write as well, even for a read-only first use.
+		// Their automatically available writes still need end-of-buffer visibility.
+		state->dirty = state->dirty || state->discarded;
 		state->discarded = false;
 		// Keep dirty latched: insertBarrier(true) must publish every image written
 		// in this buffer, including writes already consumed by a narrower RAW here.
@@ -3314,7 +3342,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 		// Same-queue submission order supplies execution order, not memory
 		// visibility, so dirty internal images need a destination scope at flush.
-		const bool bInternalFlush = flush && state.dirty && !isExport && !isPresent;
+		const bool bInternalFlush = flush && ( state.dirty || state.discarded ) && !isExport && !isPresent;
 
 		if (image->queueFamily == VK_QUEUE_FAMILY_IGNORED)
 			image->queueFamily = m_queueFamily;
@@ -3349,6 +3377,9 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		state.discarded = false;
 		state.dirty = false;
 		state.needsImport = false;
+		// This legacy barrier publishes every shader/transfer consumer scope.
+		state.visibleReadStage = 0;
+		state.visibleReadAccess = 0;
 	}
 
 	// TODO replace VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
