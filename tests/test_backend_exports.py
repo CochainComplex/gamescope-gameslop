@@ -23,8 +23,9 @@ def fixture(root):
     source = (root / "src/rendervulkan.cpp").read_text()
     compositor = (root / "src/steamcompmgr.cpp").read_text()
     init = between(source, "bool CVulkanTexture::BInit(", "bool CVulkanTexture::BInitFromSwapchain(")
-    # Execute the complete initialization prefix, including normalization order.
-    prefix = init[init.index("{\n") + 2:init.index("\n\t// Possible extensions for below")]
+    # Execute the backend normalization/export prefix. The independent
+    # host-upload ownership guard has its own mapped-memory allocation fixture.
+    prefix = between(init, "\tflags.bFlippable =", "\n\t// Possible extensions for below")
     private_types = between(source, "#define VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA", "\n// DRM doesn't")
     image_hints = between(init, "\tif ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )", "\n\tm_width = width;")
     memory_hint = between(init, "\t\tif ( flags.bFlippable == true )", "\n\t\tif ( flags.bExportable == true || pDMA != nullptr )")

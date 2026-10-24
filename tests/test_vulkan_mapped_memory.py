@@ -537,7 +537,7 @@ def main():
     mapping = between(init, "\tif ( flags.bMappable )\n",
                       "\n\tm_bInitialized = true;")
     upload = between(source, "static void framegen_net_stage_weights(",
-                     "\nstatic void framegen_record_net(")
+                     "\n}\n") + "\n}\n"
     # The completed-readback prefix owns addressing and row copies. Later
     # profile validation/persistence is outside this mapped-memory regression.
     readback = between(source, "static void framegen_net_profile_consume()\n{",
