@@ -1488,6 +1488,10 @@ struct TextureState
 {
 	VkPipelineStageFlags2 lastStage;
 	VkAccessFlags2 lastAccess;
+	// Consumer rectangle actually published after an internal write/transition.
+	// Reader accumulation above remains separate for write-after-read ordering.
+	VkPipelineStageFlags2 visibleReadStage;
+	VkAccessFlags2 visibleReadAccess;
 	bool bLastWasWrite;
 	bool discarded : 1;
 	bool dirty : 1;
@@ -1499,6 +1503,8 @@ struct TextureState
 	{
 		lastStage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
 		lastAccess = 0;
+		visibleReadStage = 0;
+		visibleReadAccess = 0;
 		bLastWasWrite = false;
 		discarded = false;
 		dirty = false;
