@@ -62,6 +62,7 @@
 #include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
+#include "framegen/net_profile_io.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
 #include "framegen/scheduling.hpp"
@@ -11040,41 +11041,27 @@ static std::thread g_framegenNetWriteThread;
 // profile: an explicit prior for every encoding the profile has no set for.
 static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &weights )
 {
-	FILE *pFile = fopen( pszPath, "rb" );
-	if ( pFile == nullptr )
+	const gamescope::framegen::NetWeightsFileRead input =
+		gamescope::framegen::read_net_weights_file( pszPath, weights );
+	if ( input.status == gamescope::framegen::NetWeightsFileStatus::Unreadable )
 	{
 		vk_log.errorf( "framegen: net weights '%s' unreadable", pszPath );
 		return false;
 	}
 
-	gamescope::framegen::NetProfileMetadata metadata = {};
-	bool bOk = fread( metadata.data(), sizeof( uint32_t ), metadata.size(), pFile ) == metadata.size();
-	const uint32_t uVersion = bOk
-		? gamescope::framegen::net_profile_metadata_version( metadata ) : 0u;
-	bOk = uVersion != 0u;
-	if ( bOk )
+	const bool bOk = input.status == gamescope::framegen::NetWeightsFileStatus::Loaded;
+	if ( input.status == gamescope::framegen::NetWeightsFileStatus::Profile )
 	{
-		weights.resize( k_uFramegenNetFloats );
-		bOk = fread( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();
-		bOk = bOk && gamescope::framegen::validate_and_migrate_net_profile_weights(
-			uVersion, weights );
-	}
-	fclose( pFile );
-
-	if ( !bOk && metadata[ 0 ] == gamescope::framegen::k_uFramegenNetProfileMagic )
-	{
-		weights.clear();
 		vk_log.errorf( "framegen: net weights '%s' are a per-game profile; pass it as GAMESCOPE_FRAMEGEN_NET_PROFILE (without NET_ONLINE it is served read-only)", pszPath );
 	}
 	else if ( !bOk )
 	{
-		weights.clear();
 		vk_log.errorf( "framegen: net weights '%s' malformed (want 3 finite fp32 conv layers 12->16->16->4, k=3)", pszPath );
 	}
-	else if ( uVersion < k_uFramegenNetVersion )
+	else if ( input.version < k_uFramegenNetVersion )
 	{
 		vk_log.infof( "framegen: net weights '%s' use legacy v%u training semantics; accepting as a bounded prior under v%u with the formerly-reserved shading head zeroed",
-			pszPath, uVersion, k_uFramegenNetVersion );
+			pszPath, input.version, k_uFramegenNetVersion );
 	}
 	return bOk;
 }
@@ -11102,20 +11089,10 @@ static FramegenNetStore_t &framegen_net_store()
 		{
 			// A missing file is a new profile. Anything but a current GSFP is
 			// incompatible: it is ignored, and the first save replaces it.
-			if ( FILE *pFile = fopen( pszProfile, "rb" ) )
-			{
-				// One byte past the largest valid profile rejects an oversized
-				// file without reading it all.
-				std::vector<uint8_t> bytes( gamescope::framegen::k_uFramegenNetProfileMaxBytes + 1u );
-				bytes.resize( fread( bytes.data(), 1u, bytes.size(), pFile ) );
-				fclose( pFile );
-				if ( std::optional<std::vector<gamescope::framegen::NetProfileSet>> sets =
-					gamescope::framegen::decode_net_profile( bytes ) )
-					store.sets = std::move( *sets );
-				else
-					vk_log.infof( "framegen: net profile '%s' is not a current GSFP v%u profile (older format or damaged); starting a new profile there",
-						pszProfile, gamescope::framegen::k_uFramegenNetProfileVersion );
-			}
+			if ( gamescope::framegen::read_net_profile_file( pszProfile, store.sets )
+				== gamescope::framegen::NetProfileFileStatus::Malformed )
+				vk_log.infof( "framegen: net profile '%s' is not a current GSFP v%u profile (older format or damaged); starting a new profile there",
+					pszProfile, gamescope::framegen::k_uFramegenNetProfileVersion );
 			for ( const gamescope::framegen::NetProfileSet &set : store.sets )
 			{
 				char szName[ 48 ];

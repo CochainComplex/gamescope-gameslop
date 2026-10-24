@@ -282,7 +282,12 @@ reinitialized from the finite prior.
 Profile I/O stays off the compositor hot path. Checkpoints use the owned writer
 thread and atomic replace; reset/exit joins it before the final flush. The
 renderer owns profile state, logging, and worker synchronization;
-`net_profile.hpp` owns the stateless serialized-format checks; and
+`net_profile.hpp` owns the stateless serialized-format checks;
+`net_profile_io.cpp` owns cold synchronous GSFR/GSFP input-file reads, returning
+status and validated data to the renderer's existing logging/activation path.
+Bare GSFR retains legacy migration and trailing-byte acceptance; GSFP retains
+its bounded read and exact current-format checks. This input seam does not own
+the store, neutral initialization, checkpoint worker or GPU readbacks.
 `AtomicOutputFile` owns only the output transaction. It creates a unique staging
 file beside the destination, checks every write and the buffered close, then
 renames. Destruction before commit removes the staging file and preserves the

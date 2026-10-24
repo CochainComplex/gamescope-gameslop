@@ -139,6 +139,7 @@ src = [
   'rendervulkan.cpp',
   'framegen/atomic_file.cpp',
   'framegen/capture_file.cpp',
+  'framegen/net_profile_io.cpp',
   'framegen/device.cpp',
   'log.cpp',
   'ime.cpp',

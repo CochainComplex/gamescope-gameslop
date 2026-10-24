@@ -59,6 +59,15 @@ test_framegen_capture = executable(
 )
 test('framegen_capture', test_framegen_capture)
 
+test_framegen_profile_io = executable(
+	'test_framegen_profile_io',
+	['framegen_profile_io.cpp', srcdir / 'framegen/net_profile_io.cpp'],
+	include_directories: [srcdir],
+	dependencies: [catch2_dep],
+	cpp_args: gamescope_cpp_args,
+)
+test('framegen_profile_io', test_framegen_profile_io)
+
 test_framegen_deadline = executable(
 	'test_framegen_deadline',
 	['framegen_deadline.cpp'],
