@@ -84,7 +84,7 @@ samples always request a backup. An estimate already in the past is considered
 missed: absence of a newer selected source buffer is causal evidence, so the
 backup is generated even if the display deadline is still farther ahead.
 
-Three trigger sites, all converging on `framegen_jit_submit()`:
+Three trigger sites, all converging on `framegen_jit_submit()` (removed in later revision):
 
 1. **Real-frame record** (`framegen_record_real_frame` tail): supersede any stale
    prediction, then request one backup only when the learned source arrival is
@@ -95,7 +95,7 @@ Three trigger sites, all converging on `framegen_jit_submit()`:
 2. **Consume drain** (`vulkan_framegen_consume_generated_frame`): after a slot
    presents and the pending list empties, plan the next slot one vblank ahead
    (replaces `framegen_refill_idle`'s k/gap slot ladder in JIT mode).
-3. **Repeat-slot tick** (`vulkan_framegen_jit_tick` from the present decision):
+3. **Repeat-slot tick** (`vulkan_framegen_jit_tick` (now `vulkan_framegen_causal_tick`) from the present decision):
    when a vblank goes to a hardware repeat while framegen is active (a stall, a
    too-slow discard, or a mispredicted keep-up), request the earliest slot that
    can still be prepared. A keep-up miss necessarily leaves the current slot as
@@ -160,7 +160,7 @@ What this fixes and what it doesn't:
   of batch planning.
 - `framegen_submit_planned` — the dispatch core, now taking explicit
   `FramegenSlotRequest_t{phase, strength, slotIndex}` entries;
-  `framegen_submit_batch` (k/gap planning) and `framegen_jit_submit`
+  `framegen_submit_batch` (k/gap planning) and `framegen_jit_submit` (removed in later revision)
   (display-clock planning) are thin planners on top. Everything downstream
   (single command buffer, timestamp bracketing, pending bookkeeping, cross-queue
   read pins) is shared. Completed read pins retire before real-output
@@ -169,14 +169,14 @@ What this fixes and what it doesn't:
   exceptional path performs one non-blocking backend event-progress pass before
   sacrificing speculative history; it never waits for framegen or overwrites a
   KMS/nested-Wayland-owned DMA-BUF.
-- `framegen_jit_submit` — the JIT planner: guards (history valid, pending empty,
+- `framegen_jit_submit` (removed in later revision) — the JIT planner: guards (history valid, pending empty,
   one-batch-in-flight, idle-gap invalidation), target = `framegen_next_vblank_ns() +
   interval`, phase/strength computation, forward cap (`flStrengthRaw >
   k_flFramegenMaxForwardStrength` → stop generating; a stall quiesces at the cap
   exactly like the old idle refill converged to it).
-- `vulkan_framegen_jit_tick` — exported reactive hook; called from
+- `vulkan_framegen_jit_tick` (now `vulkan_framegen_causal_tick`) — exported reactive hook; called from
   `steamcompmgr_main` when `vblank && !bShouldPaint` while framegen is active.
-- Gate: `framegen_jit_enabled()` = `GAMESCOPE_FRAMEGEN_JIT=1` **and**
+- Gate: `framegen_jit_enabled()` (removed in later revision) = `GAMESCOPE_FRAMEGEN_JIT=1` **and**
   `g_device.hasFramegenQueue()`. The shared-queue fallback keeps today's
   leaky-bucket batch path untouched.
 
@@ -222,7 +222,7 @@ What this fixes and what it doesn't:
 | 2 | A sudden first long frame was not predictable | an overdue estimate generates immediately, and the repeat-slot tick fills from the following vblank; arbitrary future stalls cannot be predicted without delaying real frames |
 | 3 | `GetLastVBlank` staleness after missed flips skews the target by one vblank | `framegen_next_vblank_ns()` (`VBlank::Next`) steps past now, so it self-corrects next tick; supersede/discard bound the damage to one misplaced slot |
 | 4 | Per-slot motion estimation cost at deep stall fills | forward cap bounds fills per stall (~2 at default strength); future: cache the motion field per (previousReal, currentReal) pair |
-| 5 | Double-submit races between trigger sites | all three sites run on the steamcompmgr thread and `framegen_jit_submit` refuses when `pending` is non-empty or the previous batch is in flight |
+| 5 | Double-submit races between trigger sites | all three sites run on the steamcompmgr thread and `framegen_jit_submit` (removed in later revision) refuses when `pending` is non-empty or the previous batch is in flight |
 
 ## Testing & validation plan
 

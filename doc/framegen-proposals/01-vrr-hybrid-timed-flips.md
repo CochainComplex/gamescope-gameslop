@@ -2,7 +2,7 @@
 
 Status: prototype implemented (opt-in `GAMESCOPE_FRAMEGEN_VRR_HYBRID=1`, dedicated framegen queue required; not yet validated on a VRR panel)
 Scope: compositor-side x2 frame generation on Variable-Refresh-Rate (VRR / adaptive-sync) panels
-Owner-area files: `src/steamcompmgr.cpp`, `src/vblankmanager.cpp/.hpp`, `src/Backends/DRMBackend.cpp`, `src/waitable.h`, `src/rendervulkan.cpp`
+Owner-area files: `src/steamcompmgr.cpp`, `src/vblankmanager.cpp`, `src/vblankmanager.hpp`, `src/Backends/DRMBackend.cpp`, `src/waitable.h`, `src/rendervulkan.cpp`
 
 ## Implementation notes (divergences from the draft below)
 
