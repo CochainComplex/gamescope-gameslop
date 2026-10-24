@@ -288,8 +288,14 @@ file beside the destination, checks every write and the buffered close, then
 renames. Destruction before commit removes the staging file and preserves the
 old destination. Concurrent instances can race over which complete snapshot is
 newest, but cannot share or corrupt a partial staging file. GSFD/GSCF capture
-uses the same primitive and remains a measurement-only synchronous path. Keep
-the three disk/readback consumers explicitly out of line: they are polled from
+uses the same primitive and remains a measurement-only synchronous path.
+GSFD/GSCF payload serialization lives in `src/framegen/capture_file.cpp`. It
+accepts borrowed CPU plane views only; the renderer retires GPU writes before
+constructing them and owns transaction commit, capture counters, logging,
+readback release and post-capture history invalidation. The serializer neither
+retains views nor submits work. One packed-row writer serves both formats;
+byte-level file contract tests protect metadata, plane order and padding.
+Keep the three disk/readback consumers explicitly out of line: they are polled from
 `framegen_submit_planned`, and GCC otherwise folds cold string and file machinery
 into the Vulkan command recorder even when capture is disabled.
 

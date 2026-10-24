@@ -138,6 +138,7 @@ src = [
   'vblankmanager.cpp',
   'rendervulkan.cpp',
   'framegen/atomic_file.cpp',
+  'framegen/capture_file.cpp',
   'framegen/device.cpp',
   'log.cpp',
   'ime.cpp',
