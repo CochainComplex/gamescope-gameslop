@@ -3287,8 +3287,10 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	assert( drm->req == nullptr );
 	drm->req = drmModeAtomicAlloc();
 
-	bool bSinglePlane = frameInfo->layers.count() < 2 && cv_drm_single_plane_optimizations;
+	const bool bSinglePlane = frameInfo->layers.count() < 2 && cv_drm_single_plane_optimizations;
 
+	// Admit color management before reading the output-TF debug switch.
+	// Only the enabled branch reads HDR state; select one pending write.
 	if ( drm_supports_color_mgmt( &g_DRM ) && frameInfo->applyOutputColorMgmt )
 	{
 		if ( !cv_drm_debug_disable_output_tf && !bSinglePlane )
@@ -3331,7 +3333,8 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 			flags |= DRM_MODE_PAGE_FLIP_ASYNC;
 	}
 
-	bool bForceInRequest = needs_modeset;
+	// Use the same modeset decision for every property in this request.
+	const bool bForceInRequest = needs_modeset;
 
 	if ( needs_modeset )
 	{
