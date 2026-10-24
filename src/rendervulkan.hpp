@@ -1124,7 +1124,7 @@ public:
 	// next composite on the in-order realtime queue. When no second queue is
 	// available they transparently forward to the shared composite path.
 	bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
-	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0 );
+	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0, bool bOnlineTraining = false );
 	void addFramegenDependency( CVulkanCmdBuffer *pCmdBuffer, uint64_t ulFramegenSeqNo );
 	bool hasCompletedFramegen( uint64_t sequence );
 	void waitFramegen( uint64_t sequence );
@@ -1149,6 +1149,10 @@ public:
 	}
 	// Raw GPU time (ns) of the most recent framegen batch, for logging only.
 	uint64_t framegenLastGpuTimeNs() const { return m_ulFramegenLastRawGpuTimeNs; }
+	// Conservative complete-batch training bound, never an averaged rung cost.
+	uint64_t framegenTrainingCostNs() const { return m_ulFramegenTrainingCostNs; }
+	uint64_t framegenTrainingSampleSeqNo() const { return m_ulFramegenTrainingSampleSeqNo; }
+	void framegenResetTrainingCost();
 	// Forget all per-rung costs (e.g. on a scene change) so the ladder re-probes
 	// configured pipeline optimistically for the new scene.
 	void framegenResetRungCosts();
@@ -1413,11 +1417,13 @@ protected:
 	double m_flFramegenTimestampPeriodNs = 0.0;
 	// seqNo -> { query ring slot, ladder rung, generated count } so the readback
 	// can attribute the measured cost to the exact batch shape.
-	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; };
+	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; bool bOnlineTraining; };
 	std::vector<std::pair<uint64_t, FramegenQueryAssoc_t>> m_framegenQuerySlotBySeqNo;
 	uint64_t m_aFramegenRungCostNs[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint32_t m_aFramegenRungSamples[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint64_t m_ulFramegenLastRawGpuTimeNs = 0;
+	uint64_t m_ulFramegenTrainingCostNs = 0;
+	uint64_t m_ulFramegenTrainingSampleSeqNo = 0;
 
 	// Same ring discipline for the dual-GPU staging copy, always on the composite
 	// queue family. Separate pool + validity because a dedicated framegen queue

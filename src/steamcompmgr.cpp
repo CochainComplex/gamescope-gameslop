@@ -140,6 +140,7 @@ bool g_bWasPartialComposite = false;
 
 bool ShouldDrawCursor();
 void vulkan_framegen_causal_tick();
+void vulkan_framegen_train_idle();
 uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns();
 
 std::atomic<uint32_t> g_unCurrentVRSceneAppId;
@@ -11324,6 +11325,7 @@ steamcompmgr_main(int argc, char **argv)
 		publish_mangoapp_snapshot();
 		publish_mangoapp_connector_snapshots();
 		relay_mangoapp_control();
+		vulkan_framegen_train_idle();
 
 		// The VRR timer path is independent of the fixed-refresh deadline: a
 		// zero fixed deadline never reaches clock sampling, timer arming or the

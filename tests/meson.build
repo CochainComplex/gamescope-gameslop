@@ -72,6 +72,12 @@ test('wlserver_shutdown', find_program('python3'),
 test('vulkan_mapped_memory', find_program('python3'),
 	args: files('test_vulkan_mapped_memory.py'), timeout: 90)
 
+test_framegen_learning = executable('test_framegen_learning', 'framegen_learning.cpp',
+	include_directories: [srcdir], cpp_args: gamescope_cpp_args + ['-UNDEBUG'])
+test('framegen_learning', test_framegen_learning)
+test('framegen_learning_recording', find_program('python3'),
+	args: files('test_framegen_learning.py'), timeout: 180)
+
 test('env_gamescope_local', find_program('python3'),
 	args: files('test_env_gamescope_local.py'), timeout: 15)
 
