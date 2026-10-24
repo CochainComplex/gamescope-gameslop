@@ -53,6 +53,7 @@
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
 #include "framegen/capture_file.hpp"
+#include "framegen/color_probe.hpp"
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
@@ -15766,45 +15767,33 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	const uint32_t uReferenceOffset = framegen_color_record_offset();
 	const uint32_t uEndpointOffset = framegen_color_record_span();
 
-	if ( c.reference == nullptr )
+	switch ( gamescope::framegen::color_probe_frame_action(
+		c.reference != nullptr, uSequenceOffset, uReferenceOffset, uEndpointOffset ) )
 	{
-		if ( uSequenceOffset < uReferenceOffset )
-		{
+		case gamescope::framegen::ColorProbeFrameAction::Wait:
 			c.lastRealTimeNs = ulNowNs;
 			return true;
-		}
-		if ( uSequenceOffset != uReferenceOffset )
-		{
+		case gamescope::framegen::ColorProbeFrameAction::Reseed:
 			reseed();
 			return true;
-		}
-		c.reference = pRealFrame;
-		c.referenceId = uFrameId;
-		c.referenceTimeNs = ulNowNs;
-		c.lastRealTimeNs = ulNowNs;
-		return true;
+		case gamescope::framegen::ColorProbeFrameAction::RetainReference:
+			c.reference = pRealFrame;
+			c.referenceId = uFrameId;
+			c.referenceTimeNs = ulNowNs;
+			c.lastRealTimeNs = ulNowNs;
+			return true;
+		case gamescope::framegen::ColorProbeFrameAction::Endpoint:
+			break;
 	}
 
-	if ( uSequenceOffset < uEndpointOffset )
-	{
-		c.lastRealTimeNs = ulNowNs;
-		return true;
-	}
-	if ( uSequenceOffset != uEndpointOffset )
+	const auto phase = gamescope::framegen::color_probe_phase(
+		c.anchorTimeNs, c.referenceTimeNs, ulNowNs, uReferenceOffset, uEndpointOffset );
+	if ( !phase || std::abs( phase->phase - phase->targetPhase ) > framegen_color_record_phase_tolerance() )
 	{
 		reseed();
 		return true;
 	}
-
-	const uint64_t ulSpanNs = ulNowNs - c.anchorTimeNs;
-	const float flPhase = (float)( c.referenceTimeNs - c.anchorTimeNs ) / (float)ulSpanNs;
-	const float flTargetPhase = (float)uReferenceOffset / (float)uEndpointOffset;
-	if ( !gamescope::framegen::is_finite_binary32( flPhase ) || flPhase <= 0.05f || flPhase >= 0.95f
-		|| std::abs( flPhase - flTargetPhase ) > framegen_color_record_phase_tolerance() )
-	{
-		reseed();
-		return true;
-	}
+	const float flPhase = phase->phase;
 
 	gamescope::Rc<CVulkanTexture> pAnchor = c.anchor;
 	gamescope::Rc<CVulkanTexture> pReference = c.reference;

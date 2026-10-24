@@ -46,6 +46,7 @@ Start here, then read the matching class in
 | Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
 | Atomic capture/profile output | `src/framegen/atomic_file.hpp`, `src/framegen/atomic_file.cpp` | unique same-directory staging, checked buffered close, cleanup, and atomic rename |
+| Held-out colour capture policy | `src/framegen/color_probe.hpp` | pure reference/endpoint offset selection and measured phase admission; the renderer retains continuity checks, settings, textures, completion and submission |
 | Vulkan scheduling and algorithms | `src/rendervulkan.cpp`, `src/rendervulkan.hpp` | history, resources, dispatch recording, and ML execution |
 | Queue and timestamp execution | `src/framegen/device.cpp`, `src/rendervulkan.hpp` | framegen submission, completion, command-buffer retirement, and GPU-time accounting |
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |

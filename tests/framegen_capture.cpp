@@ -2,12 +2,15 @@
 
 #include "framegen/atomic_file.hpp"
 #include "framegen/capture_file.hpp"
+#include "framegen/color_probe.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -72,6 +75,58 @@ struct PaddedPlanes
 };
 
 } // namespace
+
+TEST_CASE( "Color probes retain the exact held-out frame before the endpoint", "[framegen_capture]" )
+{
+	using Action = ColorProbeFrameAction;
+	REQUIRE( color_probe_frame_action( false, 0, 2, 4 ) == Action::Wait );
+	REQUIRE( color_probe_frame_action( false, 1, 2, 4 ) == Action::Wait );
+	REQUIRE( color_probe_frame_action( false, 2, 2, 4 ) == Action::RetainReference );
+	REQUIRE( color_probe_frame_action( false, 3, 2, 4 ) == Action::Reseed );
+	REQUIRE( color_probe_frame_action( false, 4, 2, 4 ) == Action::Reseed );
+	REQUIRE( color_probe_frame_action( true, 2, 2, 4 ) == Action::Wait );
+	REQUIRE( color_probe_frame_action( true, 3, 2, 4 ) == Action::Wait );
+	REQUIRE( color_probe_frame_action( true, 4, 2, 4 ) == Action::Endpoint );
+	REQUIRE( color_probe_frame_action( true, 5, 2, 4 ) == Action::Reseed );
+	REQUIRE( color_probe_frame_action( true, std::numeric_limits<uint64_t>::max(), 2, 4 ) == Action::Reseed );
+	// Without B, even C cannot advance the sequence. Reference selection takes
+	// precedence; lexical setting validation remains outside this policy.
+	REQUIRE( color_probe_frame_action( false, 4, 4, 4 ) == Action::RetainReference );
+	REQUIRE( color_probe_frame_action( true, 4, 4, 4 ) == Action::Endpoint );
+}
+
+TEST_CASE( "Color probe phase uses measured intervals and strict endpoint limits", "[framegen_capture]" )
+{
+	// A large clock epoch must not erase a small interval through fp32 rounding.
+	constexpr uint64_t epoch = uint64_t{ 1 } << 60;
+	const auto phase = color_probe_phase( epoch, epoch + 25, epoch + 100, 1, 2 );
+	REQUIRE( phase.has_value() );
+	REQUIRE( phase->phase == 0.25f );
+	REQUIRE( phase->targetPhase == 0.5f );
+	REQUIRE( !color_probe_phase( 0, 5, 100, 1, 2 ) );
+	REQUIRE( color_probe_phase( 0, 6, 100, 1, 2 ).has_value() );
+	REQUIRE( color_probe_phase( 0, 94, 100, 1, 2 ).has_value() );
+	REQUIRE( !color_probe_phase( 0, 95, 100, 1, 2 ) );
+	REQUIRE( !color_probe_phase( 100, 100, 100, 1, 2 ) );
+	REQUIRE( !color_probe_phase( 100, 101, 100, 1, 2 ) );
+
+	// A power-of-two span represents each adjacent binary32 phase exactly.
+	const auto atPhase = []( float value )
+	{
+		constexpr uint64_t span = uint64_t{ 1 } << 32;
+		return color_probe_phase( 0, uint64_t( double( value ) * double( span ) ), span, 1, 2 );
+	};
+	REQUIRE( !atPhase( std::nextafter( 0.05f, 0.0f ) ) );
+	REQUIRE( !atPhase( 0.05f ) );
+	const auto first = atPhase( std::nextafter( 0.05f, 1.0f ) );
+	REQUIRE( first.has_value() );
+	REQUIRE( first->phase == std::nextafter( 0.05f, 1.0f ) );
+	const auto last = atPhase( std::nextafter( 0.95f, 0.0f ) );
+	REQUIRE( last.has_value() );
+	REQUIRE( last->phase == std::nextafter( 0.95f, 0.0f ) );
+	REQUIRE( !atPhase( 0.95f ) );
+	REQUIRE( !atPhase( std::nextafter( 0.95f, 1.0f ) ) );
+}
 
 TEST_CASE( "GSFD v1 preserves metadata and packs all four planes", "[framegen_capture]" )
 {
