@@ -770,11 +770,12 @@ evaluate_deadline_miss_hysteresis(
 	// Drain the hold before any gate: at the bottom rung (or while costs are
 	// missing/immature) the gates below would otherwise return early forever and
 	// the hold would never reach zero, permanently blocking recovery.
-	const bool bHeld = state.holdFrames > 0u;
-	if ( bHeld )
+	if ( state.holdFrames > 0u )
+	{
 		state.holdFrames--;
-	if ( bHeld
-		|| maxDegradeSteps == 0u
+		return { state, false };
+	}
+	if ( maxDegradeSteps == 0u
 		|| currentRungCostNs == 0u
 		|| currentRungSamples < k_uDeadlineMinSamples
 		|| state.degradeSteps >= maxDegradeSteps )
