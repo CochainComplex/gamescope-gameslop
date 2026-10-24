@@ -1777,14 +1777,20 @@ GAMESCOPE_LOCAL_PREFIX=/path/to/the/matching/prefix \
   build/src/gamescope --backend headless -- true
 ```
 
-The guard runs both production constant-velocity warp specializations on
+The guard first round-trips known nonzero R32F bytes through the production
+host-upload barrier and a GPU image, then refills the same upload image and
+repeats the comparison. It logs the actual row pitches. This checks preservation
+through the first PREINITIALIZED transition and subsequent GENERAL uploads;
+ordinary mapped readbacks keep their existing allocation behavior.
+
+The shader cases run both production constant-velocity warp specializations on
 known translation, cut, disagreement and two-motion-boundary inputs at phases
 1/3, 1/2, 2/3, 1 and 1.5. It checks finite output, preservation of current alpha,
 HDR values above one and below zero, analytical translation/cut/fallback
 results, and that the spatial specialization actually affects a boundary.
 It does not duplicate the reconstruction algorithm as its own oracle.
 
-Both Radeon 890M and NVIDIA RTX PRO 500 Blackwell passed: maximum analytical
+Earlier shader-only runs on Radeon 890M and NVIDIA RTX PRO 500 Blackwell passed: maximum analytical
 RGB error 0.0000204 and 228 boundary pixel differences; current alpha preserved.
 These are float-image shader invariants, not an HDR display or native quality
 certification. The full Meson suite passed 79/79, including new policy and

@@ -3538,6 +3538,10 @@ void CVulkanTexture::setRenderOrigin( const char *origin )
 
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
+	if ( flags.bHostUpload && ( !flags.bMappable || !flags.bTransferSrc
+		|| flags.bExportable || flags.bFlippable || pDMA != nullptr
+		|| pExistingImageToReuseMemory != nullptr || pBackendFb != nullptr ) )
+		return false;
 	flags.bFlippable = flags.bFlippable && GetBackend()->UsesDmabufForPresentation();
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
@@ -3628,6 +3632,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.sharingMode = nSharedQueueFamilyCount != 0 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
 		.queueFamilyIndexCount = nSharedQueueFamilyCount,
 		.pQueueFamilyIndices = nSharedQueueFamilyCount != 0 ? nSharedQueueFamilies : nullptr,
+		.initialLayout = flags.bHostUpload ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 
 	m_bConcurrentSharing = imageInfo.sharingMode == VK_SHARING_MODE_CONCURRENT;
@@ -6881,6 +6886,9 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> netWeightsGpu;
 	gamescope::OwningRc<CVulkanTexture> netWeightsUpload;
 	bool bNetWeightsUploaded = false;
+	// Follows the staging IMAGE, not the active profile key. Key/scene changes
+	// can refill an existing GENERAL image; only a new allocation starts PREINITIALIZED.
+	bool bNetUploadInitialized = false;
 	bool bNetAllocTried = false;
 	// In-situ learning (only with GAMESCOPE_FRAMEGEN_NET_ONLINE): the
 	// immutable prior the fast weights decay toward, the optimizer state
@@ -12250,6 +12258,27 @@ static void framegen_net_stage_weights( const std::vector<float> &weights )
 	}
 }
 
+static void framegen_record_net_upload_barrier( CVulkanCmdBuffer *pCmdBuffer )
+{
+	auto &m = g_framegenMotion;
+	const VkImageMemoryBarrier barrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		.oldLayout = m.bNetUploadInitialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PREINITIALIZED,
+		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = m.netWeightsUpload->vkImage(),
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+	};
+	// Preserve CPU-filled pixels before copyImage first tracks this as GENERAL.
+	// One-batch admission guarantees no preceding copy still reads the staging.
+	g_device.vk.CmdPipelineBarrier( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_HOST_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &barrier );
+	m.bNetUploadInitialized = true;
+}
+
 static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH, bool bRefineReverse )
 {
 	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.netWeightsGpu == nullptr
@@ -12268,6 +12297,7 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 			framegen_net_stage_weights( framegen_net_activation_weights() );
 			g_bFramegenNetStagingStale = false;
 		}
+		framegen_record_net_upload_barrier( pCmdBuffer );
 		pCmdBuffer->copyImage( g_framegenMotion.netWeightsUpload, g_framegenMotion.netWeightsGpu );
 		if ( g_framegenMotion.netWeightsPrior != nullptr )
 			pCmdBuffer->copyImage( g_framegenMotion.netWeightsUpload, g_framegenMotion.netWeightsPrior );
@@ -12370,12 +12400,14 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	}
 
 	const uint32_t uOptGroups = div_roundup( k_uFramegenNetFloats, 64u );
-	const auto bindOpt = [&]()
+	const auto bindOpt = [&]( bool bInitialize )
 	{
 		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT ) );
 		pCmdBuffer->bindTarget( m.netState );
 		pCmdBuffer->bindTarget2( m.netWeightsGpu );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, m.netGradSlices, true );
+		// INIT never reads gradients. Keep its statically used descriptor valid
+		// without first tracking the fresh gradient image as an undefined source.
+		framegen_motion_bind_sampler( pCmdBuffer, 0, bInitialize ? m.netWeightsPrior : m.netGradSlices, true );
 		framegen_motion_bind_sampler( pCmdBuffer, 1, m.netWeightsPrior, true );
 	};
 
@@ -12383,7 +12415,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	// from the prior and zeroes the Adam moments.
 	if ( m.bNetStatePending )
 	{
-		bindOpt();
+		bindOpt( true );
 		pCmdBuffer->pushConstants<FramegenMotionNetOptPush_t>( 0.0f, 0.0f, 0.0f, 0u );
 		pCmdBuffer->dispatch( uOptGroups, 1 );
 		m.bNetStatePending = false;
@@ -12441,7 +12473,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 		bSceneCutGuard, false, bConservativeBidir, 1.0f );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
-	bindOpt();
+	bindOpt( false );
 	pCmdBuffer->pushConstants<FramegenMotionNetOptPush_t>( framegen_net_online_lr(), k_flFramegenNetEmaAlpha, k_flFramegenNetDecay, m.uNetTrainStep );
 	pCmdBuffer->dispatch( uOptGroups, 1 );
 
@@ -12788,6 +12820,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 
 				CVulkanTexture::createFlags stagingFlags;
 				stagingFlags.bMappable = true;
+				stagingFlags.bHostUpload = true;
 				stagingFlags.bTransferSrc = true;
 				stagingFlags.bFramegenShared = true;
 				g_framegenMotion.netWeightsUpload = new CVulkanTexture();
@@ -12809,6 +12842,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 					g_bFramegenNetStagingStale = false;
 				}
 				g_framegenMotion.bNetWeightsUploaded = false;
+				g_framegenMotion.bNetUploadInitialized = false;
 
 				// In-situ learning state, also once.
 				if ( bNetOk && framegen_net_online_enabled() )
@@ -14962,6 +14996,7 @@ static uint64_t framegen_learning_deadline()
 struct FramegenLearningRecording
 {
 	bool uploaded = g_framegenMotion.bNetWeightsUploaded;
+	bool uploadInitialized = g_framegenMotion.bNetUploadInitialized;
 	bool stagingStale = g_bFramegenNetStagingStale;
 	bool statePending = g_framegenMotion.bNetStatePending;
 	bool netActive = g_framegenMotion.bNetActive;
@@ -14980,6 +15015,7 @@ struct FramegenLearningRecording
 		if ( committed )
 			return;
 		g_framegenMotion.bNetWeightsUploaded = uploaded;
+		g_framegenMotion.bNetUploadInitialized = uploadInitialized;
 		g_bFramegenNetStagingStale = stagingStale;
 		g_framegenMotion.bNetStatePending = statePending;
 		g_framegenMotion.bNetActive = netActive;
@@ -15113,10 +15149,71 @@ static gamescope::OwningRc<CVulkanTexture> framegen_bench_make_image( uint32_t n
 
 } // namespace
 
+// Exercise the same preserving upload barrier used by learned inference with
+// nonzero float bytes, including a second host refill of an existing GENERAL image.
+static bool framegen_net_upload_guard()
+{
+	constexpr uint32_t W = 7u, H = 2u;
+	CVulkanTexture::createFlags uploadFlags;
+	uploadFlags.bMappable = true;
+	uploadFlags.bTransferSrc = true;
+	uploadFlags.bHostUpload = true;
+	CVulkanTexture::createFlags gpuFlags;
+	gpuFlags.bTransferSrc = true;
+	gpuFlags.bTransferDst = true;
+	CVulkanTexture::createFlags readbackFlags;
+	readbackFlags.bMappable = true;
+	readbackFlags.bTransferDst = true;
+	gamescope::OwningRc<CVulkanTexture> upload = new CVulkanTexture();
+	gamescope::OwningRc<CVulkanTexture> gpu = new CVulkanTexture();
+	gamescope::OwningRc<CVulkanTexture> readback = new CVulkanTexture();
+	if ( !upload->BInit( W, H, 1u, DRM_FORMAT_R32F, uploadFlags )
+		|| !gpu->BInit( W, H, 1u, DRM_FORMAT_R32F, gpuFlags )
+		|| !readback->BInit( W, H, 1u, DRM_FORMAT_R32F, readbackFlags ) )
+		return false;
+	struct RestoreUpload
+	{
+		gamescope::OwningRc<CVulkanTexture> texture = g_framegenMotion.netWeightsUpload;
+		bool initialized = g_framegenMotion.bNetUploadInitialized;
+		~RestoreUpload()
+		{
+			g_framegenMotion.netWeightsUpload = std::move( texture );
+			g_framegenMotion.bNetUploadInitialized = initialized;
+		}
+	} restore;
+	g_framegenMotion.netWeightsUpload = upload;
+	g_framegenMotion.bNetUploadInitialized = false;
+	for ( uint32_t pass = 0u; pass < 2u; pass++ )
+	{
+		std::array<float, W * H> expected;
+		for ( uint32_t i = 0u; i < expected.size(); i++ )
+			expected[i] = 0.25f + float( pass ) + float( i ) * 0.125f;
+		for ( uint32_t y = 0u; y < H; y++ )
+			memcpy( upload->mappedPixels() + y * upload->rowPitch(), expected.data() + y * W, W * sizeof( float ) );
+		auto cmd = g_device.commandBuffer();
+		if ( !cmd )
+			return false;
+		framegen_record_net_upload_barrier( cmd.get() );
+		cmd->copyImage( upload, gpu );
+		cmd->copyImage( gpu, readback );
+		cmd->hostReadBarrier();
+		// This guard runs before the compositor loop, never on normal presentation.
+		g_device.wait( g_device.submit( std::move( cmd ) ) );
+		for ( uint32_t y = 0u; y < H; y++ )
+			if ( memcmp( readback->mappedPixels() + y * readback->rowPitch(), expected.data() + y * W, W * sizeof( float ) ) != 0 )
+				return false;
+	}
+	vk_log.infof( "framegen: net upload guard preserved first and repeated nonzero R32F bytes (row bytes=%u upload pitch=%u readback pitch=%u)",
+		W * uint32_t( sizeof( float ) ), upload->rowPitch(), readback->rowPitch() );
+	return true;
+}
+
 // GPU contract guard for the opt-in spatial shader. Uses known translations,
 // cuts and disagreement rather than another implementation of its algorithm.
 bool vulkan_framegen_spatial_guard()
 {
+	if ( !framegen_net_upload_guard() )
+		return false;
 	constexpr uint32_t W = 64, H = 32, S = 8;
 	using Pixels = std::vector<glm::vec4>;
 	const auto makeImage = []( uint32_t w, uint32_t h, bool mapped ) {

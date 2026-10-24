@@ -12,6 +12,79 @@ def between(source, start, end):
     return source[begin:source.index(end, begin)]
 
 
+def check_host_upload_contracts(source, header, directory):
+    """Execute actual host-upload ownership guard and image-create declaration."""
+    flags = between(header, "\tstruct createFlags {", "\n\tbool BInit(")
+    init = between(source, "bool CVulkanTexture::BInit(", "bool CVulkanTexture::BInitFromSwapchain(")
+    guard = between(init, "\tif ( flags.bHostUpload", "\n\tflags.bFlippable =")
+    create = between(init, "\tVkImageCreateInfo imageInfo = {", "\n\tm_bConcurrentSharing =")
+    tiling = next(line for line in init.splitlines() if "VkImageTiling tiling =" in line)
+    staging = between(source, "\t\t\t\tCVulkanTexture::createFlags stagingFlags;",
+                      "\n\t\t\t\tg_framegenMotion.netWeightsUpload = new")
+    for name, body in (("flags", flags), ("guard", guard), ("create", create), ("staging", staging)):
+        (directory / f"host_upload_{name}.inc").write_text(body)
+    (directory / "host_upload_tiling.inc").write_text(tiling + "\n")
+    fixture = r'''
+#include <vulkan/vulkan.h>
+#include <cassert>
+#include <cstdint>
+#include <initializer_list>
+struct CVulkanTexture {
+#include "host_upload_flags.inc"
+};
+static VkFormat DRMFormatToVulkan(uint32_t, bool) { return VK_FORMAT_R32_SFLOAT; }
+static bool create(CVulkanTexture::createFlags flags, VkImageCreateInfo &observed,
+                   bool imported=false, bool reused=false, bool backend=false) {
+    const void *pDMA=imported ? &flags : nullptr;
+    const void *pExistingImageToReuseMemory=reused ? &flags : nullptr;
+    const void *pBackendFb=backend ? &flags : nullptr;
+#include "host_upload_guard.inc"
+    const uint32_t width=17, height=9, depth=1, drmFormat=0, nSharedQueueFamilyCount=0;
+    const uint32_t nSharedQueueFamilies[1]={0};
+    const VkImageUsageFlags usage=flags.imageUsage();
+#include "host_upload_tiling.inc"
+#include "host_upload_create.inc"
+    observed=imageInfo;
+    return true;
+}
+int main() {
+    CVulkanTexture::createFlags defaults;
+    assert(!defaults.bHostUpload);
+    VkImageCreateInfo observed{};
+    for (unsigned mask=0; mask<64; ++mask) {
+        auto normal=defaults;
+        normal.bMappable=mask&1; normal.bTransferSrc=mask&2; normal.bTransferDst=mask&4;
+        normal.bLinear=mask&8; normal.bStorage=mask&16; normal.bSampled=mask&32;
+        assert(create(normal,observed) && observed.initialLayout==VK_IMAGE_LAYOUT_UNDEFINED);
+        assert(observed.tiling==((normal.bMappable || normal.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL));
+    }
+    for (bool exported : {false,true}) {
+        auto capture=CVulkanTexture::createFlags::LinearCapture(exported);
+        assert(!capture.bHostUpload && create(capture,observed) && observed.initialLayout==VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+#include "host_upload_staging.inc"
+    assert(stagingFlags.bHostUpload && stagingFlags.bMappable && stagingFlags.bTransferSrc);
+    assert(create(stagingFlags,observed) && observed.initialLayout==VK_IMAGE_LAYOUT_PREINITIALIZED);
+    assert(observed.tiling==VK_IMAGE_TILING_LINEAR && observed.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    for (int rejection=0; rejection<7; ++rejection) {
+        auto invalid=stagingFlags;
+        if (rejection==0) invalid.bMappable=false;
+        if (rejection==1) invalid.bTransferSrc=false;
+        if (rejection==2) invalid.bExportable=true;
+        if (rejection==3) invalid.bFlippable=true;
+        assert(!create(invalid,observed,rejection==4,rejection==5,rejection==6));
+    }
+}
+'''
+    path = directory / 'host_upload.cpp'
+    path.write_text(fixture)
+    binary = directory / 'host_upload'
+    subprocess.run(shlex.split(os.environ.get('CXX', 'c++')) + [
+        '-std=c++20', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
+        '-I', str(directory), str(path), '-o', str(binary)], check=True, timeout=60)
+    subprocess.run([str(binary)], check=True, timeout=10)
+
+
 def check_copy_image_contracts(source, header, directory):
     """Execute production region selection; record its region/owner handoff."""
     body = between(source, "void CVulkanCmdBuffer::copyImage(",
@@ -500,6 +573,7 @@ def main():
         subprocess.run([str(binary)], check=True, timeout=10)
         check_nv12_contracts(source, header, directory)
         check_copy_image_contracts(source, header, directory)
+        check_host_upload_contracts(source, header, directory)
 
 
 if __name__ == "__main__":
