@@ -31,6 +31,7 @@ uniform layers_t {
     float u_itmTargetNits;
 
     uint u_rotation;
+    vec2 u_textureSize[VKR_MAX_LAYERS];
 };
 
 #include "composite.h"
@@ -46,7 +47,7 @@ void FsrRcasInputF(inout float r, inout float g, inout float b) {}
 
 vec4 sampleLayer(uint layerIdx, vec2 uv) {
     if ((c_ycbcrMask & (1 << layerIdx)) != 0)
-        return sampleLayerEx(s_ycbcr_samplers[layerIdx], layerIdx - 1, layerIdx, uv, false);
+        return sampleLayerYcbcr(layerIdx, layerIdx - 1, layerIdx, uv, u_textureSize[layerIdx]);
     return sampleLayerEx(s_samplers[layerIdx], layerIdx - 1, layerIdx, uv, true);
 }
 

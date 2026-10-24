@@ -685,6 +685,22 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 	m_pendingFramegenCmdBufs.reserve( k_uInitialSubmissionCapacity );
 	m_framegenQuerySlotBySeqNo.reserve( k_uInitialSubmissionCapacity );
 
+	// Immutable conversion samplers require a valid converted image view even
+	// in slots the shader never samples. Initialize its layout once at startup.
+	CVulkanTexture::createFlags placeholderFlags;
+	placeholderFlags.bSampled = true;
+	placeholderFlags.bFramegenShared = true;
+	m_ycbcrPlaceholder = new CVulkanTexture();
+	if ( !m_ycbcrPlaceholder->BInit( 2, 2, 1, DRM_FORMAT_NV12, placeholderFlags ) )
+		return false;
+	auto placeholderCmd = commandBuffer();
+	if ( !placeholderCmd )
+		return false;
+	placeholderCmd->discardImage( m_ycbcrPlaceholder.get() );
+	placeholderCmd->insertBarrier();
+	submit( std::move( placeholderCmd ) );
+	waitIdle();
+
 	// Frame generation is opt-in, so pay its fixed pipeline creation cost at
 	// compositor startup instead of on the first generated frame. A lazy miss in
 	// pipeline() calls vkCreateComputePipelines on the compositor thread and is a
@@ -1310,7 +1326,7 @@ bool CVulkanDevice::createDevice()
 
 	VkPhysicalDeviceFeatures2 features2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-		.pNext = &presentIdFeatures,
+		.pNext = GetBackend()->UsesVulkanSwapchain() ? static_cast<void *>( &presentIdFeatures ) : &features13,
 		.features = {
 			.shaderInt16 = m_bSupportsFp16,
 		},
@@ -2876,6 +2892,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		imageDescriptors[i].sampler = m_device->sampler(m_samplerState[i]);
 		imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		ycbcrImageDescriptors[i].imageView = m_device->m_ycbcrPlaceholder->linearView();
 		if (m_boundTextures[i] == nullptr)
 			continue;
 
@@ -2897,13 +2914,13 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		nearestState.bUnnormalized = false;
 
 		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
-		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
 		// I need to change this, it's so utterly stupid and confusing.
 		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
 
 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
-		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
 	}
 
@@ -2945,7 +2962,7 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 	assert(src->width() == dst->width());
 	assert(src->height() == dst->height());
 
-	VkImageCopy region = {
+	std::array<VkImageCopy, 2> regions = {{ {
 		.srcSubresource = {
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.layerCount = 1
@@ -2959,9 +2976,21 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 			.height = src->height(),
 			.depth = 1
 		},
-	};
+	} }};
+	uint32_t nRegions = 1;
+	if ( src->isYcbcr() )
+	{
+		regions[0].srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+		regions[0].dstSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+		regions[1] = regions[0];
+		regions[1].srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+		regions[1].dstSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+		regions[1].extent.width = div_roundup( src->width(), 2u );
+		regions[1].extent.height = div_roundup( src->height(), 2u );
+		nRegions = 2;
+	}
 
-	copyImageRegions(std::move(src), std::move(dst), std::span<const VkImageCopy>(&region, 1));
+	copyImageRegions(std::move(src), std::move(dst), std::span<const VkImageCopy>(regions.data(), nRegions));
 }
 
 void CVulkanCmdBuffer::copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions)
@@ -3369,17 +3398,19 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 	return true;
 }
 
-static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
+static VkResult getExternalImageFormatProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
 {
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
 		.drmFormatModifier = modifier,
 		.sharingMode = imageInfo->sharingMode,
+		.queueFamilyIndexCount = imageInfo->queueFamilyIndexCount,
+		.pQueueFamilyIndices = imageInfo->pQueueFamilyIndices,
 	};
 
 	VkPhysicalDeviceExternalImageFormatInfo externalImageFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-		.pNext = &modifierFormatInfo,
+		.pNext = modifier != DRM_FORMAT_MOD_INVALID ? &modifierFormatInfo : nullptr,
 		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 	};
 
@@ -3388,7 +3419,7 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 		.pNext = &externalImageFormatInfo,
 		.format = imageInfo->format,
 		.type = imageInfo->imageType,
-		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+		.tiling = modifier != DRM_FORMAT_MOD_INVALID ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT : imageInfo->tiling,
 		.usage = imageInfo->usage,
 		.flags = imageInfo->flags,
 	};
@@ -3407,6 +3438,39 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 	};
 
 	return g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, &imageProps);
+}
+
+static bool supportsNonModifierExport( const VkImageCreateInfo &imageInfo )
+{
+	VkExternalImageFormatProperties properties = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+	};
+	return getExternalImageFormatProps( &imageInfo, DRM_FORMAT_MOD_INVALID, &properties ) == VK_SUCCESS &&
+		( properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) &&
+		( properties.externalMemoryProperties.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT );
+}
+
+bool vulkan_supports_pipewire_dmabuf( uint32_t drmFormat )
+{
+	const auto flags = CVulkanTexture::createFlags::LinearCapture( true );
+	std::array<VkFormat, 2> formats = {
+		DRMFormatToVulkan( drmFormat, false ), DRMFormatToVulkan( drmFormat, true ),
+	};
+	VkImageFormatListCreateInfo formatList = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+		.viewFormatCount = uint32_t( formats.size() ),
+		.pViewFormats = formats.data(),
+	};
+	VkImageCreateInfo imageInfo = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.pNext = formats[0] != formats[1] ? &formatList : nullptr,
+		.flags = flags.imageCreateFlags( formats[0], formats[1] ),
+		.imageType = flags.imageType,
+		.format = formats[0],
+		.tiling = VK_IMAGE_TILING_LINEAR,
+		.usage = flags.imageUsage(),
+	};
+	return supportsNonModifierExport( imageInfo );
 }
 
 static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
@@ -3474,43 +3538,19 @@ void CVulkanTexture::setRenderOrigin( const char *origin )
 
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
+	flags.bFlippable = flags.bFlippable && GetBackend()->UsesDmabufForPresentation();
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
 	m_renderOrigin = dmabuf_render_origin( pDMA );
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
 
 	VkImageTiling tiling = (flags.bMappable || flags.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
-	VkImageUsageFlags usage = 0;
+	VkImageUsageFlags usage = flags.imageUsage();
 	VkMemoryPropertyFlags properties;
-
-	if ( flags.bSampled == true )
-	{
-		usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-	}
-
-	if ( flags.bStorage == true )
-	{
-		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-	}
-
-	if ( flags.bColorAttachment == true )
-	{
-		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	}
 
 	if ( flags.bFlippable == true )
 	{
 		flags.bExportable = true;
-	}
-
-	if ( flags.bTransferSrc == true )
-	{
-		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	}
-
-	if ( flags.bTransferDst == true )
-	{
-		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	}
 
 	if ( flags.bMappable == true )
@@ -3629,10 +3669,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.pViewFormats = formats.data(),
 	};
 
+	imageInfo.flags = flags.imageCreateFlags( formats[0], formats[1] );
 	if ( formats[0] != formats[1] )
 	{
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
-		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	}
 
 	if ( pDMA != nullptr )
@@ -3646,15 +3686,15 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
 		};
 
-		res = getModifierProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+		res = getExternalImageFormatProps( &imageInfo, pDMA->modifier, &externalImageProperties );
 		if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED && flags.bTransferSrc )
 		{
 			flags.bTransferSrc = false;
 			imageInfo.usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-			res = getModifierProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+			res = getExternalImageFormatProps( &imageInfo, pDMA->modifier, &externalImageProperties );
 		}
 		if ( res != VK_SUCCESS && res != VK_ERROR_FORMAT_NOT_SUPPORTED ) {
-			vk_errorf( res, "getModifierProps failed" );
+			vk_errorf( res, "getExternalImageFormatProps failed" );
 			return false;
 		}
 
@@ -3748,11 +3788,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				VkExternalImageFormatProperties externalFormatProps = {
 					.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
 				};
-				res = getModifierProps( &imageInfo, modifier, &externalFormatProps );
+				res = getExternalImageFormatProps( &imageInfo, modifier, &externalFormatProps );
 				if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
 					continue;
 				else if ( res != VK_SUCCESS ) {
-					vk_errorf( res, "getModifierProps failed" );
+					vk_errorf( res, "getExternalImageFormatProps failed" );
 					return false;
 				}
 
@@ -3783,12 +3823,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.pDrmFormatModifiers = modifiers.data(),
 		};
 
-		externalImageCreateInfo = {
-			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-			.pNext = std::exchange(imageInfo.pNext, &externalImageCreateInfo),
-			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-		};
-
 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 	}
 
@@ -3816,7 +3850,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		};
 	}
 	
-	if ( pDMA != nullptr )
+	if ( pDMA != nullptr || flags.bExportable )
 	{
 		externalImageCreateInfo = {
 			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -3841,6 +3875,14 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	}
 
 	m_format = imageInfo.format;
+
+	// Preflight mapped capture exports without changing legacy scanout owners.
+	if ( flags.bMappable && !flags.bFlippable && flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+		!supportsNonModifierExport( imageInfo ) )
+	{
+		vk_log.errorf( "dma-buf export is unsupported for DRM format 0x%" PRIX32 " with tiling %d", drmFormat, tiling );
+		return false;
+	}
 
 	res = g_device.vk.CreateImage(g_device.device(), &imageInfo, nullptr, &m_vkImage);
 	if (res != VK_SUCCESS) {
@@ -4155,8 +4197,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	if ( flags.bStorage || flags.bSampled || flags.bColorAttachment )
 	{
+		VkImageViewUsageCreateInfo viewUsageInfo = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+			.usage = imageInfo.usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
+		};
+		VkSamplerYcbcrConversionInfo conversionInfo = {
+			.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+			.pNext = &viewUsageInfo,
+			.conversion = g_device.ycbcrConversion(),
+		};
 		VkImageViewCreateInfo createInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.pNext = isYcbcr() ? &conversionInfo : nullptr,
 			.image = m_vkImage,
 			.viewType = VulkanImageTypeToViewType(flags.imageType),
 			.format = DRMFormatToVulkan(drmFormat, false),
@@ -4164,7 +4216,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
-				.a = bHasAlpha ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
+				.a = bHasAlpha || isYcbcr() ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
 			},
 			.subresourceRange = {
 				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -4173,19 +4225,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			},
 		};
 
-		res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
-		if ( res != VK_SUCCESS ) {
-			vk_errorf( res, "vkCreateImageView failed" );
-			return false;
+		if ( !isYcbcr() || flags.bSampled )
+		{
+			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
+			if ( res != VK_SUCCESS ) {
+				vk_errorf( res, "vkCreateImageView failed" );
+				return false;
+			}
 		}
 
 		if ( flags.bSampled )
 		{
-			VkImageViewUsageCreateInfo viewUsageInfo = {
-				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-				.usage = usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
-			};
-			createInfo.pNext = &viewUsageInfo;
+			createInfo.pNext = isYcbcr() ? static_cast<void *>( &conversionInfo ) : &viewUsageInfo;
 			createInfo.format = DRMFormatToVulkan(drmFormat, true);
 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_linearView);
 			if ( res != VK_SUCCESS ) {
@@ -4195,9 +4246,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		}
 
 
-		if ( isYcbcr() )
+		if ( isYcbcr() && flags.bStorage )
 		{
-			createInfo.pNext = NULL;
+			viewUsageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+			createInfo.pNext = &viewUsageInfo;
 			createInfo.format = VK_FORMAT_R8_UNORM;
 
 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
@@ -4207,7 +4259,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				return false;
 			}
 
-			createInfo.pNext = NULL;
 			createInfo.format = VK_FORMAT_R8G8_UNORM;
 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_chromaView);
@@ -4432,22 +4483,6 @@ CVulkanTexture::~CVulkanTexture( void )
 	}
 
 	m_bInitialized = false;
-}
-
-int CVulkanTexture::memoryFence()
-{
-	const VkMemoryGetFdInfoKHR memory_get_fd_info = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-		.memory = m_vkImageMemory,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	int fence = -1;
-	VkResult res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &fence);
-	if ( res != VK_SUCCESS ) {
-		fprintf( stderr, "vkGetMemoryFdKHR failed\n" );
-	}
-
-	return fence;
 }
 
 static bool is_image_format_modifier_supported(VkFormat format, uint32_t drmFormat, uint64_t modifier)
@@ -5367,11 +5402,10 @@ int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFram
 	if ( !oSeqNo )
 		return -EINVAL;
 
-	// Present first, wait after: the composite submit and the present both go to
-	// g_device.queue(), so the present is already ordered behind the blit and the
-	// wait is only for our own bookkeeping. Same ordering the real path uses.
-	const bool bPresented = vulkan_present_to_window();
+	// Complete the final composite and its present-layout transition before
+	// queueing presentation, as on the real-frame path.
 	vulkan_wait( *oSeqNo, true );
+	const bool bPresented = vulkan_present_to_window();
 	return bPresented ? 0 : -EAGAIN;
 }
 
@@ -6167,13 +6201,25 @@ void vulkan_garbage_collect( void )
 
 static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace )
 {
+	const uint32_t contentWidth = width;
+	const uint32_t contentHeight = height;
+	if ( drmFormat == DRM_FORMAT_NV12 )
+	{
+		// Preserve every content pixel and pad only the chroma alignment edge.
+		width = ( width + 1u ) & ~1u;
+		height = ( height + 1u ) & ~1u;
+	}
+	auto matches = [&]( CVulkanTexture *texture )
+	{
+		return texture->width() == width && texture->height() == height &&
+			texture->contentWidth() == contentWidth && texture->contentHeight() == contentHeight &&
+			texture->drmFormat() == drmFormat && texture->externalImage() == exportable &&
+			texture->streamColorspace() == colorspace;
+	};
 	for (auto& pTexture : pool)
 	{
 		// Evict a stale texture and reuse the slot
-		if (pTexture && pTexture->GetRefCount() == 0 &&
-			(width != pTexture->width() ||
-			 height != pTexture->height() ||
-			 drmFormat != pTexture->drmFormat()))
+		if (pTexture && pTexture->GetRefCount() == 0 && !matches( pTexture.get() ))
 		{
 			pTexture = nullptr;
 		}
@@ -6182,26 +6228,18 @@ static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_
 		{
 			pTexture = new CVulkanTexture();
 
-			CVulkanTexture::createFlags textureFlags;
-			textureFlags.bMappable = true;
-			textureFlags.bTransferDst = true;
-			textureFlags.bStorage = true;
-			textureFlags.bSampled = true; // required for RGB-to-NV12 shader to sample this texture
-			if (exportable || drmFormat == DRM_FORMAT_NV12) {
-				textureFlags.bExportable = true;
-				textureFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+			auto textureFlags = CVulkanTexture::createFlags::LinearCapture( exportable );
+			textureFlags.bSampled = drmFormat != DRM_FORMAT_NV12; // RGB source for RGB-to-NV12 conversion
+
+			if ( !pTexture->BInit( width, height, 1u, drmFormat, textureFlags, nullptr, contentWidth, contentHeight ) )
+			{
+				pTexture = nullptr;
+				return nullptr;
 			}
-
-			bool bSuccess = pTexture->BInit( width, height, 1u, drmFormat, textureFlags );
 			pTexture->setStreamColorspace(colorspace);
-
-			assert( bSuccess );
 		}
 
-		if (pTexture->GetRefCount() != 0 ||
-			width != pTexture->width() ||
-			height != pTexture->height() ||
-			drmFormat != pTexture->drmFormat())
+		if (pTexture->GetRefCount() != 0 || !matches( pTexture.get() ))
 			continue;
 
 		return pTexture.get();
@@ -6271,6 +6309,7 @@ struct BlitPushData_t
     float u_itmTargetNits; // unset
 
 	uint32_t u_rotation;
+	vec2_t textureSize[k_nMaxLayers] = {};
 
 	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo, uint32_t rotation = 0)
 	{
@@ -6280,6 +6319,7 @@ struct BlitPushData_t
 
 		for (int i = 0; i < frameInfo->layers.count(); i++) {
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
+			textureSize[i] = { float( layer->tex->width() ), float( layer->tex->height() ) };
 			scale[i] = layer->scale;
 			offset[i] = layer->offsetPixelCenter();
 			opacity[i] = layer->opacity;
@@ -6339,6 +6379,10 @@ struct BlitPushData_t
 		u_itmTargetNits = g_flHDRItmTargetNits;
 	}
 };
+
+// Scalar GLSL layout in blit_push_data.h, including the appended vec2 array.
+static_assert( offsetof( BlitPushData_t, textureSize ) == 68 * k_nMaxLayers + 40 );
+static_assert( sizeof( BlitPushData_t ) == 76 * k_nMaxLayers + 40 );
 
 struct CaptureConvertBlitData_t
 {
@@ -6422,6 +6466,7 @@ struct RcasPushData_t
     float u_itmTargetNits; // unset
 
 	uint32_t u_rotation;
+	vec2_t textureSize[k_nMaxLayers] = {};
 
 	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness, uint32_t rotation = 0)
 	{
@@ -6440,6 +6485,7 @@ struct RcasPushData_t
 		{
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
 
+			textureSize[i] = { float( layer->tex->width() ), float( layer->tex->height() ) };
             GamescopeUpscaleFilter eFilter = layer->filter == GamescopeUpscaleFilter::SGSR ? GamescopeUpscaleFilter::LINEAR : layer->filter;
             if (i == 0 || layer->isScreenSize() || (eFilter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
                 u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
@@ -6477,6 +6523,10 @@ struct RcasPushData_t
 		}
 	}
 };
+
+// Scalar GLSL layout shared by cs_composite_rcas{,_1px}.comp.
+static_assert( offsetof( RcasPushData_t, textureSize ) == 68 * k_nMaxLayers + 32 );
+static_assert( sizeof( RcasPushData_t ) == 76 * k_nMaxLayers + 32 );
 
 struct NisPushData_t
 {
@@ -6539,7 +6589,7 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 
 	if ( pYUVOutTexture != nullptr )
 	{
-		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->width();
+		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->contentWidth();
 
 		CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pYUVOutTexture->streamColorspace() ) );
 		constants.halfExtent[0] = pYUVOutTexture->width() / 2.0f;
@@ -10184,7 +10234,7 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	//    into the acquired swapchain image, so it is ALWAYS a sampled source
 	//    there and must not depend on the cursor-split env var.
 	createFlags.bSampled = framegen_cursor_split_enabled() || !framegen_owns_output_ring();
-	createFlags.bOutputImage = true;
+	createFlags.bOutputImage = framegen_owns_output_ring();
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
