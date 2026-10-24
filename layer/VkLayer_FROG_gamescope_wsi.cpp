@@ -1296,12 +1296,12 @@ namespace GamescopeWSILayer {
         if (pPresentModeCompat)
           vkroots::array(s_SingleMode, &pPresentModeCompat->presentModeCount, pPresentModeCompat->pPresentModes);
 
-        VkResult res = VK_SUCCESS;
-        if ((res = pDispatch.GetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, pSurfaceInfo, pSurfaceCapabilities)) != VK_SUCCESS)
-          return res;
-
+        const VkResult res = pDispatch.GetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, pSurfaceInfo, pSurfaceCapabilities);
+        // Caller-owned structure links must survive driver errors as well.
         if (pPresentModeCompat)
           vkroots::AddToChain(pPresentModeCompatParent, pPresentModeCompat);
+        if (res != VK_SUCCESS)
+          return res;
       } else {
         VkResult res = VK_SUCCESS;
         if ((res = pDispatch.GetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, pSurfaceInfo, pSurfaceCapabilities)) != VK_SUCCESS)

@@ -494,6 +494,8 @@ struct SurfaceDriver {
   uint32_t creates = 0;
   uint32_t acquires = 0;
   VkAcquireNextImageInfoKHR acquire{};
+  uint32_t capabilityQueries = 0;
+  std::vector<VkStructureType> capabilityChain;
 } surfaceDriver;
 
 VkResult VKAPI_CALL surfaceCapabilities(VkPhysicalDevice, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *caps) {
@@ -505,6 +507,9 @@ VkResult VKAPI_CALL surfaceCapabilities(VkPhysicalDevice, VkSurfaceKHR surface, 
 
 VkResult VKAPI_CALL surfaceCapabilities2(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR *info,
                                         VkSurfaceCapabilities2KHR *caps) {
+  surfaceDriver.capabilityQueries++;
+  for (auto *node = static_cast<const VkBaseOutStructure *>(caps->pNext); node; node = node->pNext)
+    surfaceDriver.capabilityChain.push_back(node->sType);
   if (auto *protectedCaps = vkroots::FindInChainMutable<VkSurfaceProtectedCapabilitiesKHR>(caps))
     protectedCaps->supportsProtected = VK_TRUE;
   return surfaceCapabilities(VK_NULL_HANDLE, info->surface, &caps->surfaceCapabilities);
@@ -627,6 +632,72 @@ TEST_CASE("Surface capability queries preserve driver fields and caller chains",
     CHECK(caps.supportedUsageFlags == expected.supportedUsageFlags);
   } else
     CHECK(caps.minImageCount == 17);
+}
+
+TEST_CASE("Forced FIFO capability queries restore caller chains on success and failure", "[present_timing_layer][forced_fifo_capabilities]") {
+  const auto position = GENERATE(0, 1, 2, 3);
+  const auto result = GENERATE(VK_SUCCESS, VK_ERROR_SURFACE_LOST_KHR);
+  CAPTURE(position, result);
+  SurfaceContract fixture;
+  auto *state = GamescopeWSILayer::gamescopeSurfaces.find(fixture.surface);
+  REQUIRE(state);
+  state->flags |= GamescopeLayerClient::Flag::FrameLimiterAware;
+  state->waylandObjects.limiterState->state = 1;
+  surfaceDriver.result = result;
+
+  VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,
+    .presentMode = VK_PRESENT_MODE_FIFO_KHR};
+  const VkPhysicalDeviceSurfaceInfo2KHR input{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+    .pNext = &mode, .surface = fixture.surface};
+  VkSurfacePresentScalingCapabilitiesEXT scaling{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT};
+  VkSurfaceProtectedCapabilitiesKHR protectedCaps{.sType = VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR,
+    .pNext = &scaling};
+  std::array modes{VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
+  VkSurfacePresentModeCompatibilityEXT compatibility{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT,
+    .presentModeCount = uint32_t(modes.size()), .pPresentModes = modes.data()};
+  VkSurfaceCapabilities2KHR output{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+    .pNext = &protectedCaps};
+  if (position == 0) {
+    compatibility.pNext = output.pNext;
+    output.pNext = &compatibility;
+  } else if (position == 1) {
+    compatibility.pNext = protectedCaps.pNext;
+    protectedCaps.pNext = &compatibility;
+  } else if (position == 2) {
+    scaling.pNext = &compatibility;
+  }
+  const auto *outputNext = output.pNext;
+  const auto *protectedNext = protectedCaps.pNext;
+  const auto *scalingNext = scaling.pNext;
+  const auto *compatibilityNext = compatibility.pNext;
+
+  CHECK(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
+    fixture.physical, VK_NULL_HANDLE, &input, &output) == result);
+  CHECK(surfaceDriver.capabilityQueries == 1);
+  CHECK(surfaceDriver.surface == fixture.surface);
+  CHECK(surfaceDriver.capabilityChain == std::vector<VkStructureType>{protectedCaps.sType, scaling.sType});
+  CHECK(output.pNext == outputNext);
+  CHECK(protectedCaps.pNext == protectedNext);
+  CHECK(scaling.pNext == scalingNext);
+  CHECK(compatibility.pNext == compatibilityNext);
+  CHECK(input.pNext == &mode);
+  CHECK(mode.pNext == nullptr);
+  CHECK(mode.presentMode == VK_PRESENT_MODE_FIFO_KHR);
+  CHECK(input.sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR);
+  CHECK(mode.sType == VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT);
+  CHECK(output.sType == VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR);
+  CHECK(protectedCaps.sType == VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR);
+  CHECK(scaling.sType == VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT);
+  CHECK(compatibility.sType == VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT);
+  // On failure only the structure types and links, not output payloads, are defined.
+  if (result == VK_SUCCESS) {
+    CHECK(output.surfaceCapabilities.maxImageArrayLayers == surfaceDriver.capabilities.maxImageArrayLayers);
+    CHECK(protectedCaps.supportsProtected == VK_TRUE);
+    if (position != 3) {
+      CHECK(compatibility.presentModeCount == 1);
+      CHECK(modes[0] == VK_PRESENT_MODE_FIFO_KHR);
+    }
+  }
 }
 
 TEST_CASE("Swapchain creation forwards a valid count and maintenance modes without changing the caller", "[present_timing_layer][surface_counts]") {

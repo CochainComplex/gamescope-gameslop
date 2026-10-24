@@ -140,6 +140,12 @@ and active versus retired acquire requests. Creation stops at a deliberate
 driver error before allocating Wayland protocol objects. These CPU tests do not
 establish GPU synchronization, XCB fallback behavior or frame pacing.
 
+The `[forced_fifo_capabilities]` cases cover forced-FIFO queries with a
+compatibility node at the head, middle, tail or absent. They verify one driver
+call, an unchanged driver result and restoration of caller-owned chain links on
+both success and failure. Only structure types and links are checked for failed
+output queries; their payloads are undefined after a driver error.
+
 The known image-count mismatch remains open: the layer can advertise three
 images although the downstream surface requires four. A correction must account
 for forced MAILBOX limits, capability-query modes and bypass/fallback surfaces;
