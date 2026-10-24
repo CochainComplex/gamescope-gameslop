@@ -14025,7 +14025,7 @@ static FramegenCausalRungSelection_t framegen_sample_causal_rung( uint32_t nRung
 
 static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs,
-	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline,
+	uint64_t ulAdmissionWakeNs, uint64_t ulPlainWakeNs, bool bNativeCommitDeadline,
 	uint64_t ulNativeSlotBudgetNs, uint64_t ulShortfallSlotBudgetNs )
 {
 	FramegenCausalRungSelection_t result;
@@ -14049,7 +14049,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	};
 	const auto sampleFits = [&]( const FramegenCausalRungSelection_t &sample )
 	{
-		return sampleFitsAt( sample, plan.wakeNs );
+		return sampleFitsAt( sample, ulAdmissionWakeNs );
 	};
 
 	const uint32_t nCurrentRung = g_framegenHistory.nDegradeSteps;
@@ -14100,9 +14100,9 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				ulNowNs, ulStartEstimateNs );
 			const uint64_t ulRecoveryBudgetNs = ulNativeSlotBudgetNs != 0u
 				? ulNativeSlotBudgetNs
-				: ( plan.wakeNs > ulDecisionStartNs
+				: ( ulAdmissionWakeNs > ulDecisionStartNs
 					? gamescope::framegen::deadline_budget_ns(
-						plan.wakeNs - ulDecisionStartNs )
+						ulAdmissionWakeNs - ulDecisionStartNs )
 					: 0u );
 			std::array<gamescope::framegen::LadderRungCost_t,
 				CVulkanDevice::kFramegenLadderSlots> rungCosts = {};
@@ -14162,9 +14162,9 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	// over-budget rung.
 	const uint64_t ulDecisionStartNs = std::max(
 		ulNowNs, ulStartEstimateNs );
-	const uint64_t ulRemainingBudgetNs = plan.wakeNs > ulDecisionStartNs
+	const uint64_t ulRemainingBudgetNs = ulAdmissionWakeNs > ulDecisionStartNs
 		? gamescope::framegen::deadline_budget_ns(
-			plan.wakeNs - ulDecisionStartNs )
+			ulAdmissionWakeNs - ulDecisionStartNs )
 		: 0u;
 	switch ( gamescope::framegen::causal_shortfall_action(
 		bDegradeForPriorMiss, result.ulCostNs, result.uSamples,
@@ -14265,11 +14265,13 @@ static uint64_t framegen_nested_slot_wake_ns( uint64_t ulSlotVBlankNs )
 
 // Nested fixed-grid slot: whether it can still be submitted before the
 // compositor wakes for its raw vblank (fixed_grid_slot_submittable).
-static bool framegen_nested_slot_submittable( uint64_t ulSlotVBlankNs, uint64_t ulNowNs )
+static bool framegen_nested_slot_submittable( uint64_t ulSlotVBlankNs, uint64_t ulNowNs,
+	uint64_t &ulRawWakeNs )
 {
 	const uint64_t ulT = g_framegenHistory.ulDeadlineGridIntervalNs;
+	ulRawWakeNs = framegen_nested_slot_wake_ns( ulSlotVBlankNs );
 	return gamescope::framegen::fixed_grid_slot_submittable( ulSlotVBlankNs,
-		framegen_nested_slot_wake_ns( ulSlotVBlankNs ),
+		ulRawWakeNs,
 		g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs, ulT,
 		gamescope::framegen::cadence_arrival_guard_ns( ulT ) );
 }
@@ -14324,8 +14326,8 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			g_framegenPresentState.displayTiming.presentBias.emaNs );
 	// The ordinary grid wake reserves enough time to render a full compositor
 	// frame. A native generated-only present instead has to finish by its actual
-	// KMS commit deadline. Use that deadline for both slot selection and cost
-	// admission; nested backends retain the byte-for-byte plain-grid path.
+	// KMS commit deadline. Use it for both slot selection and cost admission.
+	// Nested slot planning keeps the plain grid; admission is capped below.
 	gamescope::framegen::DisplayGrid_t grid = plainGrid;
 	const bool bNativeKmsTiming = GetBackend() != nullptr
 		&& GetBackend()->OwnsKMSPresentTiming();
@@ -14338,6 +14340,9 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			: gamescope::framegen::FixedRefreshCommitPlan_t{};
 	if ( gridCommitPlan.earlyCommit )
 		grid.W0 = gridCommitPlan.commitDeadlineNs;
+	const uint64_t ulNextRealEligibleVBlankNs = bNativeKmsTiming ? 0u
+		: steamcompmgr_framegen_next_real_eligible_vblank(
+			g_framegenHistory.ulLastBaseCommitID, ulVblankIntervalNs );
 	const gamescope::framegen::CausalSlotPlan_t plan =
 		gamescope::framegen::plan_next_causal_slot(
 			grid, g_framegenHistory.causalAnchor, g_framegenHistory.cadence, {
@@ -14351,6 +14356,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 				.sourceTimestampsReliable = g_framegenHistory.bCadenceUsesSourceTime,
 				.dedicatedQueue = true,
 				.skipAtOrPastNextReal = bCorrectionReplan && !bNativeKmsTiming,
+				.nextRealEligibleVBlankNs = ulNextRealEligibleVBlankNs,
 			} );
 	if ( !plan.admit )
 	{
@@ -14375,9 +14381,20 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	// Nested: the compositor takes this slot at the raw wake of its vblank. A slot
 	// that can no longer be submitted before that wake is skipped, never slid;
 	// the next planning call (tick or drain) takes the following slot.
-	if ( oTargetVBlankNs && !framegen_nested_slot_submittable( *oTargetVBlankNs, now ) )
+	uint64_t ulRawWakeNs = 0u;
+	if ( oTargetVBlankNs && !framegen_nested_slot_submittable( *oTargetVBlankNs, now, ulRawWakeNs ) )
 	{
 		framegen_net_note_skip( NetLearningSkip::NoSlot );
+		return false;
+	}
+	// A nested output is taken at the raw opportunity. A positive learned
+	// display bias cannot grant extra generation time beyond that opportunity.
+	// Reuse the same raw-wake observation that passed submittability above.
+	const uint64_t ulAdmissionWakeNs = oTargetVBlankNs
+		? std::min( plan.wakeNs, ulRawWakeNs ) : plan.wakeNs;
+	if ( oTargetVBlankNs && std::max( now, ulStartEstimateNs ) >= ulAdmissionWakeNs )
+	{
+		framegen_net_note_skip( NetLearningSkip::Budget );
 		return false;
 	}
 	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
@@ -14404,14 +14421,14 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 		gamescope::framegen::causal_shortfall_slot_budget_ns(
 			bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
-		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,
+		plan, now, ulAdmissionWakeNs, ulPlainWakeNs, commitPlan.earlyCommit,
 		ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );
 	if ( !rung.bAdmit )
 	{
 		framegen_net_note_skip( NetLearningSkip::Budget );
 		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
-		const uint64_t ulRemainingNs = plan.wakeNs > ulDecisionStartNs
-			? plan.wakeNs - ulDecisionStartNs : 0u;
+		const uint64_t ulRemainingNs = ulAdmissionWakeNs > ulDecisionStartNs
+			? ulAdmissionWakeNs - ulDecisionStartNs : 0u;
 		const uint64_t ulPlainRemainingNs = ulPlainWakeNs > ulDecisionStartNs
 			? ulPlainWakeNs - ulDecisionStartNs : 0u;
 		static uint64_t s_uCausalBudgetSkipDebugLogCounter = 0;
@@ -14451,7 +14468,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			plan.rawStrength, k_flFramegenMaxForwardStrength ),
 		.slotIndex = nSlotIndex,
 		.targetFlipNs = plan.targetNs,
-		.wakeDeadlineNs = plan.wakeNs,
+		.wakeDeadlineNs = ulAdmissionWakeNs,
 		.targetVBlankNs = oTargetVBlankNs,
 	};
 	const uint32_t nMaxCausalDegradeSteps = gamescope::framegen::max_degrade_steps(
@@ -14471,7 +14488,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 		vk_log.infof( "framegen: causal slot phase=%.3f strength=%.3f target=+%.2fms wake=+%.2fms anchor=%s work=%s cost=%.2fms samples=%u",
 			plan.phase, request.strength,
 			( plan.targetNs > now ? plan.targetNs - now : 0u ) / 1.0e6,
-			( plan.wakeNs > now ? plan.wakeNs - now : 0u ) / 1.0e6,
+			( ulAdmissionWakeNs > now ? ulAdmissionWakeNs - now : 0u ) / 1.0e6,
 			plan.provisional ? "provisional" : "corrected",
 			rung.workClass == gamescope::framegen::DeadlineWorkClass_t::CachedWarp
 				? "cached-warp" : "full-prep+warp",
@@ -14527,8 +14544,9 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 					g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs,
 					g_framegenHistory.ulDeadlineGridIntervalNs, ulArrivalGuardNs ) )
 					return false;
-				const uint64_t ulReplacementWakeNs = gamescope::framegen::apply_present_bias_ns(
-					ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs );
+				const uint64_t ulReplacementWakeNs = std::min( ulRawWakeNs,
+					gamescope::framegen::apply_present_bias_ns(
+						ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs ) );
 				const FramegenCausalRungSelection_t replacement = framegen_sample_causal_rung(
 					g_framegenHistory.nDegradeSteps );
 				const bool bDiscard = gamescope::framegen::discard_pending_provisional_slot(

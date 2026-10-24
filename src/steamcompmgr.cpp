@@ -102,6 +102,7 @@
 #include "Utils/Process.h"
 #include "Utils/PresentTiming.h"
 #include "Utils/CommitQueue.h"
+#include "Utils/VBlankSchedule.h"
 
 #include "wlr_begin.hpp"
 #include "wlr/types/wlr_pointer_constraints_v1.h"
@@ -6902,6 +6903,75 @@ static std::optional<uint64_t> s_oLowestFPSLimitScheduleVRR;
 
 // Display vblank index of the previous vblank pass. The limiter opens when a pass crosses a divisor boundary.
 static uint64_t s_ulPrevVBlankIdx = 0;
+static uint64_t s_ulVBlankIdx = 0;
+static uint64_t s_ulLastPassVBlank = 0;
+static uint64_t s_ulLastPassRefreshCycle = 0;
+
+static void steamcompmgr_note_vblank_pass( uint64_t ulPassVBlank, uint64_t ulRefreshCycle )
+{
+	// Count display vblanks, so a skipped or repeated pass cannot shift the limiter's phase.
+	s_ulPrevVBlankIdx = s_ulVBlankIdx;
+	if ( ulPassVBlank > s_ulLastPassVBlank )
+		s_ulVBlankIdx += ( ulPassVBlank - s_ulLastPassVBlank + ulRefreshCycle / 2 ) / ulRefreshCycle;
+	s_ulLastPassVBlank = ulPassVBlank;
+	s_ulLastPassRefreshCycle = ulRefreshCycle;
+}
+
+uint64_t steamcompmgr_framegen_next_real_eligible_vblank( uint64_t ulBaseCommitID, uint64_t ulRefreshCycle )
+{
+	if ( !ulBaseCommitID || !ulRefreshCycle )
+		return 0;
+	auto *pBackend = GetBackend();
+	if ( !pBackend || pBackend->OwnsKMSPresentTiming() )
+		return 0;
+	auto *pConnector = pBackend->GetCurrentConnector();
+	if ( pConnector && pConnector->IsVRRActive() )
+		return 0;
+	if ( ulRefreshCycle != g_SteamCompMgrAppRefreshCycle
+		|| ulRefreshCycle != s_ulLastPassRefreshCycle )
+		return 0;
+	const int nRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+	if ( nRefreshmHz <= 0 || gamescope::mHzToRefreshCycle( nRefreshmHz ) != ulRefreshCycle )
+		return 0;
+
+	global_focus_t *pFocus = GetCurrentFocus();
+	if ( !pFocus || pFocus->fadeWindow || pFocus->bPendingFade )
+		return 0;
+	const auto &held = pFocus->HeldCommits[HELD_COMMIT_BASE];
+	if ( !held || held->commitID != ulBaseCommitID || !held->fifo )
+		return 0;
+	steamcompmgr_win_t *w = pFocus->focusWindow;
+	if ( !w || w->seq != held->win_seq )
+		w = pFocus->overrideWindow;
+	if ( !w || w->seq != held->win_seq )
+		return 0;
+	if ( !steamcompmgr_window_should_limit_fps( w ) )
+		return 0;
+
+	// A known newer mailbox commit contradicts a FIFO eligibility floor. Only
+	// use the current source or its single known FIFO successor; other queue
+	// shapes supply no hint. These bounded reads add no scan or retained window.
+	const auto &queue = w->commit_queue;
+	if ( queue.empty() || !queue.back() )
+		return 0;
+	const commit_t *pNewest = queue.back().get();
+	if ( pNewest->commitID < ulBaseCommitID )
+		return 0;
+	if ( pNewest->commitID > ulBaseCommitID )
+	{
+		if ( !pNewest->fifo || queue.size() < 2u )
+			return 0;
+		const auto &previous = queue[queue.size() - 2u];
+		if ( !previous || previous->commitID != ulBaseCommitID )
+			return 0;
+	}
+	const int nDivisor = gamescope::VBlank::LimiterDivisor(
+		gamescope::ConvertmHzToHz( nRefreshmHz ), g_nSteamCompMgrTargetFPS, true );
+	if ( nDivisor <= 0 )
+		return 0;
+	return gamescope::VBlank::NextLimiterTarget(
+		s_ulVBlankIdx, s_ulLastPassVBlank, ulRefreshCycle, nDivisor );
+}
 
 static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx, steamcompmgr_win_t *w = nullptr, uint64_t now = 0 )
 {
@@ -6931,13 +7001,11 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 	}
 	else
 	{
-		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
-		{
-			int nVblankDivisor = nRefreshHz / nTargetFPS;
-
-			if ( vblank_idx / nVblankDivisor == s_ulPrevVBlankIdx / nVblankDivisor )
-				bSendCallback = false;
-		}
+		const int nVblankDivisor = gamescope::VBlank::LimiterDivisor(
+			nRefreshHz, nTargetFPS, bShouldLimitFPS );
+		if ( nVblankDivisor
+			&& vblank_idx / nVblankDivisor == s_ulPrevVBlankIdx / nVblankDivisor )
+			bSendCallback = false;
 	}
 
 	return bSendCallback;
@@ -10751,16 +10819,11 @@ steamcompmgr_main(int argc, char **argv)
 		// This ensures that FIFO works properly, since otherwise we might ask for a new frame
 		// application can commit a new frame that completes before we ever displayed
 		// the current pending commit.
-		static uint64_t vblank_idx = 0;
+		uint64_t &vblank_idx = s_ulVBlankIdx;
 		if ( vblank )
 		{
-			// Count display vblanks, so a skipped or repeated pass cannot shift the limiter's phase.
-			static uint64_t s_ulLastPassVBlank = 0;
-			const uint64_t ulPassVBlank = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
-			s_ulPrevVBlankIdx = vblank_idx;
-			if ( ulPassVBlank > s_ulLastPassVBlank )
-				vblank_idx += ( ulPassVBlank - s_ulLastPassVBlank + g_SteamCompMgrAppRefreshCycle / 2 ) / g_SteamCompMgrAppRefreshCycle;
-			s_ulLastPassVBlank = ulPassVBlank;
+			steamcompmgr_note_vblank_pass( g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank,
+				g_SteamCompMgrAppRefreshCycle );
 
 			{
 				uint64_t now = get_time_in_nanos();

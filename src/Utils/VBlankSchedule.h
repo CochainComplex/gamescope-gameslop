@@ -18,6 +18,28 @@ namespace gamescope
 
     namespace VBlank
     {
+        // Zero means this window has no fixed-refresh divisor gate. Keep the
+        // integer quotient used by steamcompmgr, including non-dividing caps.
+        constexpr int LimiterDivisor( int nRefreshHz, int nTargetFPS, bool bShouldLimitFPS )
+        {
+            return nTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS
+                ? nRefreshHz / nTargetFPS : 0;
+        }
+
+        // First bucket after the most recently processed fixed-refresh pass.
+        // Unknown or unrepresentable phase supplies no eligibility constraint.
+        constexpr uint64_t NextLimiterTarget( uint64_t ulIndex, uint64_t ulTarget,
+            uint64_t ulInterval, uint64_t ulDivisor )
+        {
+            if ( !ulTarget || !ulInterval || !ulDivisor )
+                return 0;
+            const uint64_t ulSteps = ulDivisor - ulIndex % ulDivisor;
+            if ( ulSteps > UINT64_MAX - ulIndex
+                || ulSteps > ( UINT64_MAX - ulTarget ) / ulInterval )
+                return 0;
+            return ulTarget + ulSteps * ulInterval;
+        }
+
         struct ScheduleParams
         {
             uint64_t ulLastVBlank = 0;

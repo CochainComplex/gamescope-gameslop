@@ -1832,7 +1832,7 @@ TEST_CASE( "nested correction uses strict measured admission before discarding p
 		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
 }
 
-TEST_CASE( "nested correction wires the biased deadline and current work class into discard",
+TEST_CASE( "nested correction wires the bounded deadline and current work class into discard",
 	"[framegen][deadline][nested][correction][reference-wiring]" )
 {
 	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
@@ -1843,8 +1843,9 @@ TEST_CASE( "nested correction wires the biased deadline and current work class i
 	};
 	CHECK( statement( "const uint64_t ulReplacementWakeNs =" )
 		== std::vector<std::string>{ framegen_canonical(
-			"const uint64_t ulReplacementWakeNs = gamescope::framegen::apply_present_bias_ns("
-			" ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs );" ) } );
+			"const uint64_t ulReplacementWakeNs = std::min( ulRawWakeNs,"
+			" gamescope::framegen::apply_present_bias_ns( ulRawWakeNs,"
+			" g_framegenPresentState.displayTiming.presentBias.emaNs ) );" ) } );
 	CHECK( statement( "const FramegenCausalRungSelection_t replacement =" )
 		== std::vector<std::string>{ framegen_canonical(
 			"const FramegenCausalRungSelection_t replacement = framegen_sample_causal_rung("
@@ -7800,7 +7801,7 @@ TEST_CASE( "the renderer classifies causal shortfalls through the shared seams",
 	CHECK( statements( "FramegenCausalRungSelection_t rung = framegen_select_causal_rung(", ";" )
 		== std::vector<std::string>{ framegen_canonical(
 			"FramegenCausalRungSelection_t rung = framegen_select_causal_rung("
-			" plan, now, ulPlainWakeNs, commitPlan.earlyCommit,"
+			" plan, now, ulAdmissionWakeNs, ulPlainWakeNs, commitPlan.earlyCommit,"
 			" ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );" ) } );
 	// A phase-only skip returns at once: it writes no rung, hold or recovery
 	// evidence.
@@ -7908,4 +7909,43 @@ TEST_CASE( "false nested degradations inside probation ratchet the recovery back
 
 	CHECK( replay( 0u ).backoffDecisions == k_uDeadlineRecoveryMaxBackoffDecisions );
 	CHECK( replay( slotNs ).backoffDecisions == k_uDeadlineRecoveryBaseBackoffDecisions );
+}
+
+TEST_CASE( "a limiter-held real frame does not suppress an earlier causal backup",
+	"[framegen][deadline][causal][real_admission]" )
+{
+	// Admission projection reconstructed from the 30/60 FIFO trace, anchor98.
+	// The provisional anchor is the coherent previous point of this grid;
+	// its exact value was not recorded. Cadence/source/grid/now were recorded
+	// or replayed from the consecutive source-ready observations.
+	constexpr uint64_t T = 16'666'666u;
+	const DisplayGrid_t raw = { 243'833'618'398'849u, 243'833'614'048'423u, T };
+	const CadencePredictorState cadence = {
+		.intervalNs = 33'555'873u, .trendNs = 33'486,
+		.lateErrorNs = 1'783'372u, .samples = 97u,
+	};
+	for ( int64_t bias : { int64_t(-227'614), int64_t(0), int64_t(1'000'000) } )
+	{
+		const DisplayGrid_t grid = apply_present_bias( raw, bias );
+		const RealAnchorState_t anchor = {
+			.realFrameId = 98u, .sourceReadyNs = 243'833'566'087'756u,
+			.provisionalTargetNs = grid.D0 - T, .provisionalBiasNs = bias, .epoch = 1u,
+		};
+		CausalPlanOptions_t options = {
+			.nowNs = 243'833'597'655'178u, .gridEpoch = 1u, .presentBiasNs = bias,
+		};
+		const CausalSlotPlan_t legacy = plan_next_causal_slot( grid, anchor, cadence, options );
+		REQUIRE_FALSE( legacy.admit );
+		REQUIRE( legacy.skipReason == DeadlineSkipReason_t::NextRealSafelyDue );
+		for ( uint64_t distance : std::array<uint64_t, 4>{ 0u, T / 2u, T / 2u + 1u, T } )
+		{
+			options.nextRealEligibleVBlankNs = raw.D0 + distance;
+			const CausalSlotPlan_t plan = plan_next_causal_slot( grid, anchor, cadence, options );
+			CHECK( plan.admit == ( distance > T / 2u ) );
+			CHECK( plan.targetNs == legacy.targetNs );
+			CHECK( plan.wakeNs == legacy.wakeNs );
+			CHECK( plan.phase == legacy.phase );
+			CHECK( plan.rawStrength == legacy.rawStrength );
+		}
+	}
 }
