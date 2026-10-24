@@ -1415,6 +1415,62 @@ static void test_push_constant_encoding()
 	}
 }
 
+static void test_accel_push_constants_keep_history_controls_independent()
+{
+	// Equal-valued controls conceal swaps. Exercise each control independently
+	// and in combination, while retaining the temporal coefficients.
+	for ( uint32_t flags = 0u; flags < 16u; flags++ )
+	{
+		const FramegenMotionAccelPush_t push(
+			1.25f, 0.125f, 0.625f, 8.0f, 0.25f, 0.5f, 0.75f,
+			( flags & 1u ) != 0u, ( flags & 2u ) != 0u,
+			( flags & 4u ) != 0u, ( flags & 8u ) != 0u, 0.875f, 0.375f );
+		CHECK( push.historyValid == ( ( flags & 1u ) != 0u ? 1.0f : 0.0f ) );
+		CHECK( push.guidedReconstruction == ( ( flags & 2u ) != 0u ? 1.0f : 0.0f ) );
+		CHECK( push.reservoirValid == ( ( flags & 4u ) != 0u ? 1.0f : 0.0f ) );
+		CHECK( push.shadingValid == ( ( flags & 8u ) != 0u ? 1.0f : 0.0f ) );
+		CHECK( push.historyFlowScale == 0.875f );
+		CHECK( push.accelTimeFactor == 0.375f );
+	}
+}
+
+static void test_net_push_constants_keep_causal_controls_enabled()
+{
+	const FramegenMotionNetPush_t push( 0.25f, false );
+	CHECK( push.mode == 0.25f );
+	CHECK( push.flowScale == 1.0f );
+	CHECK( push.confidenceRaiseScale == 1.0f );
+	CHECK( push.shadingScale == 1.0f );
+}
+
+static void test_refine_push_constants_keep_final_level_and_padding()
+{
+	for ( bool final : { false, true } )
+	{
+		const FramegenMotionRefinePush_t push( final );
+		CHECK( push.finalLevel == ( final ? 1 : 0 ) );
+		CHECK( push.pad0 == 0 );
+		CHECK( push.pad1 == 0 );
+		CHECK( push.pad2 == 0 );
+	}
+}
+
+static void test_stats_apply_push_constants_keep_detection_separate_from_trust()
+{
+	for ( bool detectOnly : { false, true } )
+	{
+		const FramegenMotionStatsApplyPush_t push( 0.125f, 0.875f, detectOnly );
+		CHECK( push.trustLo == 0.125f );
+		CHECK( push.trustHi == 0.875f );
+		CHECK( push.detectOnly == ( detectOnly ? 1u : 0u ) );
+		CHECK( push.sceneHistSection == 0.35f );
+		CHECK( push.sceneHistGlobal == 0.25f );
+		CHECK( push.sceneResid == 0.12f );
+		CHECK( push.sceneUnreliable == 0.55f );
+		CHECK( push.sceneMinSections == 7u );
+	}
+}
+
 static void test_query_ring_selection()
 {
 	using gamescope::framegen::select_query_ring_slot;
@@ -1699,6 +1755,10 @@ int main()
 	test_bidir_queue_ordering();
 	test_dispatch_policy();
 	test_push_constant_encoding();
+	test_accel_push_constants_keep_history_controls_independent();
+	test_net_push_constants_keep_causal_controls_enabled();
+	test_refine_push_constants_keep_final_level_and_padding();
+	test_stats_apply_push_constants_keep_detection_separate_from_trust();
 	test_query_ring_selection();
 	test_metrics_distribution();
 	test_metrics_moments_ignore_histogram_saturation();

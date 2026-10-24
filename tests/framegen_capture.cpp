@@ -5,6 +5,7 @@
 #include "framegen/color_probe.hpp"
 
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <csignal>
 #include <cmath>
@@ -335,6 +336,37 @@ TEST_CASE( "GSCF v3 preserves paired metadata and full precision bytes", "[frame
 		REQUIRE( read_file( path ) == expected );
 		std::filesystem::remove( path );
 	}
+}
+
+TEST_CASE( "GSCF should preserve full width frame identities and nanosecond epochs", "[framegen_capture]" )
+{
+	CaptureFiles files;
+	const auto path = files.directory / "epoch.gscf";
+	PaddedPlanes planes( { 8, 8, 8, 8 } );
+	const ColorCapture capture{
+		.width = 3, .height = 2, .drmFormat = 0x48344241, .bytesPerPixel = 8,
+		.eotf = 2, .sweep = 1,
+		.sequence = 0xfffffffffffffffeull,
+		.anchorId = 0x8000000000000010ull, .referenceId = 0x8000000000000011ull,
+		.endpointId = 0x8000000000000012ull,
+		.anchorTimeNs = 0xfffffffffffffc00ull, .referenceTimeNs = 0xfffffffffffffd00ull,
+		.endpointTimeNs = 0xffffffffffffff00ull,
+		.phase = std::bit_cast<float>( 0x3eaaaaabu ),
+		.strengths = { 0.0f, 0.375f, 0.875f },
+		.planes = planes.views,
+	};
+	AtomicOutputFile output( path );
+	CHECK( output.is_open() );
+	CHECK( write_color_capture( output, capture ) );
+	CHECK( output.commit() );
+	std::vector<uint8_t> expected;
+	append_words( expected, { 0x46435347, 3, 3, 2, 0x48344241, 8, 2, 3, 4, 1, 0, 0 }, 4 );
+	append_words( expected, { 0xfffffffffffffffeull, 0x8000000000000010ull,
+		0x8000000000000011ull, 0x8000000000000012ull, 0xfffffffffffffc00ull,
+		0xfffffffffffffd00ull, 0xffffffffffffff00ull, 0 }, 8 );
+	append_words( expected, { 0x3eaaaaab, 0, 0x3ec00000, 0x3f600000 }, 4 );
+	expected.insert( expected.end(), planes.payload.begin(), planes.payload.end() );
+	CHECK( read_file( path ) == expected );
 }
 
 TEST_CASE( "Invalid capture planes abandon publication and preserve the old file", "[framegen_capture]" )

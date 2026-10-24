@@ -4920,6 +4920,112 @@ TEST_CASE( "the bidir plan step moves D at once to protect and after a hold to r
 	}
 }
 
+TEST_CASE( "bidir catch-up should record ring pressure without presenting a second front",
+	"[framegen][deadline]" )
+{
+	constexpr uint64_t T = 10'000'000u;
+	constexpr size_t capacity = 6u;
+	constexpr uint64_t firstOpportunity = k_ulBidirWindowNs + 10u * T;
+	BidirTimelineState_t state;
+	std::vector<BidirQueueEntry_t> queue;
+	BidirEndpoint_t previous = step_real( 1u, firstOpportunity - 3u * T );
+	uint64_t consumed = 1u;
+	uint64_t lastFront = firstOpportunity - 2u * T;
+
+	const auto present = [&]( uint64_t opportunity ) {
+		const BidirPresenterView_t view = {
+			.opportunityNs = opportunity, .lastFrontOpportunityNs = lastFront,
+			.vblankIntervalNs = T, .capacity = capacity,
+		};
+		if ( !queue.empty() && bidir_front_action( bidir_front_inputs(
+			queue.front(), true, queue.size(), view ) ) == BidirFrontAction_t::Present )
+		{
+			CHECK_FALSE( bidir_front_forced( queue.front().targetNs, opportunity, T ) );
+			queue.erase( queue.begin() );
+			lastFront = opportunity;
+		}
+	};
+	const auto record = [&]( uint64_t recordNs, uint64_t opportunity ) {
+		const auto current = step_real( previous.realFrameId + 1u, recordNs );
+		auto in = step_inputs( queue, previous, current, opportunity, capacity );
+		in.presenter.vblankIntervalNs = T;
+		in.presenter.lastFrontOpportunityNs = lastFront;
+		in.wakeNs = opportunity - T / 3u;
+		in.nowNs = std::max( recordNs + 1u, opportunity - T / 4u );
+		in.consumedFrameId = consumed;
+		in.allowGeneration = false;
+		const auto step = plan_bidir_step( state, in );
+		state = step.state;
+		if ( step.reestablish == BidirReestablish_t::Shortened )
+			queue = step.retargeted;
+		std::erase_if( queue, [&]( const auto &entry ) {
+			return std::ranges::find( step.droppedRealIds, entry.realFrameId ) != step.droppedRealIds.end();
+		} );
+		CHECK_FALSE( step.previous.queue ); // the preceding real already entered the timeline
+		CHECK( step.admitted.empty() );
+		if ( step.current.queue )
+			queue.push_back( { BidirSlotKind_t::RealEndpoint, step.current.targetNs,
+				current.realFrameId, step.current.idealNs } );
+		else
+		{
+			CHECK( queue.empty() ); // only cold warmup may prime outside this queued trace
+			lastFront = opportunity;
+		}
+		previous = current;
+		consumed = current.realFrameId;
+		return step;
+	};
+
+	// Calibrate through public steps: a 50 Hz source, 100 Hz opportunities and
+	// pair latency 3T establish D=4T. Service intermediate presentation slots.
+	uint64_t opportunity = firstOpportunity;
+	for ( size_t i = 0u; i < k_ulBidirWindowNs / ( 2u * T ) + 5u; i++, opportunity += 2u * T )
+	{
+		if ( i != 0u ) present( opportunity - T );
+		const auto step = record( opportunity - T, opportunity );
+		CHECK( step.droppedRealIds.empty() );
+		present( opportunity );
+		CHECK( queue.size() <= capacity );
+	}
+	const uint64_t burstOpportunity = opportunity - T;
+	present( burstOpportunity );
+	REQUIRE( lastFront == burstOpportunity );
+	REQUIRE( queue.size() == 1u );
+	CHECK( state.epoch.delayNs == 4u * T );
+	const auto front = queue.front();
+	CHECK( front.targetNs == burstOpportunity + 2u * T );
+
+	// Five catch-up composites fill the ring after this opportunity showed a
+	// front. A sixth cannot drain another front to make room for its real.
+	for ( uint64_t i = 0u; i < 5u; i++ )
+	{
+		const auto step = record( burstOpportunity - T / 4u + i * ( T / 100u ), burstOpportunity );
+		CHECK( step.planned );
+		CHECK( step.droppedRealIds.empty() );
+	}
+	REQUIRE( queue.size() == capacity );
+	const auto newest = queue.back();
+	const auto overflow = record( burstOpportunity - T / 4u + 5u * ( T / 100u ), burstOpportunity );
+	CHECK( overflow.planned );
+	CHECK( overflow.reestablish == BidirReestablish_t::Kept );
+	CHECK_FALSE( overflow.backlogDropped );
+	CHECK( overflow.droppedRealIds == std::vector<uint64_t>{ newest.realFrameId } );
+	CHECK( overflow.state.epoch.delayNs == 4u * T );
+	CHECK( overflow.state.ringBound.overflowNs.back() == burstOpportunity );
+	CHECK( overflow.current.targetNs == burstOpportunity + 8u * T );
+	CHECK( queue.size() == capacity );
+	REQUIRE_FALSE( queue.empty() );
+	CHECK( queue.front().realFrameId == front.realFrameId );
+	CHECK( queue.front().targetNs == front.targetNs );
+	CHECK( queue.front().idealNs == front.idealNs );
+	const BidirPresenterView_t view = {
+		.opportunityNs = burstOpportunity, .lastFrontOpportunityNs = lastFront,
+		.vblankIntervalNs = T, .capacity = capacity,
+	};
+	CHECK( bidir_front_action( bidir_front_inputs( queue.front(), true,
+		queue.size(), view ) ) == BidirFrontAction_t::Wait );
+}
+
 TEST_CASE( "the bidir plan step drops reals only beyond what the display shows in time", "[framegen][deadline]" )
 {
 	constexpr uint64_t T = k_ulStepT;
@@ -5345,6 +5451,62 @@ TEST_CASE( "native commit lead keeps EMA warmup and lets override win",
 			habitual, aboveHabitual, marginNs, intervalNs );
 	STATIC_REQUIRE( capped.leadNs
 		== static_cast<uint64_t>( habitual.emaNs ) );
+}
+
+TEST_CASE( "native commit override should reserve the presentation margin at the refresh boundary",
+	"[framegen][deadline]" )
+{
+	constexpr PresentLeadState_t habitual = {
+		.emaNs = 5'000'000,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr MinimumViablePresentLeadState_t viable = {
+		.lowWaterNs = 1'000'000u,
+		.samples = k_uPresentLeadWarmupSamples,
+	};
+	constexpr uint64_t targetNs = 100'000'000u;
+	constexpr uint64_t intervalNs = 8'000'000u;
+	constexpr uint64_t marginNs = 800'000u;
+	const struct
+	{
+		uint64_t overrideNs, leadNs, advanceNs, deadlineNs;
+	} cases[] = {
+		{ 7'199'999u, 7'199'999u, 7'999'999u, 92'000'001u },
+		{ 7'200'000u, 7'200'000u, 8'000'000u, 92'000'000u },
+		{ 7'200'001u, 7'200'000u, 8'000'000u, 92'000'000u },
+		{ 12'000'000u, 7'200'000u, 8'000'000u, 92'000'000u },
+		{ UINT64_MAX, 7'200'000u, 8'000'000u, 92'000'000u },
+	};
+	for ( const auto &test : cases )
+	{
+		INFO( "override ns=" << test.overrideNs );
+		const auto selected = select_fixed_refresh_present_lead(
+			habitual, viable, marginNs, intervalNs, test.overrideNs );
+		CHECK( selected.ready );
+		CHECK( selected.overridden );
+		CHECK_FALSE( selected.learned );
+		CHECK( selected.leadNs == test.leadNs );
+		// Exercise the native overload, whose cap includes the margin, rather
+		// than the legacy EMA-only overload's one-vblank lead cap.
+		const auto plan = plan_fixed_refresh_commit( targetNs, habitual,
+			viable, marginNs, intervalNs, test.overrideNs );
+		CHECK( plan.earlyCommit );
+		CHECK( plan.overriddenLead );
+		CHECK_FALSE( plan.learnedLead );
+		CHECK( plan.presentLeadNs == test.leadNs );
+		CHECK( plan.advanceNs == test.advanceNs );
+		CHECK( plan.commitDeadlineNs == test.deadlineNs );
+	}
+
+	PresentLeadState_t warming = habitual;
+	warming.samples = k_uPresentLeadWarmupSamples - 1u;
+	const auto selected = select_fixed_refresh_present_lead(
+		warming, viable, marginNs, intervalNs, 12'000'000u );
+	CHECK_FALSE( selected.ready );
+	const auto plan = plan_fixed_refresh_commit( targetNs, warming,
+		viable, marginNs, intervalNs, 12'000'000u );
+	CHECK_FALSE( plan.earlyCommit );
+	CHECK( plan.commitDeadlineNs == 0u );
 }
 
 TEST_CASE( "fixed-refresh commit wake uses mature present lead and margin", "[framegen][deadline]" )
@@ -5913,6 +6075,35 @@ TEST_CASE( "deadline ladder recovery backoff caps and relaxes on probation",
 	CHECK( state.backoffDecisions
 		== k_uDeadlineRecoveryBaseBackoffDecisions );
 	CHECK( state.probationRemaining == 0u );
+}
+
+TEST_CASE( "failed recovery probation expiry should not relax backoff on the next success",
+	"[framegen][deadline][recovery]" )
+{
+	const RecoveryState_t lastProbationDecision = {
+		.streak = 7u,
+		.backoffDecisions = 360u,
+		.probationRemaining = 1u,
+		.decisionsSinceClimb = 224u,
+	};
+	const auto failed = note_ladder_recovery_failure( lastProbationDecision );
+	CHECK( failed.streak == 0u );
+	CHECK( failed.backoffDecisions == 360u );
+	CHECK( failed.probationRemaining == 0u );
+	CHECK( failed.decisionsSinceClimb == 225u );
+
+	// Expiry on a failed capacity decision cannot bank a reward for later.
+	const auto laterSuccess = advance_ladder_recovery_decision( failed, true );
+	CHECK( laterSuccess.streak == 0u );
+	CHECK( laterSuccess.backoffDecisions == 360u );
+	CHECK( laterSuccess.probationRemaining == 0u );
+	CHECK( laterSuccess.decisionsSinceClimb == 226u );
+
+	const auto survived = advance_ladder_recovery_decision( lastProbationDecision, true );
+	CHECK( survived.streak == 7u );
+	CHECK( survived.backoffDecisions == 180u );
+	CHECK( survived.probationRemaining == 0u );
+	CHECK( survived.decisionsSinceClimb == 225u );
 }
 
 TEST_CASE( "deadline ladder scene reset restores base recovery backoff",
