@@ -1,0 +1,13 @@
+{
+  "backend": "amd-vitis",
+  "python": "/REPLACE/ryzen-ai/venv/bin/python",
+  "runtime_tag": "REPLACE-with-SDK-XRT-driver-firmware-versions",
+  "environment": {
+    "XILINX_XRT": "/opt/xilinx/xrt",
+    "LD_LIBRARY_PATH": "/opt/xilinx/xrt/lib:/REPLACE/venv/lib/python3.12/site-packages/lnx64.o/tools/peano/lib:/REPLACE/venv/lib/python3.12/site-packages/flexml/flexml_extras/lib:/REPLACE/venv/lib/python3.12/site-packages/onnxruntime/capi:/REPLACE/venv/lib/python3.12/site-packages/voe/lib:/REPLACE/venv/lib/python3.12/site-packages/flexmlrt/lib"
+  },
+  "provider_options": {
+    "config_file": "/REPLACE/gamescope/tools/framegen-npu/amd-bf16.example.json"
+  },
+  "config_files": ["/REPLACE/gamescope/tools/framegen-npu/amd-bf16.example.json"]
+}

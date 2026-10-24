@@ -119,6 +119,10 @@ namespace gamescope
         // but don't want to expose HDR there as it is not good.
         bool bExposeHDRSupport = false;
         bool bAlwaysPatchEdid = false;
+        // Only drive a panel in HDR while an HDR app is running.
+        bool bContentDrivenHDR = false;
+        // Panel ignores hardware backlight control in PQ, follow it in software.
+        bool bSoftwareBacklight = false;
 
         // The output encoding to use for HDR output.
         // For typical HDR10 displays, this will be PQ.
@@ -146,13 +150,6 @@ namespace gamescope
             // If that assumption changes, update me.
             return bExposeHDRSupport && eOutputEncodingEOTF == EOTF_PQ;
         }
-    };
-
-    struct BackendMode
-    {
-        uint32_t uWidth;
-        uint32_t uHeight;
-        uint32_t uRefresh; // Hz
     };
 
     enum class FramegenPresentKind_t : uint8_t
@@ -229,6 +226,9 @@ namespace gamescope
         virtual BackendPresentFeedback& PresentationFeedback() = 0;
 
         virtual uint64_t GetVirtualConnectorKey() const = 0;
+
+        // A stand-in connector with no display behind it, e.g. the DRM headless virtual screen.
+        virtual bool IsHeadless() const { return false; }
 
         virtual INestedHints *GetNestedHints() = 0;
 
@@ -364,6 +364,9 @@ namespace gamescope
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) = 0;
 
         virtual bool UsesModifiers() const = 0;
+        // Whether compositor-owned presentation images need a DMA-BUF handoff.
+        // Keep native, Wayland and VR allocation policy unless a backend opts out.
+        virtual bool UsesDmabufForPresentation() const { return true; }
         virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const = 0;
 		inline bool SupportsFormat( uint32_t uDrmFormat ) const
 		{
@@ -386,9 +389,11 @@ namespace gamescope
 
         // Whether this backend actually presents compositor-generated frames.
         // Only backends that consume generated frames on their present path
-        // (DRM, nested Wayland) should return true; others must not, so frame
-        // generation never runs — and never imposes its forced-composite /
+        // (DRM, nested Wayland, SDL) should return true; others must not, so
+        // frame generation never runs — and never imposes its forced-composite /
         // no-VRR tax — where the generated frames would just be discarded.
+        // Headless and OpenVR keep false; the renderer logs once that
+        // --experimental-framegen is ignored.
         virtual bool SupportsFramegen() const { return false; }
 
         // Whether this backend owns the KMS commit/flip timing used to schedule
@@ -419,6 +424,8 @@ namespace gamescope
         virtual void HackUpdatePatchedEdid() = 0;
 
         virtual bool NeedsFrameSync() const = 0;
+        // Desktop-nested backends can pace a requested rate independently of host scanout.
+        virtual bool SupportsIndependentRefresh() const = 0;
 
         virtual TouchClickMode GetTouchClickMode() = 0;
 
@@ -433,8 +440,6 @@ namespace gamescope
         virtual void ForwardFramebuffer( std::shared_ptr<IBackendPlane> &pPlane, IBackendFb *pFramebuffer, const void *pData ) = 0;
 
         virtual bool NewlyInitted() = 0;
-
-        virtual bool ShouldFitWindows() = 0;
 
         virtual void OnEndFrame() = 0;
 
@@ -458,6 +463,7 @@ namespace gamescope
         virtual void HackUpdatePatchedEdid() override {}
 
         virtual bool NeedsFrameSync() const override;
+        virtual bool SupportsIndependentRefresh() const override { return false; }
 
         virtual TouchClickMode GetTouchClickMode() override;
 
@@ -472,8 +478,6 @@ namespace gamescope
         virtual void ForwardFramebuffer( std::shared_ptr<IBackendPlane> &pPlane, IBackendFb *pFramebuffer, const void *pData ) override {}
 
         virtual bool NewlyInitted() override { return false; }
-
-        virtual bool ShouldFitWindows() override { return true; }
 
         virtual void OnEndFrame() override {}
     };

@@ -13,14 +13,15 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <deque>
 #include <chrono>
 #include <cmath>
 #include <limits>
-#include <thread>
 #include <vector>
 #include <dlfcn.h>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
+#include "Utils/Defer.h"
 
 #if defined(__linux__)
 #include <sys/sysmacros.h>
@@ -44,18 +45,24 @@
 #include "main.hpp"
 #include "steamcompmgr.hpp"
 #include "vblankmanager.hpp"
+#include "framegen/vblank.hpp"
 #include "log.hpp"
 #include "Utils/FaultInjection.h"
 #include "Utils/Process.h"
 #include "Utils/SwapchainPolicy.h"
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
+#include "framegen/capture_file.hpp"
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
+#include "framegen/hud_history.hpp"
+#include "framegen/learning.hpp"
+#include "framegen/gpu_diagnostics.hpp"
 #include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
 #include "framegen/net_profile.hpp"
+#include "framegen/net_profile_io.hpp"
 #include "framegen/policy.hpp"
 #include "framegen/push_constants.hpp"
 #include "framegen/scheduling.hpp"
@@ -67,6 +74,7 @@
 #include "cs_composite_blur.h"
 #include "cs_composite_blur_cond.h"
 #include "cs_composite_rcas.h"
+#include "cs_composite_rcas_1px.h"
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
 #include "cs_framegen_blend.h"
@@ -95,6 +103,7 @@
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
 #include "cs_rgb_to_nv12.h"
+#include "cs_sgsr.h"
 
 #define A_CPU
 #include "shaders/ffx_a.h"
@@ -162,6 +171,14 @@ static T framegen_setting( const char *pszName, T nDefault, Parse parse, const c
 	return nDefault;
 }
 
+// GAMESCOPE_FRAMEGEN_* on/off switches: an invalid value keeps the default and
+// is logged once per name.
+bool framegen_bool_setting( const char *pszName, bool bDefault )
+{
+	return framegen_setting( pszName, bDefault, gamescope::framegen::parse_bool_setting,
+		bDefault ? "on" : "off" );
+}
+
 static uint32_t framegen_hud_level()
 {
 	static const uint32_t s_uLevel = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD", 0u,
@@ -171,6 +188,27 @@ static uint32_t framegen_hud_level()
 			return nValue && *nValue <= 2u ? nValue : std::nullopt;
 		} );
 	return s_uLevel;
+}
+
+// tests/framegen_deadline.cpp pins this body: the style goes through
+// framegen_setting (log-once) and the tested settings.hpp helpers only.
+static bool framegen_hud_cga()
+{
+	static const bool enabled = gamescope::framegen::framegen_hud_style_cga( framegen_setting(
+		"GAMESCOPE_FRAMEGEN_HUD_STYLE", gamescope::framegen::k_eFramegenHudStyleDefault,
+		gamescope::framegen::parse_hud_style_setting, gamescope::framegen::k_pszFramegenHudStyleDefault ) );
+	return enabled;
+}
+
+static uint32_t framegen_hud_opacity()
+{
+	static const uint32_t value = framegen_setting( "GAMESCOPE_FRAMEGEN_HUD_OPACITY", 101u,
+		[]( const char *text ) -> std::optional<uint32_t>
+		{
+			const auto parsed = gamescope::framegen::parse_uint32_setting( text, true );
+			return parsed && *parsed <= 100u ? parsed : std::nullopt;
+		}, "automatic (14% quiet / 36% CGA)" );
+	return value;
 }
 
 enum class FramegenHudCorner : uint32_t
@@ -189,9 +227,9 @@ static uint32_t framegen_hud_scale( uint32_t uOutputHeight )
 		{
 			const auto nValue = gamescope::framegen::parse_uint32_setting( pszValue, false );
 			return nValue && *nValue <= 6u ? nValue : std::nullopt;
-		}, "automatic scale (2-4, based on output height)" );
+		}, "automatic scale (2-3, based on output height)" );
 	return s_uOverride != 0u ? s_uOverride
-		: std::clamp( uOutputHeight / 720u, 2u, 4u );
+		: std::clamp( uOutputHeight / 720u, 2u, 3u );
 }
 
 static FramegenHudCorner framegen_hud_corner()
@@ -207,7 +245,9 @@ static FramegenHudCorner framegen_hud_corner()
 			return FramegenHudCorner::BottomLeft;
 		if ( pszCorner != nullptr && strcmp( pszCorner, "br" ) == 0 )
 			return FramegenHudCorner::BottomRight;
-		return FramegenHudCorner::BottomCenter;
+		if ( pszCorner != nullptr && strcmp( pszCorner, "bc" ) == 0 )
+			return FramegenHudCorner::BottomCenter;
+		return FramegenHudCorner::BottomRight;
 	}();
 	return s_eCorner;
 }
@@ -217,7 +257,7 @@ static constexpr size_t k_nFramegenHudPersistentBytes =
 	k_nFramegenHudUploadSlots * sizeof( gamescope::framegen::FramegenHudUniform_t );
 static constexpr size_t k_nFramegenHudPersistentPad =
 	( ( k_nFramegenHudPersistentBytes + 4095u ) / 4096u ) * 4096u;
-static_assert( k_nFramegenHudPersistentBytes == 3'168u );
+static_assert( k_nFramegenHudPersistentBytes == 3'296u );
 static_assert( k_nFramegenHudPersistentPad == 4'096u );
 static_assert( CVulkanDevice::upload_buffer_persistent_pad
 	>= k_nFramegenHudPersistentPad );
@@ -264,6 +304,18 @@ static bool framegen_backend_supported()
 {
 	return GetBackend() != nullptr && GetBackend()->SupportsFramegen();
 }
+
+static bool framegen_configured();
+using gamescope::framegen::FramegenDormantReason;
+// Runtime dormancy (see vulkan_framegen_update_dormancy). Both are written only
+// on the compositor thread; present-wait, page-flip and Wayland feedback threads
+// read them through vulkan_framegen_is_enabled(), hence atomics read relaxed.
+// The reason is published once per compositor iteration, so those threads never
+// touch g_uOutputRotation or the virtual-connector convar themselves.
+static std::atomic<FramegenDormantReason> g_eFramegenDormantReason = { FramegenDormantReason::NotDormant };
+// Set by a failed framegen-sized ring allocation and read directly, so the
+// default-size retry and the rest of that composite already run dormant.
+static std::atomic<bool> g_bFramegenRingAllocationFailed = { false };
 
 // True when the compositor owns the output image ring. On a Vulkan-swapchain
 // backend the "ring" IS the swapchain: g_output.nOutImage comes from
@@ -381,6 +433,8 @@ std::span<const uint64_t> GetSupportedSampleModifiers( uint32_t uDrmFormat )
 	return std::span<const uint64_t>{ iter->second.begin(), iter->second.end() };
 }
 
+// Debug verbosity turns the timestamp queries on, so log_composite_timing debug is the switch.
+static LogScope composite_timing_log("composite_timing");
 static void vk_errorf(VkResult result, const char *fmt, ...) {
 	static char buf[1024];
 	va_list args;
@@ -634,15 +688,30 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 	m_pendingFramegenCmdBufs.reserve( k_uInitialSubmissionCapacity );
 	m_framegenQuerySlotBySeqNo.reserve( k_uInitialSubmissionCapacity );
 
+	// Immutable conversion samplers require a valid converted image view even
+	// in slots the shader never samples. Initialize its layout once at startup.
+	CVulkanTexture::createFlags placeholderFlags;
+	placeholderFlags.bSampled = true;
+	placeholderFlags.bFramegenShared = true;
+	m_ycbcrPlaceholder = new CVulkanTexture();
+	if ( !m_ycbcrPlaceholder->BInit( 2, 2, 1, DRM_FORMAT_NV12, placeholderFlags ) )
+		return false;
+	auto placeholderCmd = commandBuffer();
+	if ( !placeholderCmd )
+		return false;
+	placeholderCmd->discardImage( m_ycbcrPlaceholder.get() );
+	placeholderCmd->insertBarrier();
+	submit( std::move( placeholderCmd ) );
+	waitIdle();
+
 	// Frame generation is opt-in, so pay its fixed pipeline creation cost at
 	// compositor startup instead of on the first generated frame. A lazy miss in
 	// pipeline() calls vkCreateComputePipelines on the compositor thread and is a
 	// visible first-use hitch, especially for the larger ML shaders.
-	if ( vulkan_framegen_is_enabled() )
+	if ( framegen_configured() )
 		compileFramegenPipelines();
 
-	std::thread piplelineThread([this](){compileAllPipelines();});
-	piplelineThread.detach();
+	m_pipelineThread = std::jthread([this](std::stop_token st){compileAllPipelines(st);});
 
 	g_reshadeManager.init(this);
 
@@ -801,6 +870,72 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 			std::snprintf( m_framegenOtherDeviceName.data(),
 				m_framegenOtherDeviceName.size(), "%s", otherProperties.deviceName );
 		}
+	}
+
+	// Capture bounded, read-only device metadata once; no Vulkan/DRM queries
+	// are made by diagnostics requests or the compositor's observation path.
+	{
+		gamescope::framegen::GpuDiagnostics inventory;
+		inventory.scope = GetBackend()->UsesVulkanSwapchain()
+			? "Nested swapchain: outer display GPU unknown"
+			: "Backend owns output: Vulkan compositor device shown";
+		inventory.build = gamescope::k_szGamescopeHudVersion;
+		std::vector<VkPhysicalDevice> diagnosticDevices{m_physDev};
+		for (auto physical : physDevs) if (physical!=m_physDev) diagnosticDevices.push_back(physical);
+		for (auto physical : diagnosticDevices) {
+			if (inventory.cards.size() >= 16u) break;
+			VkPhysicalDeviceProperties properties;
+			vk.GetPhysicalDeviceProperties(physical, &properties);
+			uint32_t count = 0;
+			vk.EnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+			std::vector<VkExtensionProperties> extensions(count);
+			vk.EnumerateDeviceExtensionProperties(physical, nullptr, &count, extensions.data());
+			auto supports = [&](const char *name) {
+				return std::any_of(extensions.begin(),extensions.end(),[&](const auto &ext) {
+					return std::strcmp(ext.extensionName,name)==0;
+				});
+			};
+			VkPhysicalDeviceProperties2 info{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+			VkPhysicalDeviceDriverProperties driver{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+			VkPhysicalDevicePCIBusInfoPropertiesEXT pci{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT };
+			VkPhysicalDeviceDrmPropertiesEXT drm{ .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT };
+			if (properties.apiVersion >= VK_API_VERSION_1_2 || supports(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+				driver.pNext=info.pNext; info.pNext=&driver;
+			}
+			if (supports(VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) { pci.pNext=info.pNext; info.pNext=&pci; }
+			if (supports(VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) { drm.pNext=info.pNext; info.pNext=&drm; }
+			vk.GetPhysicalDeviceProperties2(physical,&info);
+			gamescope::framegen::GpuCard card;
+			card.name=properties.deviceName; card.vendor=properties.vendorID; card.device=properties.deviceID;
+			card.software=properties.deviceType==VK_PHYSICAL_DEVICE_TYPE_CPU;
+			char value[128];
+			if (supports(VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) {
+				std::snprintf(value,sizeof(value),"%04x:%02x:%02x.%u",pci.pciDomain,pci.pciBus,pci.pciDevice,pci.pciFunction);
+				card.pci=value;
+			}
+#if HAVE_DRM
+			if (drm.hasRender) {
+				drmDevice *device=nullptr;
+				if (drmGetDeviceFromDevId(makedev(drm.renderMajor,drm.renderMinor),0,&device)==0) {
+					if (device->available_nodes & (1<<DRM_NODE_RENDER)) card.node=device->nodes[DRM_NODE_RENDER];
+					if (card.pci.empty() && device->bustype==DRM_BUS_PCI && device->businfo.pci) {
+						auto bus=device->businfo.pci;
+						std::snprintf(value,sizeof(value),"%04x:%02x:%02x.%u",bus->domain,bus->bus,bus->dev,bus->func);
+						card.pci=value;
+					}
+					drmFreeDevice(&device);
+				}
+			}
+#endif
+			if (driver.driverName[0]) {
+				card.driver=driver.driverName;
+				if (driver.driverInfo[0]) card.driver+=std::string(" / ")+driver.driverInfo;
+			}
+			else { std::snprintf(value,sizeof(value),"driver version 0x%x",properties.driverVersion); card.driver=value; }
+			if (physical==m_physDev) inventory.presenter=inventory.cards.size();
+			inventory.cards.push_back(std::move(card));
+		}
+		gamescope::framegen::gpu_diagnostics_store().initialize(std::move(inventory));
 	}
 
 	// Record how many queues the chosen compositor family exposes, so
@@ -1033,6 +1168,12 @@ bool CVulkanDevice::createDevice()
 		}
 	}
 
+	{
+		VkPhysicalDeviceProperties deviceProperties;
+		vk.GetPhysicalDeviceProperties( physDev(), &deviceProperties );
+		m_uVendorID = deviceProperties.vendorID;
+	}
+
 	// Queue 0 carries real composites; queue 1 is disposable speculative
 	// frame-generation work. Keep the latter at the lowest relative priority so
 	// a long motion pass cannot compete equally for compute/memory resources and
@@ -1053,8 +1194,10 @@ bool CVulkanDevice::createDevice()
 	// priorities above still favor real composites; the second queue also removes
 	// FIFO head-of-line blocking. Gated on framegen so a session that never uses
 	// it requests exactly the single REALTIME queue it did before.
-	const bool bWantFramegenQueue = g_bExperimentalFramegen && framegen_backend_supported()
-		&& m_framegenQueueFamily != ~0u && !env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE" ) );
+	const bool bFramegenBackend = g_bExperimentalFramegen && framegen_backend_supported();
+	const bool bSingleQueue = bFramegenBackend
+		&& framegen_bool_setting( "GAMESCOPE_FRAMEGEN_SINGLE_QUEUE", false );
+	const bool bWantFramegenQueue = bFramegenBackend && m_framegenQueueFamily != ~0u && !bSingleQueue;
 	if ( !bWantFramegenQueue )
 	{
 		m_framegenQueueFamily = ~0u;
@@ -1108,6 +1251,9 @@ bool CVulkanDevice::createDevice()
 
 		enabledExtensions.push_back( VK_KHR_PRESENT_ID_EXTENSION_NAME );
 		enabledExtensions.push_back( VK_KHR_PRESENT_WAIT_EXTENSION_NAME );
+
+		if ( supportsHDRMetadata )
+			enabledExtensions.push_back( VK_EXT_HDR_METADATA_EXTENSION_NAME );
 	}
 
 	if ( m_bSupportsModifiers )
@@ -1128,9 +1274,6 @@ bool CVulkanDevice::createDevice()
 #if 0
 	enabledExtensions.push_back( VK_KHR_MAINTENANCE_5_EXTENSION_NAME );
 #endif
-
-	if ( supportsHDRMetadata )
-		enabledExtensions.push_back( VK_EXT_HDR_METADATA_EXTENSION_NAME );
 
 	for ( auto& extension : GetBackend()->GetDeviceExtensions( physDev() ) )
 		enabledExtensions.push_back( extension );
@@ -1186,7 +1329,7 @@ bool CVulkanDevice::createDevice()
 
 	VkPhysicalDeviceFeatures2 features2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-		.pNext = &presentIdFeatures,
+		.pNext = GetBackend()->UsesVulkanSwapchain() ? static_cast<void *>( &presentIdFeatures ) : &features13,
 		.features = {
 			.shaderInt16 = m_bSupportsFp16,
 		},
@@ -1285,10 +1428,18 @@ bool CVulkanDevice::createDevice()
 			m_framegenQueueFamily = ~0u;
 		}
 	}
-	else if ( g_bExperimentalFramegen && framegen_backend_supported() )
+	else if ( bSingleQueue )
+	{
+		vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_SINGLE_QUEUE is set; generation shares the composite queue" );
+	}
+	else if ( bFramegenBackend )
 	{
 		vk_log.infof( "framegen: no dedicated queue (compositor family %u exposes %u queue(s), no other compute-capable family usable); generation shares the composite queue",
 			m_queueFamily, m_queueCount );
+	}
+	else if ( g_bExperimentalFramegen )
+	{
+		vk_log.infof( "framegen: --experimental-framegen ignored: this backend does not present generated frames" );
 	}
 
 	return true;
@@ -1581,7 +1732,15 @@ bool CVulkanDevice::createShaders()
 	SHADER(BLUR, cs_composite_blur);
 	SHADER(BLUR_COND, cs_composite_blur_cond);
 	SHADER(BLUR_FIRST_PASS, cs_gaussian_blur_horizontal);
-	SHADER(RCAS, cs_composite_rcas);
+	// The one pixel layout is only measured on Adreno, every other vendor keeps the quad swizzle.
+	if (m_uVendorID == 0x5143) /* Qualcomm */
+	{
+		SHADER(RCAS, cs_composite_rcas_1px);
+	}
+	else
+	{
+		SHADER(RCAS, cs_composite_rcas);
+	}
 	if (m_bSupportsFp16)
 	{
 		SHADER(EASU, cs_easu_fp16);
@@ -1593,6 +1752,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(NIS, cs_nis);
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
+	SHADER(SGSR, cs_sgsr);
 	SHADER(FRAMEGEN_BLEND, cs_framegen_blend);
 	SHADER(FRAMEGEN_EXTRAPOLATE, cs_framegen_extrapolate);
 	SHADER(FRAMEGEN_EXTRAPOLATE_DIRECT, cs_framegen_extrapolate_direct);
@@ -1614,6 +1774,7 @@ bool CVulkanDevice::createShaders()
 	SHADER(FRAMEGEN_MOTION_MATCH_REFINE, cs_framegen_motion_match_refine);
 	SHADER(FRAMEGEN_MOTION_FBCHECK, cs_framegen_motion_fbcheck);
 	SHADER(FRAMEGEN_MOTION_WARP, cs_framegen_motion_warp);
+	SHADER(FRAMEGEN_MOTION_WARP_SPATIAL, cs_framegen_motion_warp);
 	SHADER(FRAMEGEN_MOTION_WARP_ACCEL, cs_framegen_motion_warp_accel);
 	SHADER(FRAMEGEN_MOTION_BIDIR, cs_framegen_motion_bidir);
 	SHADER(FRAMEGEN_MOTION_BIDIR_TRACE, cs_framegen_motion_bidir);
@@ -1873,7 +2034,7 @@ VkSampler CVulkanDevice::sampler( SamplerState key )
 VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable)
 {
 	// Keep these IDs aligned with descriptor_set.h and the framegen shaders.
-	// Slot 6 is the bidir trace variant; ITM remains slot 7.
+	// Slot 6 selects the shader-specific framegen variant; ITM remains slot 7.
 	const std::array<VkSpecializationMapEntry, 8> specializationEntries = {{
 		{
 			.constantID = 0,
@@ -1935,7 +2096,8 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.blur_layer_count = blur_layer_count,
 		.colorspace_mask = colorspace_mask,
 		.output_eotf = output_eotf,
-		.endpoint_trace = type == SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
+		.endpoint_trace = type == SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE
+			|| type == SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL,
 		.itm_enable = itm_enable,
 	};
 
@@ -1969,7 +2131,7 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 	return result;
 }
 
-void CVulkanDevice::compileAllPipelines()
+void CVulkanDevice::compileAllPipelines(std::stop_token st)
 {
 	pthread_setname_np( pthread_self(), "gamescope-shdr" );
 
@@ -1982,6 +2144,7 @@ void CVulkanDevice::compileAllPipelines()
 		PipelineInfo_t{ SHADER_TYPE_EASU, 1, 1, 1 },
 		PipelineInfo_t{ SHADER_TYPE_NIS, 1, 1, 1 },
 		PipelineInfo_t{ SHADER_TYPE_RGB_TO_NV12, 1, 1, 1 },
+		PipelineInfo_t{ SHADER_TYPE_SGSR, 1, 1, 1 },
 	};
 
 	for (auto& info : pipelineInfos) {
@@ -1997,6 +2160,7 @@ void CVulkanDevice::compileAllPipelines()
 					{
 						std::lock_guard<std::mutex> lock(m_pipelineMutex);
 						PipelineInfo_t key = {info.shaderType, layerCount, ycbcrMask, blur_layers, info.compositeDebug};
+						if (st.stop_requested()) return;
 						auto result = m_pipelineMap.emplace(std::make_pair(key, newPipeline));
 						if (!result.second)
 							vk.DestroyPipeline(device(), newPipeline, nullptr);
@@ -2020,6 +2184,7 @@ void CVulkanDevice::compileFramegenPipelines()
 		SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
 		SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK,
 		SHADER_TYPE_FRAMEGEN_MOTION_WARP,
+		SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL,
 		SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL,
 		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
 		SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
@@ -2149,6 +2314,9 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	// This is the seq no of the command buffer we are going to submit.
 	const uint64_t nextSeqNo = lastSubmissionSeqNo + 1;
 
+	for ( uint32_t uIndex : cmdBuffer->GetUsedDescriptorSets() )
+		m_descriptorSetSeqNos[ uIndex ] = nextSeqNo;
+
 	static constexpr size_t k_uInlineSubmitSemaphores = 8;
 	const auto &externalSignals = cmdBuffer->GetExternalSignals();
 	const auto &externalWaits = cmdBuffer->GetExternalDependencies();
@@ -2178,12 +2346,11 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pWaitSemaphores[i] = externalWaits[i].pTimelineSemaphore->pVkSemaphore;
 		pWaitPoints[i] = externalWaits[i].ulPoint;
-		// TRANSFER is required as well as the shading stages: a non-device-local
-		// client import is first read by vkCmdCopyImage in the dual-gpu staging
-		// path (and in the ReShade pre-stage submission), so without it the
-		// transfer read may legally run before the client's acquire point is
-		// signalled and copy a stale or partially written image.
-		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+		// Dependencies are first consumed by compute or an import/staging copy.
+		// ReShade inherits client waits on its pre-stage copy, before its raster
+		// pass. Keep TRANSFER covered without adding a graphics-only stage to
+		// generated-frame waits that also reach this owner on compute-only queues.
+		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
@@ -2214,6 +2381,37 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	return nextSeqNo;
 }
 
+VkDescriptorSet CVulkanDevice::descriptorSet( CVulkanCmdBuffer *pCmdBuffer, bool bFramegen )
+{
+	// The framegen ring is never stamped: only shared-ring indexes may reach
+	// AddDescriptorSet (m_descriptorSetSeqNos is sized for the shared ring).
+	if ( bFramegen && !m_framegenDescriptorSets.empty() )
+	{
+		VkDescriptorSet ret = m_framegenDescriptorSets[m_currentFramegenDescriptorSet];
+		m_currentFramegenDescriptorSet = ( m_currentFramegenDescriptorSet + 1 ) % m_framegenDescriptorSets.size();
+		return ret;
+	}
+
+	const uint32_t uIndex = m_currentDescriptorSet;
+	m_currentDescriptorSet = ( m_currentDescriptorSet + 1 ) % m_descriptorSets.size();
+
+	// Not wait(), its ring reset would clobber constants this recording already uploaded.
+	// hasCompleted() answers from the completion cache first, so a long-retired set costs no syscall.
+	if ( const uint64_t ulSeqNo = m_descriptorSetSeqNos[ uIndex ]; ulSeqNo && !hasCompleted( ulSeqNo ) )
+	{
+		VkSemaphoreWaitInfo waitInfo = {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+			.semaphoreCount = 1,
+			.pSemaphores = &m_scratchTimelineSemaphore,
+			.pValues = &ulSeqNo,
+		};
+		vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
+	}
+
+	pCmdBuffer->AddDescriptorSet( uIndex );
+	return m_descriptorSets[ uIndex ];
+}
+
 uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
 {
 	uint64_t nextSeqNo = submitInternal(cmdBuffer.get());
@@ -2221,11 +2419,22 @@ uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
 	return nextSeqNo;
 }
 
+uint64_t CVulkanDevice::completedSeqNo()
+{
+	uint64_t ulSeqNo = 0;
+	vk_check( vk.GetSemaphoreCounterValue( device(), m_scratchTimelineSemaphore, &ulSeqNo ) );
+	return ulSeqNo;
+}
+
 void CVulkanDevice::garbageCollect( void )
 {
 	uint64_t currentSeqNo;
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 	cache_timeline_completion( m_submissionCompletedSeqNo, currentSeqNo );
+
+	// wait() only resets the ring on a latest-wait, which stale waits never are.
+	if ( currentSeqNo == m_submissionSeqNo )
+		m_uploadBufferOffset = 0;
 
 	resetCmdBuffers(currentSeqNo);
 }
@@ -2354,6 +2563,11 @@ void CVulkanCmdBuffer::AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTi
 	m_ExternalSignals.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
 }
 
+void CVulkanCmdBuffer::AddReleasePoint( std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint )
+{
+	m_releasePoints.emplace_back( std::move( pReleasePoint ) );
+}
+
 void CVulkanDevice::wait(uint64_t sequence, bool reset)
 {
 	if (m_submissionSeqNo == sequence)
@@ -2439,6 +2653,8 @@ void CVulkanCmdBuffer::reset()
 {
 	vk_check( m_device->vk.ResetCommandBuffer(m_cmdBuffer, 0) );
 	m_textureRefs.clear();
+	m_releasePoints.clear();
+	m_usedDescriptorSets.clear();
 	m_textureState.clear();
 
 	m_ExternalDependencies.clear();
@@ -2584,7 +2800,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	assert(m_target != nullptr);
 	emitPreDispatchBarriers();
 
-	VkDescriptorSet descriptorSet = m_device->descriptorSet( m_bFramegen );
+	VkDescriptorSet descriptorSet = m_device->descriptorSet( this, m_bFramegen );
 
 	std::array<VkWriteDescriptorSet, 7> writeDescriptorSets;
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> imageDescriptors = {};
@@ -2678,6 +2894,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		imageDescriptors[i].sampler = m_device->sampler(m_samplerState[i]);
 		imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		ycbcrImageDescriptors[i].imageView = m_device->m_ycbcrPlaceholder->linearView();
 		if (m_boundTextures[i] == nullptr)
 			continue;
 
@@ -2699,13 +2916,13 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		nearestState.bUnnormalized = false;
 
 		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
-		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
 		// I need to change this, it's so utterly stupid and confusing.
 		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
 
 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
-		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
 	}
 
@@ -2746,6 +2963,41 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 {
 	assert(src->width() == dst->width());
 	assert(src->height() == dst->height());
+
+	std::array<VkImageCopy, 2> regions = {{ {
+		.srcSubresource = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.layerCount = 1
+		},
+		.dstSubresource = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.layerCount = 1
+		},
+		.extent = {
+			.width = src->width(),
+			.height = src->height(),
+			.depth = 1
+		},
+	} }};
+	uint32_t nRegions = 1;
+	if ( src->isYcbcr() )
+	{
+		regions[0].srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+		regions[0].dstSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+		regions[1] = regions[0];
+		regions[1].srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+		regions[1].dstSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+		regions[1].extent.width = div_roundup( src->width(), 2u );
+		regions[1].extent.height = div_roundup( src->height(), 2u );
+		nRegions = 2;
+	}
+
+	copyImageRegions(std::move(src), std::move(dst), std::span<const VkImageCopy>(regions.data(), nRegions));
+}
+
+void CVulkanCmdBuffer::copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions)
+{
+	assert(src->format() == dst->format());
 	prepareSrcImage(src.get());
 	prepareDestImage(dst.get());
 	if ( !m_device->supportsSync2() )
@@ -2760,23 +3012,7 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 		emitSync2Barriers();
 	}
 
-	VkImageCopy region = {
-		.srcSubresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.layerCount = 1
-		},
-		.dstSubresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.layerCount = 1
-		},
-		.extent = {
-			.width = src->width(),
-			.height = src->height(),
-			.depth = 1
-		},
-	};
-
-	m_device->vk.CmdCopyImage(m_cmdBuffer, src->vkImage(), VK_IMAGE_LAYOUT_GENERAL, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+	m_device->vk.CmdCopyImage(m_cmdBuffer, src->vkImage(), VK_IMAGE_LAYOUT_GENERAL, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, uint32_t(regions.size()), regions.data());
 
 	markDirty(dst.get());
 	m_textureRefs.emplace_back(std::move(src));
@@ -2881,6 +3117,8 @@ void CVulkanCmdBuffer::emitExternalAcquireBarriers()
 		state.discarded = false;
 		state.dirty = false;
 		state.needsImport = false;
+		state.visibleReadStage = 0;
+		state.visibleReadAccess = 0;
 	}
 
 	if ( !m_imageBarriers.empty() )
@@ -2912,14 +3150,26 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 		const bool bHasPriorUse = state->lastAccess != 0;
 		const bool bWriteHazard = bHasPriorUse && state->bLastWasWrite;
 		const bool bReadToWriteHazard = bHasPriorUse && !state->bLastWasWrite && use.bWrite;
-		if ( state->discarded || bWriteHazard || bReadToWriteHazard )
+		const bool bReadScopeExpansion = !state->bLastWasWrite && !use.bWrite
+			&& state->visibleReadStage != 0
+			&& ( ( use.stage & ~state->visibleReadStage ) != 0
+				|| ( use.access & ~state->visibleReadAccess ) != 0 );
+		if ( state->discarded || bWriteHazard || bReadToWriteHazard || bReadScopeExpansion )
 		{
+			// Prior RAW/layout publication made the producer available, but only
+			// visible to its destination scope. Chain a new reader's visibility
+			// from the accumulated readers. Publish the whole stored rectangle:
+			// merely OR-ing metadata would falsely cover unbarriered stage/access pairs.
+			const VkPipelineStageFlags2 dstStage = bReadScopeExpansion
+				? state->visibleReadStage | use.stage : use.stage;
+			const VkAccessFlags2 dstAccess = bReadScopeExpansion
+				? state->visibleReadAccess | use.access : use.access;
 			m_imageBarriers2.push_back( VkImageMemoryBarrier2{
 				.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
 				.srcStageMask = state->discarded ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : state->lastStage,
 				.srcAccessMask = !state->discarded && bWriteHazard ? state->lastAccess : 0u,
-				.dstStageMask = use.stage,
-				.dstAccessMask = use.access,
+				.dstStageMask = dstStage,
+				.dstAccessMask = dstAccess,
 				.oldLayout = state->discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 				.newLayout = VK_IMAGE_LAYOUT_GENERAL,
 				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2927,6 +3177,11 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 				.image = use.pTexture->vkImage(),
 				.subresourceRange = subResRange,
 			} );
+			if ( !use.bWrite )
+			{
+				state->visibleReadStage = dstStage;
+				state->visibleReadAccess = dstAccess;
+			}
 		}
 	}
 
@@ -2948,7 +3203,8 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 		// A clean first use needs no barrier: submission order plus the producing
 		// command buffer's 3d951b7 flush barrier supplies cross-buffer visibility.
 		// Keep consecutive read stages accumulated so a later WAR waits on every
-		// outstanding reader even though read -> read itself needs no barrier.
+		// outstanding reader. Visibility of an internal producer is tracked
+		// separately: a new read scope can need a memory dependency too.
 		if ( bHasPriorUse && !state->bLastWasWrite && !use.bWrite )
 		{
 			state->lastStage |= use.stage;
@@ -2960,6 +3216,14 @@ void CVulkanCmdBuffer::emitSync2Barriers()
 			state->lastAccess = use.access;
 		}
 		state->bLastWasWrite = use.bWrite;
+		if ( use.bWrite )
+		{
+			state->visibleReadStage = 0;
+			state->visibleReadAccess = 0;
+		}
+		// Layout transitions write as well, even for a read-only first use.
+		// Their automatically available writes still need end-of-buffer visibility.
+		state->dirty = state->dirty || state->discarded;
 		state->discarded = false;
 		// Keep dirty latched: insertBarrier(true) must publish every image written
 		// in this buffer, including writes already consumed by a narrower RAW here.
@@ -3081,7 +3345,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 		// Same-queue submission order supplies execution order, not memory
 		// visibility, so dirty internal images need a destination scope at flush.
-		const bool bInternalFlush = flush && state.dirty && !isExport && !isPresent;
+		const bool bInternalFlush = flush && ( state.dirty || state.discarded ) && !isExport && !isPresent;
 
 		if (image->queueFamily == VK_QUEUE_FAMILY_IGNORED)
 			image->queueFamily = m_queueFamily;
@@ -3116,11 +3380,26 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		state.discarded = false;
 		state.dirty = false;
 		state.needsImport = false;
+		// This legacy barrier publishes every shader/transfer consumer scope.
+		state.visibleReadStage = 0;
+		state.visibleReadAccess = 0;
 	}
 
 	// TODO replace VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
 	m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 									0, 0, nullptr, 0, nullptr, m_imageBarriers.size(), m_imageBarriers.data());
+}
+
+void CVulkanCmdBuffer::hostReadBarrier()
+{
+	const VkMemoryBarrier barrier =
+	{
+		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	};
+	m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+									0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 CVulkanDevice g_device;
@@ -3152,17 +3431,19 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 	return true;
 }
 
-static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
+static VkResult getExternalImageFormatProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
 {
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
 		.drmFormatModifier = modifier,
 		.sharingMode = imageInfo->sharingMode,
+		.queueFamilyIndexCount = imageInfo->queueFamilyIndexCount,
+		.pQueueFamilyIndices = imageInfo->pQueueFamilyIndices,
 	};
 
 	VkPhysicalDeviceExternalImageFormatInfo externalImageFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-		.pNext = &modifierFormatInfo,
+		.pNext = modifier != DRM_FORMAT_MOD_INVALID ? &modifierFormatInfo : nullptr,
 		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 	};
 
@@ -3171,7 +3452,7 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 		.pNext = &externalImageFormatInfo,
 		.format = imageInfo->format,
 		.type = imageInfo->imageType,
-		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+		.tiling = modifier != DRM_FORMAT_MOD_INVALID ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT : imageInfo->tiling,
 		.usage = imageInfo->usage,
 		.flags = imageInfo->flags,
 	};
@@ -3190,6 +3471,39 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 	};
 
 	return g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, &imageProps);
+}
+
+static bool supportsNonModifierExport( const VkImageCreateInfo &imageInfo )
+{
+	VkExternalImageFormatProperties properties = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+	};
+	return getExternalImageFormatProps( &imageInfo, DRM_FORMAT_MOD_INVALID, &properties ) == VK_SUCCESS &&
+		( properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) &&
+		( properties.externalMemoryProperties.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT );
+}
+
+bool vulkan_supports_pipewire_dmabuf( uint32_t drmFormat )
+{
+	const auto flags = CVulkanTexture::createFlags::LinearCapture( true );
+	std::array<VkFormat, 2> formats = {
+		DRMFormatToVulkan( drmFormat, false ), DRMFormatToVulkan( drmFormat, true ),
+	};
+	VkImageFormatListCreateInfo formatList = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+		.viewFormatCount = uint32_t( formats.size() ),
+		.pViewFormats = formats.data(),
+	};
+	VkImageCreateInfo imageInfo = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.pNext = formats[0] != formats[1] ? &formatList : nullptr,
+		.flags = flags.imageCreateFlags( formats[0], formats[1] ),
+		.imageType = flags.imageType,
+		.format = formats[0],
+		.tiling = VK_IMAGE_TILING_LINEAR,
+		.usage = flags.imageUsage(),
+	};
+	return supportsNonModifierExport( imageInfo );
 }
 
 static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
@@ -3257,44 +3571,23 @@ void CVulkanTexture::setRenderOrigin( const char *origin )
 
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
+	if ( flags.bHostUpload && ( !flags.bMappable || !flags.bTransferSrc
+		|| flags.bExportable || flags.bFlippable || pDMA != nullptr
+		|| pExistingImageToReuseMemory != nullptr || pBackendFb != nullptr ) )
+		return false;
+	flags.bFlippable = flags.bFlippable && GetBackend()->UsesDmabufForPresentation();
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
 	m_renderOrigin = dmabuf_render_origin( pDMA );
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
 
 	VkImageTiling tiling = (flags.bMappable || flags.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
-	VkImageUsageFlags usage = 0;
+	VkImageUsageFlags usage = flags.imageUsage();
 	VkMemoryPropertyFlags properties;
-
-	if ( flags.bSampled == true )
-	{
-		usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-	}
-
-	if ( flags.bStorage == true )
-	{
-		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-	}
-
-	if ( flags.bColorAttachment == true )
-	{
-		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	}
 
 	if ( flags.bFlippable == true )
 	{
 		flags.bExportable = true;
-	}
-
-	if ( flags.bTransferSrc == true )
-	{
-		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	}
-	m_bTransferSrc = flags.bTransferSrc;
-
-	if ( flags.bTransferDst == true )
-	{
-		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	}
 
 	if ( flags.bMappable == true )
@@ -3372,6 +3665,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.sharingMode = nSharedQueueFamilyCount != 0 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
 		.queueFamilyIndexCount = nSharedQueueFamilyCount,
 		.pQueueFamilyIndices = nSharedQueueFamilyCount != 0 ? nSharedQueueFamilies : nullptr,
+		.initialLayout = flags.bHostUpload ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 
 	m_bConcurrentSharing = imageInfo.sharingMode == VK_SHARING_MODE_CONCURRENT;
@@ -3413,10 +3707,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.pViewFormats = formats.data(),
 	};
 
+	imageInfo.flags = flags.imageCreateFlags( formats[0], formats[1] );
 	if ( formats[0] != formats[1] )
 	{
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
-		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	}
 
 	if ( pDMA != nullptr )
@@ -3430,9 +3724,15 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
 		};
 
-		res = getModifierProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+		res = getExternalImageFormatProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+		if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED && flags.bTransferSrc )
+		{
+			flags.bTransferSrc = false;
+			imageInfo.usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+			res = getExternalImageFormatProps( &imageInfo, pDMA->modifier, &externalImageProperties );
+		}
 		if ( res != VK_SUCCESS && res != VK_ERROR_FORMAT_NOT_SUPPORTED ) {
-			vk_errorf( res, "getModifierProps failed" );
+			vk_errorf( res, "getExternalImageFormatProps failed" );
 			return false;
 		}
 
@@ -3516,25 +3816,40 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			numPossibleModifiers = modifiers.size();
 		}
 
-		for ( size_t i = 0; i < numPossibleModifiers; i++ )
+		auto CollectModifiers = [&]() -> bool
 		{
-			uint64_t modifier = possibleModifiers[i];
+			modifiers.clear();
+			for ( size_t i = 0; i < numPossibleModifiers; i++ )
+			{
+				uint64_t modifier = possibleModifiers[i];
 
-			VkExternalImageFormatProperties externalFormatProps = {
-				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
-			};
-			res = getModifierProps( &imageInfo, modifier, &externalFormatProps );
-			if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
-				continue;
-			else if ( res != VK_SUCCESS ) {
-				vk_errorf( res, "getModifierProps failed" );
-				return false;
+				VkExternalImageFormatProperties externalFormatProps = {
+					.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+				};
+				res = getExternalImageFormatProps( &imageInfo, modifier, &externalFormatProps );
+				if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
+					continue;
+				else if ( res != VK_SUCCESS ) {
+					vk_errorf( res, "getExternalImageFormatProps failed" );
+					return false;
+				}
+
+				if ( !( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
+					continue;
+
+				modifiers.push_back( modifier );
 			}
+			return true;
+		};
 
-			if ( !( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
-				continue;
-
-			modifiers.push_back( modifier );
+		if ( !CollectModifiers() )
+			return false;
+		if ( modifiers.empty() && flags.bTransferSrc )
+		{
+			flags.bTransferSrc = false;
+			imageInfo.usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+			if ( !CollectModifiers() )
+				return false;
 		}
 
 		assert( modifiers.size() > 0 );
@@ -3546,14 +3861,22 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			.pDrmFormatModifiers = modifiers.data(),
 		};
 
-		externalImageCreateInfo = {
-			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-			.pNext = std::exchange(imageInfo.pNext, &externalImageCreateInfo),
-			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-		};
-
 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 	}
+
+	if ( flags.bTransferSrc && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
+	{
+		VkFormatProperties formatProps = {};
+		g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), imageInfo.format, &formatProps );
+		const VkFormatFeatureFlags tilingFeatures = tiling == VK_IMAGE_TILING_LINEAR ? formatProps.linearTilingFeatures : formatProps.optimalTilingFeatures;
+		if ( !( tilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT ) )
+		{
+			flags.bTransferSrc = false;
+			imageInfo.usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		}
+	}
+
+	m_bTransferSrc = flags.bTransferSrc;
 
 	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
 	{
@@ -3565,7 +3888,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		};
 	}
 	
-	if ( pDMA != nullptr )
+	if ( pDMA != nullptr || flags.bExportable )
 	{
 		externalImageCreateInfo = {
 			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -3591,11 +3914,20 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	m_format = imageInfo.format;
 
+	// Preflight mapped capture exports without changing legacy scanout owners.
+	if ( flags.bMappable && !flags.bFlippable && flags.bExportable && pDMA == nullptr && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+		!supportsNonModifierExport( imageInfo ) )
+	{
+		vk_log.errorf( "dma-buf export is unsupported for DRM format 0x%" PRIX32 " with tiling %d", drmFormat, tiling );
+		return false;
+	}
+
 	res = g_device.vk.CreateImage(g_device.device(), &imageInfo, nullptr, &m_vkImage);
 	if (res != VK_SUCCESS) {
 		vk_errorf( res, "vkCreateImage failed" );
 		return false;
 	}
+	m_bOwnsImage = true;
 	
 	VkMemoryRequirements memRequirements;
 	g_device.vk.GetImageMemoryRequirements(g_device.device(), m_vkImage, &memRequirements);
@@ -3603,7 +3935,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkMemoryAllocateInfo allocInfo = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.allocationSize = memRequirements.size,
-		.memoryTypeIndex = uint32_t(g_device.findMemoryType(properties, memRequirements.memoryTypeBits)),
 	};
 
 	m_size = allocInfo.allocationSize;
@@ -3613,8 +3944,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	if ( pExistingImageToReuseMemory == nullptr )
 	{
 		// Possible pNexts
-		// fd = -1 so the failure path below can tell "never imported" from a real FD.
-		VkImportMemoryFdInfoKHR importMemoryInfo = { .fd = -1 };
+		VkImportMemoryFdInfoKHR importMemoryInfo = {};
 		VkExportMemoryAllocateInfo memory_export_info = {};
 		VkMemoryDedicatedAllocateInfo memory_dedicated_info = {};
 		struct wsi_memory_allocate_info memory_wsi_info = {};
@@ -3714,14 +4044,38 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 					.fd = fd,
 			};
 		}
+		else
+		{
+			// HOST_CACHED improves CPU readback, but is not required for mapping.
+			// Keep HOST_COHERENT: mapped callers do not flush or invalidate caches.
+			int32_t nMemoryTypeIndex = g_device.findMemoryType( properties, memRequirements.memoryTypeBits );
+			if ( nMemoryTypeIndex < 0 && flags.bMappable )
+			{
+				nMemoryTypeIndex = g_device.findMemoryType( properties & ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT, memRequirements.memoryTypeBits );
+				if ( nMemoryTypeIndex >= 0 )
+					vk_log.debugf( "host-cached image memory unavailable; using coherent memory type %d", nMemoryTypeIndex );
+			}
+			if ( nMemoryTypeIndex < 0 )
+			{
+				vk_errorf( VK_ERROR_FEATURE_NOT_PRESENT, "no compatible memory type for image allocation" );
+				g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
+				m_vkImage = VK_NULL_HANDLE;
+				m_bOwnsImage = false;
+				return false;
+			}
+			allocInfo.memoryTypeIndex = uint32_t( nMemoryTypeIndex );
+		}
 		
 		res = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &memoryHandle );
 		if ( res != VK_SUCCESS )
 		{
 			vk_errorf( res, "vkAllocateMemory failed" );
-			// Ownership of the dup'd FD only transfers on a successful import.
-			if ( importMemoryInfo.fd >= 0 )
+			if ( pDMA != nullptr )
+			{
+				// When import doesn't succeed, the driver hasn't taken ownership of the FD
+				// Close it so it doesn't become an FD leak
 				close( importMemoryInfo.fd );
+			}
 			return false;
 		}
 
@@ -3750,23 +4104,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	{
 		assert( tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT );
 		const VkImageSubresource image_subresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.aspectMask = isYcbcr() ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
 		};
 		VkSubresourceLayout image_layout;
 		g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &image_subresource, &image_layout);
 
 		m_unRowPitch = image_layout.rowPitch;
+		m_mappedOffset = image_layout.offset;
 
 		if (isYcbcr())
 		{
-			const VkImageSubresource lumaSubresource = {
-				.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT,
-			};
-			VkSubresourceLayout lumaLayout;
-			g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &lumaSubresource, &lumaLayout);
-
-			m_lumaOffset = lumaLayout.offset;
-			m_lumaPitch = lumaLayout.rowPitch;
+			m_lumaOffset = image_layout.offset;
+			m_lumaPitch = image_layout.rowPitch;
 
 			const VkImageSubresource chromaSubresource = {
 				.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT,
@@ -3857,7 +4206,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		else
 		{
 			const VkImageSubresource subresource = {
-				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.aspectMask = isYcbcr() ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
 			};
 			VkSubresourceLayout subresourceLayout = {};
 			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );
@@ -3886,8 +4235,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	if ( flags.bStorage || flags.bSampled || flags.bColorAttachment )
 	{
+		VkImageViewUsageCreateInfo viewUsageInfo = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+			.usage = imageInfo.usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
+		};
+		VkSamplerYcbcrConversionInfo conversionInfo = {
+			.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+			.pNext = &viewUsageInfo,
+			.conversion = g_device.ycbcrConversion(),
+		};
 		VkImageViewCreateInfo createInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.pNext = isYcbcr() ? &conversionInfo : nullptr,
 			.image = m_vkImage,
 			.viewType = VulkanImageTypeToViewType(flags.imageType),
 			.format = DRMFormatToVulkan(drmFormat, false),
@@ -3895,7 +4254,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
-				.a = bHasAlpha ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
+				.a = bHasAlpha || isYcbcr() ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE,
 			},
 			.subresourceRange = {
 				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -3904,19 +4263,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			},
 		};
 
-		res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
-		if ( res != VK_SUCCESS ) {
-			vk_errorf( res, "vkCreateImageView failed" );
-			return false;
+		if ( !isYcbcr() || flags.bSampled )
+		{
+			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_srgbView);
+			if ( res != VK_SUCCESS ) {
+				vk_errorf( res, "vkCreateImageView failed" );
+				return false;
+			}
 		}
 
 		if ( flags.bSampled )
 		{
-			VkImageViewUsageCreateInfo viewUsageInfo = {
-				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-				.usage = usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
-			};
-			createInfo.pNext = &viewUsageInfo;
+			createInfo.pNext = isYcbcr() ? static_cast<void *>( &conversionInfo ) : &viewUsageInfo;
 			createInfo.format = DRMFormatToVulkan(drmFormat, true);
 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_linearView);
 			if ( res != VK_SUCCESS ) {
@@ -3926,9 +4284,10 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		}
 
 
-		if ( isYcbcr() )
+		if ( isYcbcr() && flags.bStorage )
 		{
-			createInfo.pNext = NULL;
+			viewUsageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+			createInfo.pNext = &viewUsageInfo;
 			createInfo.format = VK_FORMAT_R8_UNORM;
 
 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
@@ -3938,7 +4297,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				return false;
 			}
 
-			createInfo.pNext = NULL;
 			createInfo.format = VK_FORMAT_R8G8_UNORM;
 			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
 			res = g_device.vk.CreateImageView(g_device.device(), &createInfo, nullptr, &m_chromaView);
@@ -3987,6 +4345,7 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
 {
 	m_drmFormat = VulkanFormatToDRM( format );
 	m_vkImage = image;
+	m_bOwnsImage = false;
 	m_vkImageMemory = VK_NULL_HANDLE;
 	m_width = width;
 	m_height = height;
@@ -4064,6 +4423,9 @@ gamescope::Rc<CVulkanTexture> CVulkanTexture::AcquireDeviceLocalStagingImage()
 	CVulkanTexture::createFlags flags;
 	flags.bSampled = true;
 	flags.bTransferDst = true;
+	// A copy source too: upstream's Xwayland blit merge (MergeBlitsOverOverride) copies from the base texture, which
+	// on the dual-GPU route is this staged image.
+	flags.bTransferSrc = true;
 	if ( !pTexture->BInit( m_width, m_height, m_depth, m_drmFormat, flags,
 			nullptr, m_contentWidth, m_contentHeight ) )
 	{
@@ -4133,50 +4495,32 @@ CVulkanTexture::~CVulkanTexture( void )
 		m_pMappedData = nullptr;
 	}
 
-	if ( m_srgbView != VK_NULL_HANDLE )
+	for ( VkImageView *pView : { &m_srgbView, &m_linearView, &m_lumaView, &m_chromaView } )
 	{
-		g_device.vk.DestroyImageView( g_device.device(), m_srgbView, nullptr );
-		m_srgbView = VK_NULL_HANDLE;
-	}
-
-	if ( m_linearView != VK_NULL_HANDLE )
-	{
-		g_device.vk.DestroyImageView( g_device.device(), m_linearView, nullptr );
-		m_linearView = VK_NULL_HANDLE;
+		if ( *pView != VK_NULL_HANDLE )
+		{
+			g_device.vk.DestroyImageView( g_device.device(), *pView, nullptr );
+			*pView = VK_NULL_HANDLE;
+		}
 	}
 
 	if ( m_pBackendFb != nullptr )
 		m_pBackendFb = nullptr;
 
+	if ( m_bOwnsImage && m_vkImage != VK_NULL_HANDLE )
+	{
+		g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
+		m_vkImage = VK_NULL_HANDLE;
+		m_bOwnsImage = false;
+	}
+
 	if ( m_vkImageMemory != VK_NULL_HANDLE )
 	{
-		if ( m_vkImage != VK_NULL_HANDLE )
-		{
-			g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
-			m_vkImage = VK_NULL_HANDLE;
-		}
-
 		g_device.vk.FreeMemory( g_device.device(), m_vkImageMemory, nullptr );
 		m_vkImageMemory = VK_NULL_HANDLE;
 	}
 
 	m_bInitialized = false;
-}
-
-int CVulkanTexture::memoryFence()
-{
-	const VkMemoryGetFdInfoKHR memory_get_fd_info = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-		.memory = m_vkImageMemory,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	int fence = -1;
-	VkResult res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &fence);
-	if ( res != VK_SUCCESS ) {
-		fprintf( stderr, "vkGetMemoryFdKHR failed\n" );
-	}
-
-	return fence;
 }
 
 static bool is_image_format_modifier_supported(VkFormat format, uint32_t drmFormat, uint64_t modifier)
@@ -4493,7 +4837,7 @@ static void framegen_publish_present_wait_tags( uint64_t ulUpToPresentId, uint64
 // Accepted by the driver, completion unmeasurable: presented, no timestamp.
 static void framegen_publish_presented_untimed( const gamescope::FramegenPresentTag_t &tag, uint64_t ulPresentId )
 {
-	vulkan_framegen_publish_present_feedback( tag, GetVBlankTimer().GetNextVBlank( 0 ), ulPresentId, true, false );
+	vulkan_framegen_publish_present_feedback( tag, framegen_next_vblank_ns(), ulPresentId, true, false );
 }
 
 // Retires every stored tag instead of orphaning it (which would leak
@@ -5056,10 +5400,10 @@ bool vulkan_present_to_window( void )
 // texture. A swapchain image cannot be blitted into — vulkan_make_swapchain
 // requests SAMPLED | STORAGE | TRANSFER_SRC, no TRANSFER_DST — so the generated,
 // already output-sized and output-encoded frame is written with a one-layer
-// compute composite instead. That is not a workaround: it is the identical
-// colour path a real frame takes, so HDR and colour management are preserved by
-// construction, and it is the only way to get the framegen HUD onto a generated
-// frame.
+// compute composite instead. Its source must pass through unchanged: colour
+// management and output encoding already ran in the late composite. Decoding
+// again would alternate brightness between real and generated frames. This
+// pass also draws the framegen HUD onto the generated frame.
 int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFrame, const struct FrameInfo_t *pPresentFrameInfo )
 {
 	if ( pFrame == nullptr || pPresentFrameInfo == nullptr )
@@ -5074,9 +5418,8 @@ int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFram
 	FrameInfo_t blitFrameInfo = {};
 	blitFrameInfo.applyOutputColorMgmt = false;   // pFrame already carries the output encoding
 	blitFrameInfo.outputEncodingEOTF = pPresentFrameInfo->outputEncodingEOTF;
-	blitFrameInfo.layerCount = 1;
-
-	FrameInfo_t::Layer_t *pBaseLayer = &blitFrameInfo.layers[ 0 ];
+	FrameInfo_t::Layer_t *pBaseLayer = blitFrameInfo.layers.push();
+	assert( pBaseLayer );
 	pBaseLayer->scale.x = 1.0;
 	pBaseLayer->scale.y = 1.0;
 	pBaseLayer->opacity = 1.0;
@@ -5086,8 +5429,7 @@ int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFram
 	pBaseLayer->applyColorMgmt = false;
 	pBaseLayer->filter = GamescopeUpscaleFilter::NEAREST;
 	pBaseLayer->ctm = nullptr;
-	pBaseLayer->colorspace = pPresentFrameInfo->outputEncodingEOTF == EOTF_PQ
-		? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+	pBaseLayer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
 
 	// pOutputOverride == the acquired swapchain image keeps this composite out of
 	// framegen_record_real_frame and off the ring index, exactly as
@@ -5098,11 +5440,10 @@ int vulkan_present_framegen_frame_to_window( gamescope::Rc<CVulkanTexture> pFram
 	if ( !oSeqNo )
 		return -EINVAL;
 
-	// Present first, wait after: the composite submit and the present both go to
-	// g_device.queue(), so the present is already ordered behind the blit and the
-	// wait is only for our own bookkeeping. Same ordering the real path uses.
-	const bool bPresented = vulkan_present_to_window();
+	// Complete the final composite and its present-layout transition before
+	// queueing presentation, as on the real-frame path.
 	vulkan_wait( *oSeqNo, true );
+	const bool bPresented = vulkan_present_to_window();
 	return bPresented ? 0 : -EAGAIN;
 }
 
@@ -5169,7 +5510,8 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_flat_texture( uint32_t width, 
 
 	gamescope::OwningRc<CVulkanTexture> texture = new CVulkanTexture();
 	bool bRes = texture->BInit( width, height, 1u, VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM ), flags );
-	assert( bRes );
+	if ( !bRes )
+		return nullptr;
 
 	auto [_dst, offset] = g_device.uploadBufferData( width * height * 4 );
 	uint8_t *dst = (uint8_t *)_dst;
@@ -5478,10 +5820,16 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 
 	uint32_t uDRMFormat = pOutput->uOutputFormat;
 
+	// Output images are physical-oriented; the panel scans out unrotated.
+	uint32_t uOutputWidth = g_nOutputWidth;
+	uint32_t uOutputHeight = g_nOutputHeight;
+	if ( g_uOutputRotation & 1u )
+		std::swap( uOutputWidth, uOutputHeight );
+
 	for ( uint32_t i = 0; i < nRing; i++ )
 	{
 		pOutput->outputImages[i] = new CVulkanTexture();
-		if ( !pOutput->outputImages[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags ) )
+		if ( !pOutput->outputImages[i]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags ) )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
 			return false;
@@ -5504,7 +5852,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		for ( uint32_t i = 0; i < nRing; i++ )
 		{
 			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
-			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[i].get() ) )
+			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[i].get() ) )
 			{
 				vk_log.errorf( "failed to allocate buffer for KMS" );
 				return false;
@@ -5515,6 +5863,50 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	return true;
 }
 
+// Without a swapchain the shared images are ours to make, so they wait for their first use.
+static bool vulkan_defer_output_images()
+{
+	return !GetBackend()->UsesVulkanSwapchain();
+}
+
+static bool vulkan_ensure_output_images()
+{
+	if ( !vulkan_defer_output_images() )
+		return true;
+
+	VulkanOutput_t *pOutput = &g_output;
+	if ( !pOutput->outputImages.empty() && pOutput->outputImages[0] )
+		return true;
+
+	vk_log.debugf( "Making the shared output images on first use" );
+	if ( vulkan_make_output_images( pOutput ) )
+		return true;
+
+	// A framegen-sized ring (8-12 images) that does not fit must not black out
+	// every composite: framegen goes dormant (ring_allocation) and the ring is
+	// retried exactly once at the default size. The flag holds until the next
+	// vulkan_remake_output_images(), the only retry of the larger ring.
+	const uint32_t nFailedRing = uint32_t( pOutput->outputImages.size() );
+	if ( nFailedRing > k_uOutputRingSizeDefault )
+	{
+		g_bFramegenRingAllocationFailed.store( true, std::memory_order_relaxed );
+		vk_log.infof( "framegen: dormant (ring_allocation): could not allocate the %u-image framegen output ring; using %u images",
+			nFailedRing, k_uOutputRingSizeDefault );
+		// Drop every partial allocation before the default-size retry.
+		pOutput->outputImages.clear();
+		pOutput->outputImagesPartialOverlay.clear();
+		pOutput->nOutImage = 0;
+		pOutput->nLastOutImage = 0;
+		if ( vulkan_make_output_images( pOutput ) )
+			return true;
+	}
+
+	// A half-made set would pass the check above, so the next use tries again from nothing.
+	pOutput->outputImages.clear();
+	pOutput->outputImagesPartialOverlay.clear();
+	return false;
+}
+
 bool vulkan_remake_output_images()
 {
 	if ( g_bVulkanOutputFailed )
@@ -5522,6 +5914,9 @@ bool vulkan_remake_output_images()
 	VulkanOutput_t *pOutput = &g_output;
 	g_device.waitIdle();
 	vulkan_framegen_reset( "output_images_remade" );
+	// A mode/HDR/rotation (or dormancy) remake is the only retry of a failed
+	// framegen-sized ring; creation is lazy, so the next composite tries it.
+	g_bFramegenRingAllocationFailed.store( false, std::memory_order_relaxed );
 
 	pOutput->nOutImage = 0;
 
@@ -5530,6 +5925,14 @@ bool vulkan_remake_output_images()
 		pScreenshotTexture = nullptr;
 	for (auto& pCaptureTexture : pOutput->pCaptureTextures)
 		pCaptureTexture = nullptr;
+
+	if ( vulkan_defer_output_images() )
+	{
+		pOutput->outputImages.clear();
+		pOutput->outputImagesPartialOverlay.clear();
+		pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+		return true;
+	}
 
 	bool bRet = vulkan_make_output_images( pOutput );
 	if ( !bRet )
@@ -5615,34 +6018,129 @@ bool vulkan_make_output()
 			return false;
 		}
 
-		if ( !vulkan_make_output_images( pOutput ) )
+		if ( vulkan_defer_output_images() )
+			pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+		else if ( !vulkan_make_output_images( pOutput ) )
 			return false;
 	}
 
 	return true;
 }
 
-static void update_tmp_images( uint32_t width, uint32_t height )
+static bool tmp_image_format_supported( uint32_t drmFormat )
+{
+	// The device is initialized once. Capability queries belong to that lifetime,
+	// not every composite or allocation retry.
+	static const auto formats = []
+	{
+		std::array<std::pair<uint32_t, bool>, 4> result = {{
+			{ DRM_FORMAT_ARGB8888, false },
+			{ DRM_FORMAT_ABGR8888, false },
+			{ DRM_FORMAT_ABGR2101010, false },
+			{ DRM_FORMAT_ABGR16161616F, false },
+		}};
+		VkPhysicalDeviceProperties deviceProperties = {};
+		g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &deviceProperties );
+		const auto &extensions = g_device.supportedExtensions();
+		const bool flags2 = deviceProperties.apiVersion >= VK_API_VERSION_1_3
+			|| std::any_of( extensions.begin(), extensions.end(), []( const auto &extension )
+			{
+				return std::strcmp( extension.extensionName, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME ) == 0;
+			} );
+		for ( auto &[drm, supported] : result )
+		{
+			const VkFormat format = DRMFormatToVulkan( drm, false );
+			const VkFormat srgbFormat = DRMFormatToVulkan( drm, true );
+			if ( format == VK_FORMAT_UNDEFINED || srgbFormat == VK_FORMAT_UNDEFINED )
+				continue;
+			VkFormatProperties3 extended = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+			VkFormatProperties2 properties = {
+				.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+				.pNext = flags2 ? &extended : nullptr,
+			};
+			g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &properties );
+			const VkFormatFeatureFlags2 features = flags2 ? extended.optimalTilingFeatures
+				: properties.formatProperties.optimalTilingFeatures;
+			constexpr VkFormatFeatureFlags2 required = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT
+				| VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+			// Device creation requires shaderStorageImageWriteWithoutFormat. Before
+			// flags2, its guarantee covers these listed storage formats, not BGRA8.
+			const bool legacyWrite = format == VK_FORMAT_R8G8B8A8_UNORM
+				|| format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_R16G16B16A16_SFLOAT;
+			const bool write = flags2 ? ( features & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT ) != 0 : legacyWrite;
+			supported = ( features & required ) == required && write;
+			if ( srgbFormat != format )
+			{
+				// BInit restricts the alternate sRGB view to sampled usage.
+				VkFormatProperties viewProperties = {};
+				g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), srgbFormat, &viewProperties );
+				constexpr VkFormatFeatureFlags viewRequired = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+					| VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+				supported = supported && ( viewProperties.optimalTilingFeatures & viewRequired ) == viewRequired;
+			}
+		}
+		return result;
+	}();
+	for ( const auto &[format, supported] : formats )
+		if ( format == drmFormat )
+			return supported;
+	return false;
+}
+
+static uint32_t tmp_image_format( GamescopeAppTextureColorspace colorspace )
+{
+	switch ( colorspace )
+	{
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB:
+			return DRM_FORMAT_ABGR16161616F;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ:
+			return DRM_FORMAT_ABGR2101010;
+		default:
+			// Both choices retain the SDR sRGB view. RGBA8 also has the legacy
+			// formatless-write guarantee when BGRA8 eligibility cannot be queried.
+			return tmp_image_format_supported( DRM_FORMAT_ARGB8888 )
+				? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888;
+	}
+}
+
+static bool update_tmp_images( uint32_t width, uint32_t height, uint32_t drmFormat )
 {
 	if ( g_output.tmpOutput != nullptr
 			&& width == g_output.tmpOutput->width()
-			&& height == g_output.tmpOutput->height() )
+			&& height == g_output.tmpOutput->height()
+			&& drmFormat == g_output.tmpOutput->drmFormat() )
 	{
-		return;
+		return true;
 	}
+	if ( !tmp_image_format_supported( drmFormat ) )
+		return false;
 
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bSampled = true;
 	createFlags.bStorage = true;
 
-	g_output.tmpOutput = new CVulkanTexture();
-	bool bSuccess = g_output.tmpOutput->BInit( width, height, 1u, DRM_FORMAT_ARGB8888, createFlags, nullptr );
-
-	if ( !bSuccess )
+	gamescope::OwningRc<CVulkanTexture> replacement = new CVulkanTexture();
+	if ( !replacement->BInit( width, height, 1u, drmFormat, createFlags, nullptr ) )
 	{
-		vk_log.errorf( "failed to create fsr output" );
-		return;
+		vk_log.errorf( "failed to create composite intermediate" );
+		return false;
 	}
+	// Already-recorded command buffers retain their own references to the old
+	// image. Publish only initialized replacements, without waiting for them.
+	g_output.tmpOutput = std::move( replacement );
+	return true;
+}
+
+bool vulkan_prepare_composite_intermediate( const FrameInfo_t *frameInfo )
+{
+	const bool upscale = frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 || frameInfo->useNISLayer0;
+	if ( !upscale && !frameInfo->blurLayer0 )
+		return true;
+	if ( frameInfo->layers.count() == 0 )
+		return false;
+	const auto &layer = frameInfo->layers.get( 0 );
+	return update_tmp_images( upscale ? layer.integerWidth() : currentOutputWidth,
+		upscale ? layer.integerHeight() : currentOutputHeight, tmp_image_format( layer.colorspace ) );
 }
 
 
@@ -5834,13 +6332,25 @@ void vulkan_garbage_collect( void )
 
 static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace )
 {
+	const uint32_t contentWidth = width;
+	const uint32_t contentHeight = height;
+	if ( drmFormat == DRM_FORMAT_NV12 )
+	{
+		// Preserve every content pixel and pad only the chroma alignment edge.
+		width = ( width + 1u ) & ~1u;
+		height = ( height + 1u ) & ~1u;
+	}
+	auto matches = [&]( CVulkanTexture *texture )
+	{
+		return texture->width() == width && texture->height() == height &&
+			texture->contentWidth() == contentWidth && texture->contentHeight() == contentHeight &&
+			texture->drmFormat() == drmFormat && texture->externalImage() == exportable &&
+			texture->streamColorspace() == colorspace;
+	};
 	for (auto& pTexture : pool)
 	{
 		// Evict a stale texture and reuse the slot
-		if (pTexture && pTexture->GetRefCount() == 0 &&
-			(width != pTexture->width() ||
-			 height != pTexture->height() ||
-			 drmFormat != pTexture->drmFormat()))
+		if (pTexture && pTexture->GetRefCount() == 0 && !matches( pTexture.get() ))
 		{
 			pTexture = nullptr;
 		}
@@ -5849,25 +6359,18 @@ static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_
 		{
 			pTexture = new CVulkanTexture();
 
-			CVulkanTexture::createFlags textureFlags;
-			textureFlags.bMappable = true;
-			textureFlags.bTransferDst = true;
-			textureFlags.bStorage = true;
-			if (exportable || drmFormat == DRM_FORMAT_NV12) {
-				textureFlags.bExportable = true;
-				textureFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+			auto textureFlags = CVulkanTexture::createFlags::LinearCapture( exportable );
+			textureFlags.bSampled = drmFormat != DRM_FORMAT_NV12; // RGB source for RGB-to-NV12 conversion
+
+			if ( !pTexture->BInit( width, height, 1u, drmFormat, textureFlags, nullptr, contentWidth, contentHeight ) )
+			{
+				pTexture = nullptr;
+				return nullptr;
 			}
-
-			bool bSuccess = pTexture->BInit( width, height, 1u, drmFormat, textureFlags );
 			pTexture->setStreamColorspace(colorspace);
-
-			assert( bSuccess );
 		}
 
-		if (pTexture->GetRefCount() != 0 ||
-			width != pTexture->width() ||
-			height != pTexture->height() ||
-			drmFormat != pTexture->drmFormat())
+		if (pTexture->GetRefCount() != 0 || !matches( pTexture.get() ))
 			continue;
 
 		return pTexture.get();
@@ -5890,6 +6393,25 @@ gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uin
 	if (!texture)
 		vk_log.errorf("Unable to acquire capture texture. Out of textures.");
 	return texture;
+}
+
+// XRGB2101010 storage images are an optional Vulkan feature that NVIDIA hardware
+// doesn't support, and imageStore lands in XBGR order there, swapping R/B.
+uint32_t vulkan_get_rgb10_capture_format( void )
+{
+	static uint32_t s_uFormat = []()
+	{
+		// Pooled capture textures are mappable, hence linear-tiled.
+		VkFormatProperties props;
+		g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), VK_FORMAT_A2R10G10B10_UNORM_PACK32, &props );
+		constexpr VkFormatFeatureFlags uNeeded = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+		if ( ( props.linearTilingFeatures & uNeeded ) == uNeeded )
+			return DRM_FORMAT_XRGB2101010;
+
+		vk_log.infof( "XRGB2101010 lacks linear storage/sampled support, capturing as XBGR2101010" );
+		return DRM_FORMAT_XBGR2101010;
+	}();
+	return s_uFormat;
 }
 
 // Internal display's native brightness.
@@ -5917,20 +6439,27 @@ struct BlitPushData_t
     float u_itmSdrNits; // unset
     float u_itmTargetNits; // unset
 
-	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo)
+	uint32_t u_rotation;
+	vec2_t textureSize[k_nMaxLayers] = {};
+
+	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo, uint32_t rotation = 0)
 	{
 		u_shaderFilter = 0;
 		u_alphaMode = 0;
+		u_rotation = rotation;
 
-		for (int i = 0; i < frameInfo->layerCount; i++) {
-			const FrameInfo_t::Layer_t *layer = &frameInfo->layers[i];
+		for (int i = 0; i < frameInfo->layers.count(); i++) {
+			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
+			textureSize[i] = { float( layer->tex->width() ), float( layer->tex->height() ) };
 			scale[i] = layer->scale;
 			offset[i] = layer->offsetPixelCenter();
 			opacity[i] = layer->opacity;
-            if (layer->isScreenSize() || (layer->filter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
+            // SGSR only exists as a pre-pass, a layer still carrying it samples as linear.
+            GamescopeUpscaleFilter eFilter = layer->filter == GamescopeUpscaleFilter::SGSR ? GamescopeUpscaleFilter::LINEAR : layer->filter;
+            if (layer->isScreenSize() || (eFilter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
                 u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
             else
-                u_shaderFilter |= ((uint32_t)layer->filter) << (i * 4);
+                u_shaderFilter |= ((uint32_t)eFilter) << (i * 4);
 
 			u_alphaMode |= ((uint32_t)layer->eAlphaBlendingMode) << ( i * 4 );
 
@@ -5965,6 +6494,7 @@ struct BlitPushData_t
 		opacity[0] = 1.0f;
         u_shaderFilter = (uint32_t)GamescopeUpscaleFilter::LINEAR;
 		u_alphaMode = 0;
+		u_rotation = 0;
 		ctm[0] = glm::mat3x4
 		{
 			1, 0, 0, 0,
@@ -5980,6 +6510,10 @@ struct BlitPushData_t
 		u_itmTargetNits = g_flHDRItmTargetNits;
 	}
 };
+
+// Scalar GLSL layout in blit_push_data.h, including the appended vec2 array.
+static_assert( offsetof( BlitPushData_t, textureSize ) == 68 * k_nMaxLayers + 40 );
+static_assert( sizeof( BlitPushData_t ) == 76 * k_nMaxLayers + 40 );
 
 struct CaptureConvertBlitData_t
 {
@@ -6032,6 +6566,17 @@ struct EasuPushData_t
 	}
 };
 
+struct SgsrPushData_t
+{
+	uint32_t u_width;
+	uint32_t u_height;
+
+	SgsrPushData_t(uint32_t tempX, uint32_t tempY)
+		: u_width(tempX), u_height(tempY)
+	{
+	}
+};
+
 struct RcasPushData_t
 {
 	uvec2_t u_layer0Offset;
@@ -6051,26 +6596,32 @@ struct RcasPushData_t
     float u_itmSdrNits; // unset
     float u_itmTargetNits; // unset
 
-	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness)
+	uint32_t u_rotation;
+	vec2_t textureSize[k_nMaxLayers] = {};
+
+	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness, uint32_t rotation = 0)
 	{
 		uvec4_t tmp;
 		FsrRcasCon(&tmp.x, sharpness);
-		u_layer0Offset.x = uint32_t(int32_t(frameInfo->layers[0].offset.x));
-		u_layer0Offset.y = uint32_t(int32_t(frameInfo->layers[0].offset.y));
+		u_rotation = rotation;
+		u_layer0Offset.x = uint32_t(int32_t(frameInfo->layers.get( 0 ).offset.x));
+		u_layer0Offset.y = uint32_t(int32_t(frameInfo->layers.get( 0 ).offset.y));
 		u_borderMask = frameInfo->borderMask() >> 1u;
 		u_frameId = s_frameId++;
 		u_c1 = tmp.x;
 		u_shaderFilter = 0;
 		u_alphaMode = 0;
 
-		for (int i = 0; i < frameInfo->layerCount; i++)
+		for (int i = 0; i < frameInfo->layers.count(); i++)
 		{
-			const FrameInfo_t::Layer_t *layer = &frameInfo->layers[i];
+			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
 
-            if (i == 0 || layer->isScreenSize() || (layer->filter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
+			textureSize[i] = { float( layer->tex->width() ), float( layer->tex->height() ) };
+            GamescopeUpscaleFilter eFilter = layer->filter == GamescopeUpscaleFilter::SGSR ? GamescopeUpscaleFilter::LINEAR : layer->filter;
+            if (i == 0 || layer->isScreenSize() || (eFilter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
                 u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
             else
-                u_shaderFilter |= ((uint32_t)layer->filter) << (i * 4);
+                u_shaderFilter |= ((uint32_t)eFilter) << (i * 4);
 
 			u_alphaMode |= ((uint32_t)layer->eAlphaBlendingMode) << ( i * 4 );
 
@@ -6088,7 +6639,7 @@ struct RcasPushData_t
 				};
 			}
 
-			u_opacity[i] = frameInfo->layers[i].opacity;
+			u_opacity[i] = frameInfo->layers.get( i ).opacity;
 		}
 
 		u_linearToNits = g_flInternalDisplayBrightnessNits;
@@ -6096,13 +6647,17 @@ struct RcasPushData_t
 		u_itmSdrNits = g_flHDRItmSdrNits;
 		u_itmTargetNits = g_flHDRItmTargetNits;
 
-		for (uint32_t i = 1; i < k_nMaxLayers; i++)
+		for (int i = 1; i < frameInfo->layers.count(); i++)
 		{
-			u_scale[i - 1] = frameInfo->layers[i].scale;
-			u_offset[i - 1] = frameInfo->layers[i].offsetPixelCenter();
+			u_scale[i - 1] = frameInfo->layers.get( i ).scale;
+			u_offset[i - 1] = frameInfo->layers.get( i ).offsetPixelCenter();
 		}
 	}
 };
+
+// Scalar GLSL layout shared by cs_composite_rcas{,_1px}.comp.
+static_assert( offsetof( RcasPushData_t, textureSize ) == 68 * k_nMaxLayers + 32 );
+static_assert( sizeof( RcasPushData_t ) == 76 * k_nMaxLayers + 32 );
 
 struct NisPushData_t
 {
@@ -6124,9 +6679,9 @@ struct NisPushData_t
 
 void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *frameInfo)
 {
-	for ( int i = 0; i < frameInfo->layerCount; i++ )
+	for ( int i = 0; i < frameInfo->layers.count(); i++ )
 	{
-		const FrameInfo_t::Layer_t *layer = &frameInfo->layers[i];
+		const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
 
 		bool nearest = layer->isScreenSize()
                     || layer->filter == GamescopeUpscaleFilter::NEAREST
@@ -6137,7 +6692,7 @@ void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *fram
 		cmdBuffer->setSamplerNearest(i, nearest);
 		cmdBuffer->setSamplerUnnormalized(i, true);
 	}
-	for (uint32_t i = frameInfo->layerCount; i < VKR_SAMPLER_SLOTS; i++)
+	for (uint32_t i = frameInfo->layers.count(); i < VKR_SAMPLER_SLOTS; i++)
 	{
 		cmdBuffer->bindTexture(i, nullptr);
 	}
@@ -6154,7 +6709,7 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
 
-	cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layerCount, frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
+	cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
 	bind_all_layers(cmdBuffer.get(), frameInfo);
 	cmdBuffer->bindTarget(pScreenshotTexture);
 	cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
@@ -6165,7 +6720,7 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 
 	if ( pYUVOutTexture != nullptr )
 	{
-		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->width();
+		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->contentWidth();
 
 		CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pYUVOutTexture->streamColorspace() ) );
 		constants.halfExtent[0] = pYUVOutTexture->width() / 2.0f;
@@ -6201,23 +6756,198 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 extern std::string g_reshade_effect;
 extern uint32_t g_reshade_technique_idx;
 
+// GPU timestamps around each composite, read back a few submits later and
+// averaged per filter so a diagnostic never stalls the queue.
+namespace
+{
+	struct CompositeTiming_t
+	{
+		static constexpr uint32_t k_uSlots = 64;
+
+		struct Pending_t
+		{
+			uint32_t uSlot;
+			const char *pszKey;
+			// Set when a middle timestamp splits the two upscale passes.
+			const char *pszKeyPre;
+			const char *pszKeyPost;
+			// A reused slot reports the previous use as available until its
+			// reset executes, so results are only read once the submit is done.
+			uint64_t ulSeqNo;
+		};
+
+		struct Accum_t
+		{
+			double flTotalNs = 0.0;
+			uint32_t uCount = 0;
+		};
+
+		VkQueryPool pool = VK_NULL_HANDLE;
+		float flPeriodNs = 0.0f;
+		uint64_t ulValidMask = ~0ull;
+		bool bUnsupported = false;
+		uint32_t uNextSlot = 0;
+		std::deque<Pending_t> pending;
+		bool bMidWritten[ k_uSlots ] = {};
+		std::unordered_map<const char *, Accum_t> accum;
+		uint64_t ulLastReportNs = 0;
+	};
+
+	CompositeTiming_t g_CompositeTiming;
+
+	const char *UpscaleFilterName( GamescopeUpscaleFilter eFilter )
+	{
+		switch ( eFilter )
+		{
+			case GamescopeUpscaleFilter::LINEAR:  return "linear";
+			case GamescopeUpscaleFilter::NEAREST: return "nearest";
+			case GamescopeUpscaleFilter::FSR:     return "fsr";
+			case GamescopeUpscaleFilter::NIS:     return "nis";
+			case GamescopeUpscaleFilter::PIXEL:   return "pixel";
+			case GamescopeUpscaleFilter::SGSR:    return "sgsr";
+			default:                              return "view";
+		}
+	}
+
+	bool CompositeTimingInit()
+	{
+		CompositeTiming_t &t = g_CompositeTiming;
+		if ( t.pool != VK_NULL_HANDLE || t.bUnsupported )
+			return t.pool != VK_NULL_HANDLE;
+
+		uint32_t uFamilyCount = 0;
+		g_device.vk.GetPhysicalDeviceQueueFamilyProperties( g_device.physDev(), &uFamilyCount, nullptr );
+		std::vector<VkQueueFamilyProperties> families( uFamilyCount );
+		g_device.vk.GetPhysicalDeviceQueueFamilyProperties( g_device.physDev(), &uFamilyCount, families.data() );
+		if ( g_device.queueFamily() >= uFamilyCount || families[ g_device.queueFamily() ].timestampValidBits == 0 )
+		{
+			composite_timing_log.errorf( "queue family %u has no timestamp support", g_device.queueFamily() );
+			t.bUnsupported = true;
+			return false;
+		}
+
+		const uint32_t uValidBits = families[ g_device.queueFamily() ].timestampValidBits;
+		t.ulValidMask = uValidBits >= 64 ? ~0ull : ( ( 1ull << uValidBits ) - 1 );
+
+		VkPhysicalDeviceProperties props;
+		g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &props );
+		t.flPeriodNs = props.limits.timestampPeriod;
+
+		VkQueryPoolCreateInfo createInfo =
+		{
+			.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+			.queryType = VK_QUERY_TYPE_TIMESTAMP,
+			.queryCount = CompositeTiming_t::k_uSlots * 3,
+		};
+		VkResult res = g_device.vk.CreateQueryPool( g_device.device(), &createInfo, nullptr, &t.pool );
+		if ( res != VK_SUCCESS )
+		{
+			vk_errorf( res, "composite_timing: vkCreateQueryPool failed" );
+			t.bUnsupported = true;
+			return false;
+		}
+		return true;
+	}
+
+	void CompositeTimingDrain()
+	{
+		CompositeTiming_t &t = g_CompositeTiming;
+		while ( !t.pending.empty() )
+		{
+			const CompositeTiming_t::Pending_t &p = t.pending.front();
+			if ( p.ulSeqNo == 0 || p.ulSeqNo > g_device.completedSeqNo() )
+				break;
+			// Value then availability per query, 64-bit, begin/mid/end.
+			const uint32_t uCount = p.pszKeyPre ? 3 : 2;
+			const uint32_t uEnd = p.pszKeyPre ? 2 : 1;
+			uint64_t ulResults[ 6 ] = {};
+			VkResult res = g_device.vk.GetQueryPoolResults( g_device.device(), t.pool, p.uSlot * 3, uCount, sizeof( ulResults ), ulResults, sizeof( uint64_t ) * 2,
+				VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT );
+			if ( res != VK_SUCCESS || !ulResults[ 1 ] || !ulResults[ uEnd * 2 + 1 ] )
+				break;
+
+			auto Add = [&]( const char *pszKey, uint64_t ulFrom, uint64_t ulTo )
+			{
+				CompositeTiming_t::Accum_t &a = t.accum[ pszKey ];
+				a.flTotalNs += double( ( ulTo - ulFrom ) & t.ulValidMask ) * t.flPeriodNs;
+				a.uCount++;
+			};
+			Add( p.pszKey, ulResults[ 0 ], ulResults[ uEnd * 2 ] );
+			if ( p.pszKeyPre )
+			{
+				Add( p.pszKeyPre, ulResults[ 0 ], ulResults[ 2 ] );
+				Add( p.pszKeyPost, ulResults[ 2 ], ulResults[ 4 ] );
+			}
+			t.pending.pop_front();
+		}
+
+		const uint64_t ulNow = get_time_in_nanos();
+		if ( ulNow - t.ulLastReportNs < 2'000'000'000ull )
+			return;
+		t.ulLastReportNs = ulNow;
+		for ( auto &[ pszKey, a ] : t.accum )
+		{
+			if ( a.uCount )
+				composite_timing_log.debugf( "%s %.0f us avg over %u", pszKey, a.flTotalNs / a.uCount / 1000.0, a.uCount );
+			a = {};
+		}
+	}
+
+	// Returns the slot whose end timestamp the caller writes before submit.
+	std::optional<uint32_t> CompositeTimingBegin( CVulkanCmdBuffer *pCmdBuffer )
+	{
+		if ( !composite_timing_log.Enabled( LOG_DEBUG ) || !CompositeTimingInit() )
+			return std::nullopt;
+
+		CompositeTiming_t &t = g_CompositeTiming;
+		CompositeTimingDrain();
+		if ( t.pending.size() >= CompositeTiming_t::k_uSlots )
+			return std::nullopt;
+
+		const uint32_t uSlot = t.uNextSlot;
+		t.uNextSlot = ( t.uNextSlot + 1 ) % CompositeTiming_t::k_uSlots;
+		t.bMidWritten[ uSlot ] = false;
+		g_device.vk.CmdResetQueryPool( pCmdBuffer->rawBuffer(), t.pool, uSlot * 3, 3 );
+		// Bottom of pipe so the first timestamp lands after earlier submissions drain.
+		g_device.vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, t.pool, uSlot * 3 );
+		return uSlot;
+	}
+
+	// Between the upscale pre-pass and the composite that follows it.
+	void CompositeTimingMid( CVulkanCmdBuffer *pCmdBuffer, uint32_t uSlot )
+	{
+		CompositeTiming_t &t = g_CompositeTiming;
+		g_device.vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, t.pool, uSlot * 3 + 1 );
+		t.bMidWritten[ uSlot ] = true;
+	}
+
+	void CompositeTimingEnd( CVulkanCmdBuffer *pCmdBuffer, uint32_t uSlot, const char *pszKey, const char *pszKeyPre, const char *pszKeyPost )
+	{
+		CompositeTiming_t &t = g_CompositeTiming;
+		const bool bMid = t.bMidWritten[ uSlot ];
+		g_device.vk.CmdWriteTimestamp( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, t.pool, uSlot * 3 + ( bMid ? 2 : 1 ) );
+		t.pending.push_back( { uSlot, pszKey, bMid ? pszKeyPre : nullptr, bMid ? pszKeyPost : nullptr, 0 } );
+	}
+}
+
 ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
 // Motion-estimation intermediates (low-resolution luma pyramids and the motion
 // field). Allocated lazily by the motion dispatch, released on framegen reset.
-// The matcher runs coarse-to-fine over three pyramid levels: full search only
-// at the smallest, +/-1 seeded refinement below it (framegen_prepare_motion).
+// The matcher runs coarse-to-fine from the field's scale down to /32: full
+// search only at /32, +/-1 seeded refinement below it (framegen_prepare_motion).
 struct FramegenMotionResources_t
 {
 	// Finest (base low-res) level: what the warp's field scale is keyed to.
 	gamescope::OwningRc<CVulkanTexture> lumaPrev;
 	gamescope::OwningRc<CVulkanTexture> lumaCur;
 	gamescope::OwningRc<CVulkanTexture> mvField;
-	// Coarser levels, each a further 2x box downscale: [0] = /2, [1] = /4 of
-	// the base low-res grid, with an intermediate motion field per level.
-	gamescope::OwningRc<CVulkanTexture> lumaPrevCoarse[2];
-	gamescope::OwningRc<CVulkanTexture> lumaCurCoarse[2];
-	gamescope::OwningRc<CVulkanTexture> mvFieldCoarse[2];
+	// Coarser levels, each a further 2x box downscale of the one before ([0] =
+	// /2 of the base grid), down to /32 of the output; an intermediate motion
+	// field per level. motion_coarse_levels() of them are in use.
+	gamescope::OwningRc<CVulkanTexture> lumaPrevCoarse[ gamescope::framegen::k_uMotionMaxCoarseLevels ];
+	gamescope::OwningRc<CVulkanTexture> lumaCurCoarse[ gamescope::framegen::k_uMotionMaxCoarseLevels ];
+	gamescope::OwningRc<CVulkanTexture> mvFieldCoarse[ gamescope::framegen::k_uMotionMaxCoarseLevels ];
 	// Forward-backward consistency (only when enabled): the unchecked forward
 	// field and the reverse (prev-anchored) field the check pass reads; the
 	// checked result lands in mvField. The reverse chain reuses the coarse
@@ -6256,14 +6986,18 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> lumaReservoir[2];
 	uint64_t uLumaReservoirFrameId[2] = {};
 	bool bLumaReservoirAllocTried = false;
-	// Self-supervised adaptation: the 96x1 R32_UINT counter image the
-	// stats probe atomically accumulates into (applied to the motion field in
-	// the same batch), and its host-mapped linear copy the CPU parses one batch
-	// later to auto-calibrate thresholds. 384 bytes
-	// each; allocated with the other motion intermediates so the warps can
-	// bind the accumulator unconditionally.
+	// Stats probe: the 96x1 R32_UINT counter image the probe atomically
+	// accumulates into, and its host-mapped linear copy the CPU parses one
+	// batch later (adaptation thresholds, quality meter). 384 bytes each and
+	// independent of the field size, so they are created once, on first need,
+	// and survive field reallocation. A failed allocation turns adaptation,
+	// online training and the meter off; it never fails motion setup.
 	gamescope::OwningRc<CVulkanTexture> statsAccum;
 	gamescope::OwningRc<CVulkanTexture> statsReadback;
+	bool bStatsAllocTried = false;
+	// mvFieldFwd holds this pair's unchecked matcher field (the FB check ran);
+	// otherwise the matcher wrote mvField directly.
+	bool bUncheckedFieldValid = false;
 	// Learned field refinement (only with a loaded weights blob): the
 	// net's refined copies of both checked fields (a conv reads an apron of
 	// raw neighbors, so refinement can never be in place — see
@@ -6278,6 +7012,9 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> netWeightsGpu;
 	gamescope::OwningRc<CVulkanTexture> netWeightsUpload;
 	bool bNetWeightsUploaded = false;
+	// Follows the staging IMAGE, not the active profile key. Key/scene changes
+	// can refill an existing GENERAL image; only a new allocation starts PREINITIALIZED.
+	bool bNetUploadInitialized = false;
 	bool bNetAllocTried = false;
 	// In-situ learning (only with GAMESCOPE_FRAMEGEN_NET_ONLINE): the
 	// immutable prior the fast weights decay toward, the optimizer state
@@ -6296,6 +7033,18 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> netProfileReadback;
 	bool bNetStatePending = false;
 	uint32_t uNetTrainStep = 0;
+	gamescope::framegen::NetTrainingCadence netTrainingCadence;
+	// Optional work is cold after every scene/key/resource change. A completed,
+	// finite non-cut foreground batch first warms the exact pipelines; a later
+	// such batch measures their warm CPU recording cost. No guessed bootstrap.
+	struct LearningCost_t
+	{
+		uint64_t warmedSeqNo = 0;
+		uint64_t pendingRecordSeqNo = 0;
+		uint64_t pendingRecordNs = 0;
+		uint64_t recordCostNs = 0;
+		uint64_t lastAttemptNs = 0;
+	} learning;
 	// True while the last recorded batch routed the warps/probe through the
 	// refined fields; the accessor below keys off it. Batches are strictly
 	// one-in-flight, so a single flag is race-free.
@@ -6313,7 +7062,58 @@ struct FramegenMotionResources_t
 	uint32_t lumaFormat = DRM_FORMAT_INVALID;
 };
 static FramegenMotionResources_t g_framegenMotion;
-static constexpr uint32_t k_uFramegenMotionDownscale = 8;
+
+// The motion field's scale for this session (gamescope::framegen::
+// motion_field_scale): fixed at startup from the configured pipeline.
+static uint32_t framegen_motion_scale()
+{
+	static const uint32_t s_uScale = []()
+	{
+		const uint32_t uScale = gamescope::framegen::motion_field_scale(
+			framegen_bool_setting( "GAMESCOPE_FRAMEGEN_FIELD_FINE", false ), g_eFramegenPipeline );
+		if ( uScale != gamescope::framegen::k_uMotionReferenceScale )
+			vk_log.infof( "framegen: fine motion field (1/%u of the output)", uScale );
+		return uScale;
+	}();
+	return s_uScale;
+}
+
+// Predictive warp fallback where the motion evidence is weak: move the real
+// frame only as far as the confidence allows (default) instead of crossfading
+// with the colour extrapolation (GAMESCOPE_FRAMEGEN_SHARP_FALLBACK=0). In blind
+// A/Bs (2026-10-16, Xonotic and GravityMark 1M, dual GPU, 120 Hz) the sharp
+// fallback beat framegen off on both, the crossfade lost to off on Xonotic,
+// and head to head the sharp one was preferred on both. The crossfade stays as
+// an escape hatch until more games, HDR and a second GPU pair confirm it.
+static bool framegen_sharp_fallback()
+{
+	static const bool s_bEnabled = []()
+	{
+		const bool bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_SHARP_FALLBACK", true );
+		if ( !bEnabled )
+			vk_log.infof( "framegen: crossfade low-confidence fallback (GAMESCOPE_FRAMEGEN_SHARP_FALLBACK=0)" );
+		return bEnabled;
+	}();
+	return s_bEnabled;
+}
+
+// Opt-in (GAMESCOPE_FRAMEGEN_BATCH_REPAINT=1, causal mode only): request a
+// composite after each generated batch instead of only waking the compositor,
+// as before 518498f. Measured nested on a GPU-bound client (GravityMark 1M,
+// 2048x1280@120, dual GPU): ~28% more real frames and steadier flips, at the
+// cost of a longer source-to-flip tail (p95 ~25 ms vs ~11 ms). Off by default:
+// it trades the latency tail for real-frame throughput.
+static bool framegen_batch_repaint()
+{
+	static const bool s_bEnabled = []()
+	{
+		const bool bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_BATCH_REPAINT", false );
+		if ( bEnabled )
+			vk_log.infof( "framegen: composite request after each generated batch (GAMESCOPE_FRAMEGEN_BATCH_REPAINT)" );
+		return bEnabled;
+	}();
+	return s_bEnabled;
+}
 
 // Full-colour held-out validation. In capture mode, endpoint frames
 // A/C and one exact intermediate reference B are retained; B is hidden from the
@@ -6386,6 +7186,16 @@ static FramegenDispatch_t g_framegenDispatch;
 static constexpr float k_flFramegenSuppressLo = 0.08f;
 static constexpr float k_flFramegenSuppressHi = 0.40f;
 
+// The delayed reals whose flips may teach the present bias: present token and
+// raw target. More on-slot delayed reals in flight than this lose the oldest
+// sample, never use a wrong one.
+struct FramegenBidirBiasSample_t
+{
+	uint64_t ulPresentToken = 0;
+	uint64_t ulRawTargetNs = 0;
+};
+using FramegenBidirBiasTokens_t = std::array<FramegenBidirBiasSample_t, 4>;
+
 struct FramegenPresentState_t
 {
 	const CVulkanTexture *pLastBaseTexture = nullptr;
@@ -6408,10 +7218,56 @@ struct FramegenPresentState_t
 	// correlated flip after it is discard-only evidence for the bias EMA.
 	bool bPresentBiasHitchEpisode = false;
 	bool bLoggedMinimumViableLeadActive = false;
+	// Present tokens of the newest delayed reals shown at their own opportunity
+	// (bidir_real_on_slot), oldest first: only their flips teach the present
+	// bias under bidir.
+	FramegenBidirBiasTokens_t onSlotRealTokens = {};
 	gamescope::FramegenPresentTag_t pendingTag = {};
 	bool bTagPending = false;
 };
 static FramegenPresentState_t g_framegenPresentState;
+// First present token of the current dormancy epoch (compositor thread).
+// Tokens stay monotonic across dormancy; older feedback still counts in METRICS
+// but never teaches the restarted display timing state.
+static uint64_t g_ulFramegenFirstPresentToken = 0;
+
+// Compositor thread only: the last applied reason and per-reason time spent
+// dormant, for the METRICS summary. The clock is read only on transitions and
+// at shutdown.
+struct FramegenDormancy_t
+{
+	FramegenDormantReason reason = FramegenDormantReason::NotDormant;
+	uint64_t sinceNs = 0;
+	std::array<uint64_t, static_cast<size_t>( FramegenDormantReason::RingAllocation ) + 1u> durationNs = {};
+};
+static FramegenDormancy_t g_framegenDormancy;
+
+static FramegenDormantReason framegen_longest_dormant_reason()
+{
+	auto durationNs = g_framegenDormancy.durationNs;
+	if ( g_framegenDormancy.reason != FramegenDormantReason::NotDormant )
+		durationNs[ static_cast<size_t>( g_framegenDormancy.reason ) ] +=
+			get_time_in_nanos() - g_framegenDormancy.sinceNs;
+	FramegenDormantReason longest = FramegenDormantReason::NotDormant;
+	for ( size_t i = 1; i < durationNs.size(); i++ )
+	{
+		if ( durationNs[ i ] > durationNs[ static_cast<size_t>( longest ) ] )
+			longest = static_cast<FramegenDormantReason>( i );
+	}
+	return longest;
+}
+
+// The display interval framegen paces against: the refresh the vblank timer
+// counts in (GetRefresh()). Nested, g_nOutputRefresh later becomes the parent
+// monitor's refresh while slots are still placed on g_nNestedRefresh's cadence,
+// so deriving the interval from g_nOutputRefresh there would put gaps, phases
+// and strengths off from where frames are shown. On DRM the two are equal.
+static uint64_t framegen_display_interval_ns()
+{
+	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+	return nFramegenRefreshMhz > 0
+		? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
+}
 
 static uint64_t framegen_commit_lead_override_ns();
 static bool framegen_causal_deadline_enabled();
@@ -6455,6 +7311,15 @@ using FramegenMetricsLatencyDistribution_t = gamescope::framegen::MetricsLatency
 // delayed real's whole bidir delay.
 using FramegenMetricsSourceLatencyDistribution_t = gamescope::framegen::MetricsSourceLatencyDistribution;
 
+using NetLearningSkip = gamescope::framegen::NetLearningSkip;
+static bool framegen_net_online_enabled();
+struct FramegenNetProgress_t
+{
+	uint64_t recorded, published, saved;
+};
+static FramegenNetProgress_t framegen_net_progress();
+static gamescope::framegen::NetLearningPair g_framegenNetLearningPair;
+
 struct FramegenMetricsWindow_t
 {
 	uint64_t real = 0, generated = 0, delayedReal = 0, repeats = 0;
@@ -6464,6 +7329,9 @@ struct FramegenMetricsWindow_t
 	uint64_t droppedReals = 0, reprimes = 0;
 	// The longest bidir delay D planned with (0: none).
 	uint64_t bidirDelayNsMax = 0;
+	// Bidir queue fronts the output-ring ceiling forced out ahead of their slot:
+	// reals shown early, interpolations discarded before they were due.
+	uint64_t ringOverflows = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	uint64_t resetsRing = 0, resetsChain = 0;
 	// Feedback that arrived as "discarded" (window hidden/occluded at the host):
@@ -6498,6 +7366,13 @@ struct FramegenMetricsWindow_t
 	// source interval.
 	FramegenMetricsSourceLatencyDistribution_t realSourceToFlip;
 	FramegenMetricsSourceLatencyDistribution_t delayedRealRecordToFlip;
+	// The live-real latency split at the first paint of its content: waiting
+	// for the compositor to pick it up, then composite + present to the flip.
+	FramegenMetricsSourceLatencyDistribution_t realSourceToRecord;
+	FramegenMetricsSourceLatencyDistribution_t realRecordToFlip;
+	gamescope::framegen::MotionQualityCounts quality;
+	uint64_t trainedSteps = 0, publishedSteps = 0, droppedNetReadbacks = 0, rejectedNetReadbacks = 0;
+	gamescope::framegen::NetLearningSkips learningSkips;
 };
 
 struct FramegenMetricsPendingEvents_t
@@ -6505,6 +7380,7 @@ struct FramegenMetricsPendingEvents_t
 	uint64_t repeats = 0, discards = 0, slowDrops = 0, admissionSkips = 0, resets = 0;
 	uint64_t droppedReals = 0, reprimes = 0;
 	uint64_t bidirDelayNsMax = 0;
+	uint64_t ringOverflows = 0;
 	uint64_t resetsCut = 0, resetsGrid = 0, resetsProvenance = 0, resetsHitch = 0;
 	uint64_t resetsRing = 0, resetsChain = 0;
 	uint64_t realWaits = 0;
@@ -6512,8 +7388,22 @@ struct FramegenMetricsPendingEvents_t
 	uint64_t copyGpuNsSum = 0;
 	uint64_t copyGpuSamples = 0;
 	uint64_t copyGpuNsMax = 0;
+	gamescope::framegen::MotionQualityCounts quality;
+	uint64_t trainedSteps = 0, publishedSteps = 0, droppedNetReadbacks = 0, rejectedNetReadbacks = 0;
+	gamescope::framegen::NetLearningSkips learningSkips;
 };
 static FramegenMetricsPendingEvents_t g_framegenMetricsPendingEvents;
+
+static void framegen_net_note_skip( NetLearningSkip reason )
+{
+	if ( framegen_net_online_enabled() )
+		g_framegenNetLearningPair.skip( reason );
+}
+
+static void framegen_net_finish_pair()
+{
+	g_framegenMetricsPendingEvents.learningSkips.add( g_framegenNetLearningPair.finish() );
+}
 
 struct FramegenMetricsState_t
 {
@@ -6529,7 +7419,7 @@ static FramegenMetricsState_t g_framegenMetrics;
 
 static bool framegen_metrics_enabled()
 {
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_METRICS" ) );
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_METRICS", false );
 	return s_bEnabled;
 }
 
@@ -6543,6 +7433,7 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.droppedReals += events.droppedReals;
 	window.reprimes += events.reprimes;
 	window.bidirDelayNsMax = std::max( window.bidirDelayNsMax, events.bidirDelayNsMax );
+	window.ringOverflows += events.ringOverflows;
 	window.resets += events.resets;
 	window.resetsCut += events.resetsCut;
 	window.resetsGrid += events.resetsGrid;
@@ -6563,6 +7454,12 @@ static void framegen_metrics_add_events( FramegenMetricsWindow_t &window,
 	window.copyGpuNsSum += events.copyGpuNsSum;
 	window.copyGpuSamples += events.copyGpuSamples;
 	window.copyGpuNsMax = std::max( window.copyGpuNsMax, events.copyGpuNsMax );
+	window.quality += events.quality;
+	window.trainedSteps += events.trainedSteps;
+	window.publishedSteps += events.publishedSteps;
+	window.droppedNetReadbacks += events.droppedNetReadbacks;
+	window.rejectedNetReadbacks += events.rejectedNetReadbacks;
+	window.learningSkips += events.learningSkips;
 }
 
 static void framegen_metrics_flush_events()
@@ -6645,6 +7542,8 @@ static void framegen_metrics_log( const char *pszLabel,
 	const gamescope::framegen::FixedRefreshPresentLead_t viableLead =
 		framegen_native_present_lead(
 			ulVblankIntervalNs / 10u, ulVblankIntervalNs );
+	const FramegenNetProgress_t net = framegen_net_progress();
+	const auto skip = window.learningSkips.dominant();
 	vk_log.infof( "framegen-metrics: %s real=%" PRIu64 " gen=%" PRIu64
 		" dreal=%" PRIu64 " rep=%" PRIu64
 		" flip_ms_avg=%.3f flip_ms_min=%.3f flip_ms_max=%.3f"
@@ -6663,7 +7562,15 @@ static void framegen_metrics_log( const char *pszLabel,
 		" src_flip_ms_p50=%.3f src_flip_ms_p95=%.3f"
 		" reprime=%" PRIu64 " dreal_drop=%" PRIu64 " src_flip_ms_p90=%.3f"
 		" src_flip_ms_fs=%.3f dreal_flip_ms_p50=%.3f dreal_flip_ms_p90=%.3f"
-		" dreal_flip_ms_p95=%.3f dreal_flip_ms_fs=%.3f bidir_delay_ms=%.3f",
+		" dreal_flip_ms_p95=%.3f dreal_flip_ms_fs=%.3f bidir_delay_ms=%.3f"
+		" ring_ovf=%" PRIu64
+		" q_resid=%.4f q_bad_mv=%.3f q_killed_mv=%.3f q_killed_match=%.3f"
+		" q_killed_fb=%.3f q_samples=%" PRIu64
+		" src_rec_ms_p50=%.3f src_rec_ms_p95=%.3f rec_flip_ms_p50=%.3f rec_flip_ms_p95=%.3f"
+		" train_online=%u train_recorded=%" PRIu64 " train_published=%" PRIu64
+		" train_skip=%s train_skip_n=%" PRIu64
+		" train_recorded_total=%" PRIu64 " train_published_total=%" PRIu64 " train_saved_total=%" PRIu64
+		" train_rb_dropped=%" PRIu64 " train_rb_rejected=%" PRIu64,
 		pszLabel, window.real, window.generated, window.delayedReal, window.repeats,
 		flip.average(), flip.n != 0 ? flip.min : 0.0, flip.max,
 		flip.stddev(), flip.p95(),
@@ -6694,7 +7601,19 @@ static void framegen_metrics_log( const char *pszLabel,
 		FramegenMetricsSourceLatencyDistribution_t::k_flFullScaleMs,
 		delayedFlip.p50(), delayedFlip.percentile( 90u ), delayedFlip.p95(),
 		FramegenMetricsSourceLatencyDistribution_t::k_flFullScaleMs,
-		window.bidirDelayNsMax / 1.0e6 );
+		window.bidirDelayNsMax / 1.0e6, window.ringOverflows,
+		// Motion-field quality over texels whose content changed; all 0 with q_samples=0
+		// (meter off, or no fresh field in the window).
+		window.quality.residual(), window.quality.badFraction(),
+		window.quality.killedFraction(), window.quality.killedMatchFraction(),
+		window.quality.killedFbFraction(), window.quality.samples,
+		window.realSourceToRecord.p50(), window.realSourceToRecord.p95(),
+		window.realRecordToFlip.p50(), window.realRecordToFlip.p95(),
+		framegen_net_online_enabled() ? 1u : 0u, window.trainedSteps, window.publishedSteps,
+		gamescope::framegen::net_learning_skip_name( skip ),
+		window.learningSkips.counts[ static_cast<size_t>( skip ) ],
+		net.recorded, net.published, net.saved,
+		window.droppedNetReadbacks, window.rejectedNetReadbacks );
 }
 
 static void framegen_metrics_close_windows( uint64_t ulNowNs, bool bLog )
@@ -6758,6 +7677,14 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 			const uint64_t ulLatencyNs = feedback.ulActualFlipNs - ulFromNs;
 			for ( FramegenMetricsWindow_t *pWindow : { &g_framegenMetrics.current, &g_framegenMetrics.total } )
 				( bDelayed ? pWindow->delayedRealRecordToFlip : pWindow->realSourceToFlip ).add( ulLatencyNs );
+			if ( !bDelayed && pEntry->ulRecordNs >= ulFromNs && feedback.ulActualFlipNs > pEntry->ulRecordNs )
+			{
+				for ( FramegenMetricsWindow_t *pWindow : { &g_framegenMetrics.current, &g_framegenMetrics.total } )
+				{
+					pWindow->realSourceToRecord.add( pEntry->ulRecordNs - ulFromNs );
+					pWindow->realRecordToFlip.add( feedback.ulActualFlipNs - pEntry->ulRecordNs );
+				}
+			}
 		}
 	}
 	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real )
@@ -6791,9 +7718,7 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 	if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::Real
 		|| feedback.tag.ulTargetFlipNs == 0 )
 		return;
-	const int nRefreshMhz = GetVBlankTimer().GetRefresh();
-	const uint64_t ulVblankNs = nRefreshMhz > 0
-		? 1'000'000'000'000ull / (uint64_t)nRefreshMhz : 8'333'333ull;
+	const uint64_t ulVblankNs = framegen_display_interval_ns();
 	const gamescope::framegen::DeadlineFeedbackSample_t sample =
 		gamescope::framegen::deadline_feedback_sample(
 			feedback.ulActualFlipNs, feedback.tag.ulTargetFlipNs,
@@ -6821,10 +7746,12 @@ static void framegen_metrics_add_feedback( const DisplayFeedback_t &feedback )
 
 static void framegen_metrics_shutdown()
 {
+	framegen_net_finish_pair();
 	framegen_metrics_flush_events();
-	char szTotal[32];
-	snprintf( szTotal, sizeof( szTotal ), "TOTAL w=%" PRIu64,
-		g_framegenMetrics.nClosedWindows );
+	char szTotal[80];
+	snprintf( szTotal, sizeof( szTotal ), "TOTAL w=%" PRIu64 " dormant=%s",
+		g_framegenMetrics.nClosedWindows,
+		gamescope::framegen::framegen_dormant_reason_name( framegen_longest_dormant_reason() ) );
 	framegen_metrics_log( szTotal, g_framegenMetrics.total );
 }
 
@@ -6847,6 +7774,7 @@ static void framegen_metrics_note_bidir_delay( uint64_t ulDelayNs )
 		std::max( g_framegenMetricsPendingEvents.bidirDelayNsMax, ulDelayNs );
 }
 static void framegen_metrics_note_slow_drop( uint64_t n ) { g_framegenMetricsPendingEvents.slowDrops += n; }
+static void framegen_metrics_note_ring_overflow() { g_framegenMetricsPendingEvents.ringOverflows++; }
 static void framegen_metrics_note_admission_skip() { g_framegenMetricsPendingEvents.admissionSkips++; }
 enum class FramegenResetReason_t : uint8_t
 {
@@ -6878,6 +7806,31 @@ static void framegen_metrics_note_chain_reset( FramegenResetReason_t reason )
 
 static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback );
 static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback );
+
+// The present bias under bidir: the flip of a delayed real shown on its own
+// slot, against its raw target plus the bias learned by now. Several flips are
+// in flight, so the bias their tags carried is stale; the residual against the
+// current bias keeps this the 1/8 EMA of (flip - raw target). Generated
+// and held flips are what the bias is judged by, and a real shown early or late
+// is off its slot by design, so neither teaches it. The first correlated flip
+// after a hitch is discard-only evidence, as for live reals.
+static void framegen_apply_bidir_flip_feedback( const DisplayFeedback_t &feedback )
+{
+	const FramegenBidirBiasTokens_t &tokens = g_framegenPresentState.onSlotRealTokens;
+	const auto sample = std::ranges::find( tokens, feedback.tag.ulPresentToken,
+		&FramegenBidirBiasSample_t::ulPresentToken );
+	if ( !feedback.bPresented || !feedback.bTimestampValid || sample == tokens.end() )
+		return;
+
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
+	g_framegenPresentState.displayTiming.presentBias = gamescope::framegen::update_present_bias(
+		g_framegenPresentState.displayTiming.presentBias,
+		gamescope::framegen::display_target_ns( sample->ulRawTargetNs, g_framegenPresentState.displayTiming ),
+		feedback.ulActualFlipNs,
+		gamescope::framegen::cadence_arrival_guard_ns( ulVblankIntervalNs ),
+		ulVblankIntervalNs, g_framegenPresentState.bPresentBiasHitchEpisode ).state;
+	g_framegenPresentState.bPresentBiasHitchEpisode = false;
+}
 
 struct FramegenShadowDecision_t
 {
@@ -6989,6 +7942,7 @@ static bool framegen_observe_display_chain( uint64_t ulIntervalNs,
 		g_displayFeedbackMailbox.nRead = 0;
 		g_displayFeedbackMailbox.nCount = 0;
 	}
+	g_framegenPresentState.onSlotRealTokens = {};
 	framegen_metrics_note_chain_reset( bPhysicalChainChanged
 		? FramegenResetReason_t::Grid
 		: FramegenResetReason_t::Provenance );
@@ -7020,7 +7974,7 @@ static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
 			.ulRealFrameId = g_framegenPresentState.ulCurrentRealFrameId,
 			.ulSlotId = 0,
 			.ulCompositeSeqNo = 0,
-			.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 ),
+			.ulTargetFlipNs = framegen_next_vblank_ns(),
 			.ulCommitSubmitNs = 0,
 			.eKind = gamescope::FramegenPresentKind_t::Real,
 		};
@@ -7033,13 +7987,14 @@ static void framegen_select_present_tag( gamescope::FramegenPresentKind_t eKind,
 	tag.ulSlotId = ulSlotId;
 	tag.ulCompositeSeqNo = ulCompositeSeqNo;
 	tag.ulTargetFlipNs = ulTargetFlipNs != 0
-		? ulTargetFlipNs : GetVBlankTimer().GetNextVBlank( 0 );
+		? ulTargetFlipNs : framegen_next_vblank_ns();
 	tag.ulCommitSubmitNs = 0;
 }
 
 // Present tags and feedback exist for framegen, and for the opt-in metrics
-// (which also give the framegen-OFF baseline). Constant after init, so framegen
-// OFF without metrics does no per-frame present bookkeeping.
+// (which also give the framegen-OFF baseline). Constant except across a
+// dormancy transition, which restarts g_framegenPresentState; framegen OFF or
+// dormant without metrics does no per-frame present bookkeeping.
 static bool framegen_present_tracking_enabled()
 {
 	return vulkan_framegen_is_enabled() || framegen_metrics_enabled();
@@ -7049,11 +8004,11 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 {
 	if ( !framegen_present_tracking_enabled() )
 		return;
-	const CVulkanTexture *pBaseTexture = pFrameInfo != nullptr && pFrameInfo->layerCount > 0
-		? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
+	const CVulkanTexture *pBaseTexture = pFrameInfo != nullptr && pFrameInfo->layers.count() > 0
+		? pFrameInfo->layers.get( 0 ).tex.get() : nullptr;
 	const gamescope::framegen::RealFrameIdentity_t identity = {
-		.commitId = pFrameInfo != nullptr && pFrameInfo->layerCount > 0
-			? pFrameInfo->layers[ 0 ].ulCommitID : 0u,
+		.commitId = pFrameInfo != nullptr && pFrameInfo->layers.count() > 0
+			? pFrameInfo->layers.get( 0 ).ulCommitID : 0u,
 		.pTexture = pBaseTexture,
 	};
 	if ( g_framegenPresentState.ulCurrentRealFrameId == 0
@@ -7073,10 +8028,10 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 		g_framegenPresentState.ulLastBaseCommitID = identity.commitId;
 	}
 
-	if ( framegen_metrics_enabled() && pFrameInfo != nullptr && pFrameInfo->layerCount > 0 )
+	if ( framegen_metrics_enabled() && pFrameInfo != nullptr && pFrameInfo->layers.count() > 0 )
 	{
 		framegen_metrics_note_source_ready( g_framegenPresentState.ulCurrentRealFrameId,
-			pFrameInfo->layers[ 0 ].acquireReadyTimeNs );
+			pFrameInfo->layers.get( 0 ).acquireReadyTimeNs );
 	}
 
 	g_framegenPresentState.pendingTag = {
@@ -7084,7 +8039,7 @@ void vulkan_framegen_begin_present( const struct FrameInfo_t *pFrameInfo )
 		.ulRealFrameId = g_framegenPresentState.ulCurrentRealFrameId,
 		.ulSlotId = 0,
 		.ulCompositeSeqNo = 0,
-		.ulTargetFlipNs = GetVBlankTimer().GetNextVBlank( 0 ),
+		.ulTargetFlipNs = framegen_next_vblank_ns(),
 		.ulCommitSubmitNs = 0,
 		.eKind = gamescope::FramegenPresentKind_t::Real,
 	};
@@ -7175,6 +8130,8 @@ void vulkan_framegen_drain_present_feedback()
 			continue;
 		if ( bMetricsCollectionEnabled )
 			framegen_metrics_add_feedback( feedback );
+		if ( feedback.tag.ulPresentToken < g_ulFramegenFirstPresentToken )
+			continue;
 
 		if ( feedback.bPresented && feedback.bTimestampValid )
 		{
@@ -7301,11 +8258,14 @@ void vulkan_framegen_drain_present_feedback()
 			}
 		}
 
-		// A delayed real's flip feeds metrics and the lead learner above only:
-		// the bidir translation is fixed per establishment, and the anchor and
-		// VRR paths below are for live reals.
+		// A delayed real's flip never moves the bidir translation, which is fixed
+		// per establishment; one shown on its own slot teaches the present bias
+		// its tags carry. The anchor and VRR paths below are for live reals.
 		if ( feedback.tag.eKind == gamescope::FramegenPresentKind_t::DelayedReal )
+		{
+			framegen_apply_bidir_flip_feedback( feedback );
 			continue;
+		}
 
 		// A discarded real completion is still identity-bearing cancellation
 		// evidence for VRR; no timestamp-based anchor correction is possible.
@@ -7418,6 +8378,9 @@ struct FramegenHistory_t
 		// read off the live history) so a frame planned before a fallback can
 		// never end up with two cursors, or none.
 		bool bCursorFree = false;
+		// Same contract for the framegen HUD: both endpoints were composited
+		// without it, so framegen_present_image draws the live HUD on top.
+		bool bHudFree = false;
 	};
 	std::vector<PendingGenerated_t> pending;
 
@@ -7490,6 +8453,8 @@ struct FramegenHistory_t
 	// the oversubscription guard: skip new generation while the previous batch
 	// is still running rather than queue work in front of real frames.
 	uint64_t lastGeneratedSeqNo = 0;
+	// Training shares mutable scratch/descriptor resources, not presentation tags.
+	uint64_t lastLearningSeqNo = 0;
 	// Slot planning relative to the current real frame. Real-frame submission
 	// fills the first multiplier-1 slots; the dedicated-queue idle refill can
 	// continue from this counter if the game stalls before the next real frame.
@@ -7521,6 +8486,12 @@ struct FramegenHistory_t
 	// onto generated frames. Shifted alongside previousReal/currentReal.
 	bool bCursorFreePrevious = false;
 	bool bCursorFreeCurrent = false;
+	// Same for the framegen HUD: previousReal / currentReal hold a composite the
+	// HUD was NOT drawn into (see the HUD split in vulkan_composite), so the
+	// present side draws the live HUD onto generated frames. Only ever true
+	// while GAMESCOPE_FRAMEGEN_HUD is on. Shifted alongside previousReal/currentReal.
+	bool bHudFreePrevious = false;
+	bool bHudFreeCurrent = false;
 	// Rolling index into g_output.framegenCursorHistoryImages.
 	uint32_t nNextCursorHistoryIndex = 0;
 	// Rolling index into g_output.framegenPresentImages for the next late
@@ -7565,6 +8536,7 @@ struct FramegenHistory_t
 	// hasCompletedFramegen() admits the batch that wrote it.
 	gamescope::framegen::AdaptationState adaptation;
 	uint64_t ulAdaptStatsSeqNo = 0;      // batch whose probe wrote the readback
+	bool bAdaptStatsMeasureOnly = false; // that readback is a quality-meter sample
 	uint64_t ulAdaptConsumedSeqNo = 0;   // last readback folded into the EMAs
 	// Dataset capture: batch whose copies filled the recorder
 	// readbacks, and the last one flushed to disk — same one-batch-in-flight
@@ -7580,6 +8552,21 @@ struct FramegenHistory_t
 
 static FramegenHistory_t g_framegenHistory;
 
+static bool framegen_work_completed()
+{
+	return g_device.hasCompletedFramegen( std::max(
+		g_framegenHistory.lastGeneratedSeqNo, g_framegenHistory.lastLearningSeqNo ) );
+}
+
+static void framegen_net_drop_profile_readback()
+{
+	if ( g_framegenHistory.ulNetProfileSeqNo != 0
+		&& g_framegenHistory.ulNetProfileSeqNo != g_framegenHistory.ulNetProfileConsumedSeqNo )
+		g_framegenMetricsPendingEvents.droppedNetReadbacks++;
+	g_framegenHistory.ulNetProfileSeqNo = 0;
+	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
+}
+
 struct FramegenImagePoolPressure_t
 {
 	size_t nTextureBusy = 0;
@@ -7587,6 +8574,17 @@ struct FramegenImagePoolPressure_t
 	uint64_t ulTextureRefs = 0;
 	uint64_t ulBackendExternalRefs = 0;
 };
+
+// The first backend-fb ref belongs to the first public texture ref. Any excess
+// is an external owner such as a pending KMS commit or unreleased nested-Wayland
+// attach.
+static uint32_t framegen_backend_external_refs( CVulkanTexture &image )
+{
+	const uint32_t uTextureRefs = image.GetRefCount();
+	const gamescope::IBackendFb *pBackendFb = image.GetBackendFb();
+	const uint32_t uBackendRefs = pBackendFb != nullptr ? pBackendFb->GetRefCount() : 0;
+	return uBackendRefs - std::min( uBackendRefs, uTextureRefs != 0 ? 1u : 0u );
+}
 
 static FramegenImagePoolPressure_t framegen_image_pool_pressure(
 	const std::vector<gamescope::OwningRc<CVulkanTexture>> &images )
@@ -7598,13 +8596,7 @@ static FramegenImagePoolPressure_t framegen_image_pool_pressure(
 			continue;
 
 		const uint32_t uTextureRefs = pImage->GetRefCount();
-		const gamescope::IBackendFb *pBackendFb = pImage->GetBackendFb();
-		const uint32_t uBackendRefs = pBackendFb != nullptr ? pBackendFb->GetRefCount() : 0;
-		// The first backend-fb ref belongs to the first public texture ref. Any
-		// excess is an external owner such as a pending KMS commit or unreleased
-		// nested-Wayland attach.
-		const uint32_t uBackendExternalRefs = uBackendRefs
-			- std::min( uBackendRefs, uTextureRefs != 0 ? 1u : 0u );
+		const uint32_t uBackendExternalRefs = framegen_backend_external_refs( *pImage );
 		pressure.nTextureBusy += uTextureRefs != 0;
 		pressure.nBackendBusy += uBackendExternalRefs != 0;
 		pressure.ulTextureRefs += uTextureRefs;
@@ -7613,7 +8605,7 @@ static FramegenImagePoolPressure_t framegen_image_pool_pressure(
 	return pressure;
 }
 
-static void framegen_log_output_ring_pressure()
+static void framegen_log_output_ring_pressure( const char *pszAction )
 {
 	size_t nHistoryRefs = 0;
 	size_t nReadPinRefs = 0;
@@ -7621,26 +8613,52 @@ static void framegen_log_output_ring_pressure()
 	const FramegenImagePoolPressure_t pressure = framegen_image_pool_pressure(
 		g_output.outputImages );
 
+	// One token per ring image: P pending real, c/p current/previous history,
+	// r generation read pin, b<n> external backend refs, t<n> texture refs.
+	std::string sOwners;
 	for ( const auto &pOwnedImage : g_output.outputImages )
 	{
 		CVulkanTexture *pImage = pOwnedImage.get();
 		if ( pImage == nullptr )
 			continue;
 
-		nHistoryRefs += g_framegenHistory.previousReal.get() == pImage;
-		nHistoryRefs += g_framegenHistory.currentReal.get() == pImage;
-		nReadPinRefs += g_framegenHistory.genReadA.get() == pImage;
-		nReadPinRefs += g_framegenHistory.genReadB.get() == pImage;
-		nReadPinRefs += g_framegenHistory.genReadReference.get() == pImage;
+		size_t nPending = 0;
 		for ( const FramegenHistory_t::PendingGenerated_t &entry : g_framegenHistory.pending )
-			nPendingRealRefs += entry.bReal && entry.tex.get() == pImage;
+			nPending += entry.bReal && entry.tex.get() == pImage;
+		const bool bCurrent = g_framegenHistory.currentReal.get() == pImage;
+		const bool bPrevious = g_framegenHistory.previousReal.get() == pImage;
+		const size_t nRead = size_t( g_framegenHistory.genReadA.get() == pImage )
+			+ size_t( g_framegenHistory.genReadB.get() == pImage )
+			+ size_t( g_framegenHistory.genReadReference.get() == pImage );
+		const uint32_t uBackendExternalRefs = framegen_backend_external_refs( *pImage );
+
+		nHistoryRefs += size_t( bCurrent ) + size_t( bPrevious );
+		nReadPinRefs += nRead;
+		nPendingRealRefs += nPending;
+
+		sOwners += sOwners.empty() ? "" : ",";
+		sOwners += nPending != 0 ? "P" : "";
+		sOwners += bCurrent ? "c" : "";
+		sOwners += bPrevious ? "p" : "";
+		sOwners += nRead != 0 ? "r" : "";
+		if ( uBackendExternalRefs != 0 )
+			sOwners += "b" + std::to_string( uBackendExternalRefs );
+		sOwners += "t" + std::to_string( pImage->GetRefCount() );
 	}
 
+	// How far the queue front is past its display target (negative: early).
+	const uint64_t ulFrontTargetNs = g_framegenHistory.pending.empty()
+		? 0 : g_framegenHistory.pending.front().ulTargetFlipNs;
+	const double flFrontLateMs = ulFrontTargetNs != 0
+		? double( int64_t( get_time_in_nanos() - ulFrontTargetNs ) ) / 1.0e6
+		: std::numeric_limits<double>::quiet_NaN();
+
 	vk_log.infof( "framegen: real output-ring pressure pool=%zu texture-busy=%zu refs=%" PRIu64
-		" backend-busy=%zu external-refs=%" PRIu64 " history-refs=%zu read-pins=%zu pending-real-refs=%zu pending=%zu; skipping live-buffer composite",
+		" backend-busy=%zu external-refs=%" PRIu64 " history-refs=%zu read-pins=%zu pending-real-refs=%zu pending=%zu"
+		" front_late_ms=%.1f owners=[%s]; %s",
 		g_output.outputImages.size(), pressure.nTextureBusy, pressure.ulTextureRefs,
 		pressure.nBackendBusy, pressure.ulBackendExternalRefs, nHistoryRefs, nReadPinRefs,
-		nPendingRealRefs, g_framegenHistory.pending.size() );
+		nPendingRealRefs, g_framegenHistory.pending.size(), flFrontLateMs, sOwners.c_str(), pszAction );
 }
 static bool g_bLoggedFramegenConfig = false;
 static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 250'000'000ull;
@@ -7702,14 +8720,13 @@ static uint64_t framegen_predicted_interval_ns()
 		g_framegenHistory.cadence );
 }
 
-static uint64_t framegen_display_interval_ns();
 static bool framegen_refill_idle();
 static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionReplan = false );
 static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps );
 static void framegen_clear_vrr_midpoint_state( bool bClearPending );
 static bool framegen_format_supports_sampled_storage( uint32_t drmFormat );
 static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
-static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo );
+static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo, bool bCursorFree, bool bHudFree );
 
 static const char *framegen_color_record_dir()
 {
@@ -7802,7 +8819,7 @@ static FramegenColorProbeSweep framegen_color_record_sweep()
 // one-slot speculation must not block a real composite.
 static bool framegen_classic_enabled()
 {
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_CLASSIC" ) );
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_CLASSIC", false );
 	return s_bEnabled;
 }
 
@@ -7824,13 +8841,16 @@ static bool framegen_causal_deadline_enabled()
 // point falls back to the fixed-refresh paths, live, with no restart.
 static bool framegen_vrr_hybrid_configured()
 {
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_VRR_HYBRID" ) );
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_VRR_HYBRID", false );
 	return s_bEnabled;
 }
 
 bool vulkan_framegen_vrr_hybrid_requested()
 {
-	return framegen_vrr_hybrid_configured() && g_device.hasFramegenQueue();
+	// The framegen queue outlives dormancy; the runtime gate keeps a dormant
+	// session's VRR decisions identical to an unconfigured one's.
+	return vulkan_framegen_is_enabled()
+		&& framegen_vrr_hybrid_configured() && g_device.hasFramegenQueue();
 }
 
 bool vulkan_framegen_vrr_hybrid_active()
@@ -7851,7 +8871,7 @@ bool vulkan_framegen_vrr_hybrid_active()
 // generated frames exactly as to real ones. Opt-in prototype toggle.
 static bool framegen_base_layer_enabled()
 {
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_BASE" ) );
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_BASE", false );
 	// A Vulkan-swapchain backend has no compositor-owned output ring, so
 	// output-space history is not representable there at all: it would pin a
 	// presentation-engine-owned image and sample it after re-acquire. Base-layer
@@ -7861,7 +8881,9 @@ static bool framegen_base_layer_enabled()
 
 bool vulkan_framegen_base_layer_active()
 {
-	return framegen_base_layer_enabled() && g_framegenHistory.bBaseLayer;
+	// History first: the compositor asks this with framegen off too, and then
+	// the switch is never read.
+	return g_framegenHistory.bBaseLayer && framegen_base_layer_enabled();
 }
 
 // Per-frame dispatcher rung decision for base-layer mode — deliberately a handful of
@@ -7876,10 +8898,10 @@ bool vulkan_framegen_base_layer_active()
 static bool framegen_base_layer_usable( const struct FrameInfo_t *pFrameInfo )
 {
 	if ( !framegen_base_layer_enabled()
-		|| pFrameInfo->layerCount < 1
-		|| pFrameInfo->layers[ 0 ].tex == nullptr
-		|| pFrameInfo->layers[ 0 ].zpos != g_zposBase
-		|| pFrameInfo->layers[ 0 ].tex->isYcbcr()
+		|| pFrameInfo->layers.count() < 1
+		|| pFrameInfo->layers.get( 0 ).tex == nullptr
+		|| pFrameInfo->layers.get( 0 ).zpos != g_zposBase
+		|| pFrameInfo->layers.get( 0 ).tex->isYcbcr()
 		|| !g_reshade_effect.empty() )
 		return false;
 
@@ -7888,7 +8910,7 @@ static bool framegen_base_layer_usable( const struct FrameInfo_t *pFrameInfo )
 	// channels, so the format is kept). Probe storage support once per format.
 	static uint32_t s_uCheckedDrmFormat = DRM_FORMAT_INVALID;
 	static bool s_bFormatSupported = false;
-	const uint32_t uBaseFormat = pFrameInfo->layers[ 0 ].tex->drmFormat();
+	const uint32_t uBaseFormat = pFrameInfo->layers.get( 0 ).tex->drmFormat();
 	if ( uBaseFormat != s_uCheckedDrmFormat )
 	{
 		s_uCheckedDrmFormat = uBaseFormat;
@@ -7911,11 +8933,7 @@ static bool framegen_base_layer_usable( const struct FrameInfo_t *pFrameInfo )
 // usage flags, see framegen_create_output_texture).
 static bool framegen_cursor_split_enabled()
 {
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_CURSOR" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_CURSOR", true );
 	return s_bEnabled;
 }
 
@@ -7926,11 +8944,11 @@ static bool framegen_cursor_split_enabled()
 // behaviour. Returns the layer index, or -1.
 static int framegen_cursor_top_layer_index( const struct FrameInfo_t *pFrameInfo )
 {
-	if ( pFrameInfo == nullptr || pFrameInfo->layerCount < 2 )
+	if ( pFrameInfo == nullptr || pFrameInfo->layers.count() < 2 )
 		return -1;
-	const int nLast = pFrameInfo->layerCount - 1;
-	if ( pFrameInfo->layers[ nLast ].zpos != (int)g_zposCursor
-		|| pFrameInfo->layers[ nLast ].tex == nullptr )
+	const int nLast = pFrameInfo->layers.count() - 1;
+	if ( pFrameInfo->layers.get( nLast ).zpos != (int)g_zposCursor
+		|| pFrameInfo->layers.get( nLast ).tex == nullptr )
 		return -1;
 	return nLast;
 }
@@ -7941,10 +8959,10 @@ static bool framegen_frame_has_cursor_layer( const struct FrameInfo_t *pFrameInf
 {
 	if ( pFrameInfo == nullptr )
 		return false;
-	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
 	{
-		if ( pFrameInfo->layers[ i ].zpos == (int)g_zposCursor
-			&& pFrameInfo->layers[ i ].tex != nullptr )
+		if ( pFrameInfo->layers.get( i ).zpos == (int)g_zposCursor
+			&& pFrameInfo->layers.get( i ).tex != nullptr )
 			return true;
 	}
 	return false;
@@ -7960,10 +8978,10 @@ static bool framegen_frame_has_cursor_layer( const struct FrameInfo_t *pFrameInf
 // today's baked-in cursor).
 static bool framegen_composite_records_history( const struct FrameInfo_t *pFrameInfo )
 {
-	const CVulkanTexture *pBaseTexture = pFrameInfo->layerCount > 0
-		? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
-	const uint64_t ulBaseCommitID = pFrameInfo->layerCount > 0
-		? pFrameInfo->layers[ 0 ].ulCommitID : 0u;
+	const CVulkanTexture *pBaseTexture = pFrameInfo->layers.count() > 0
+		? pFrameInfo->layers.get( 0 ).tex.get() : nullptr;
+	const uint64_t ulBaseCommitID = pFrameInfo->layers.count() > 0
+		? pFrameInfo->layers.get( 0 ).ulCommitID : 0u;
 	return pBaseTexture == nullptr
 		|| gamescope::framegen::is_new_real_frame_content(
 			{ g_framegenHistory.ulLastBaseCommitID, g_framegenHistory.pLastBaseTexture },
@@ -7984,7 +9002,7 @@ static bool framegen_composite_records_history( const struct FrameInfo_t *pFrame
 // otherwise uses the shared absolute-deadline timeline.
 static bool framegen_bidir_enabled()
 {
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_BIDIR" ) );
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_BIDIR", false );
 	return s_bEnabled;
 }
 
@@ -8022,19 +9040,26 @@ static float framegen_bidir_endpoint_trace_strength( GamescopeFramegenPipeline e
 	return s_flStrength;
 }
 
-bool vulkan_framegen_bidir_active()
+// Bidir is configured and possible for this backend and mode; it then runs in
+// every scene that does not use base-layer generation.
+static bool framegen_bidir_requested()
 {
 	return vulkan_framegen_is_enabled()
 		&& framegen_bidir_enabled()
+		&& g_eFramegenPipeline != GamescopeFramegenPipeline::Spatial
 		// Bidir substitutes vulkan_get_last_output_image() into the flip, i.e. it
 		// presents ring images directly. On a swapchain backend those are
 		// presentation-engine-owned and there is no flip to substitute into.
-		// !bBaseLayer below already covers it once base mode latches; this closes
-		// the first-frame window and documents why.
+		// The base-layer check in vulkan_framegen_bidir_active() covers it once
+		// base mode latches; this closes the first-frame window and documents why.
 		&& framegen_owns_output_ring()
 		&& g_eFramegenMode == GamescopeFramegenMode::Motion
-		&& !vulkan_framegen_vrr_hybrid_requested()
-		&& !g_framegenHistory.bBaseLayer;
+		&& !vulkan_framegen_vrr_hybrid_requested();
+}
+
+bool vulkan_framegen_bidir_active()
+{
+	return framegen_bidir_requested() && !g_framegenHistory.bBaseLayer;
 }
 
 static bool framegen_color_probe_requested()
@@ -8052,13 +9077,15 @@ static bool framegen_color_probe_active()
 		&& g_uFramegenColorRecordCount < framegen_color_record_max();
 }
 
-// Fixed at startup (command line and backend); a runtime toggle would have to
-// reset g_framegenPresentState, which framegen_present_tracking_enabled gates.
-bool vulkan_framegen_is_enabled()
+// Fixed at startup (command line and backend). Gates what must outlive runtime
+// dormancy: device-lifetime setup and the shutdown drain. The device queue and
+// descriptor reservations keep their own g_bExperimentalFramegen &&
+// framegen_backend_supported() test.
+static bool framegen_configured()
 {
 	// Only enable on backends that actually present generated frames. Otherwise
 	// generation would run and be discarded, and the forced-composite / no-VRR /
-	// no-tearing tax would be paid for no benefit (Headless, OpenVR, SDL).
+	// no-tearing tax would be paid for no benefit (headless, OpenVR).
 	if ( !framegen_backend_supported() )
 		return false;
 
@@ -8067,6 +9094,18 @@ bool vulkan_framegen_is_enabled()
 		&& ( g_eFramegenMode == GamescopeFramegenMode::Extrapolate
 			|| g_eFramegenMode == GamescopeFramegenMode::Blend
 			|| g_eFramegenMode == GamescopeFramegenMode::Motion );
+}
+
+// Configured and not dormant; callable from any thread. The reason changes only
+// in vulkan_framegen_update_dormancy(), which also restarts the present state
+// that framegen_present_tracking_enabled() gates. A ring allocation failure
+// turns this off mid-composite, right after the reset of a ring remake (or at
+// startup); the next update completes that transition.
+bool vulkan_framegen_is_enabled()
+{
+	return framegen_configured()
+		&& g_eFramegenDormantReason.load( std::memory_order_relaxed ) == FramegenDormantReason::NotDormant
+		&& !g_bFramegenRingAllocationFailed.load( std::memory_order_relaxed );
 }
 
 // Deadline-driven degradation ladder. The startup mode/pipeline/multiplier are the
@@ -8080,11 +9119,7 @@ using FramegenEffective_t = gamescope::framegen::EffectiveConfig;
 
 static bool framegen_recovery_enabled()
 {
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RECOVER" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_RECOVER", true );
 	return s_bEnabled;
 }
 
@@ -8262,6 +9297,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	const bool bCut = reason != nullptr
 		&& ( strcmp( reason, "base_colorspace_change" ) == 0
 			|| strcmp( reason, "output_eotf_change" ) == 0
+			|| strcmp( reason, "net_input_key_change" ) == 0
 			|| strcmp( reason, "layer_count_change" ) == 0 );
 	framegen_metrics_note_reset( bCut ? FramegenResetReason_t::Cut
 		: bHitch ? FramegenResetReason_t::Hitch
@@ -8332,6 +9368,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	// Forget learned per-rung costs so the new scene is measured afresh rather than
 	// inheriting the old scene's "this rung overruns" verdicts.
 	g_device.framegenResetRungCosts();
+	g_framegenMotion.learning = {};
 	// The adaptation EMAs describe the old scene's content (noise floor,
 	// round-trip ambiguity); a new scene re-calibrates from the defaults.
 	g_framegenHistory.adaptation = {};
@@ -8343,8 +9380,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	g_framegenHistory.ulNetRecordConsumedSeqNo = 0;
 	// A pending profile snapshot dies with the scene too; the learned
 	// weights themselves persist — they describe the game, not one shot.
-	g_framegenHistory.ulNetProfileSeqNo = 0;
-	g_framegenHistory.ulNetProfileConsumedSeqNo = 0;
+	framegen_net_drop_profile_readback();
 	// Temporal acceleration must never cross a scene/cadence discontinuity.
 	g_framegenMotion.uMotionHistoryFrameId = 0;
 	g_framegenMotion.uMotionHistoryIntervalNs = 0;
@@ -8408,11 +9444,104 @@ void vulkan_framegen_reset( const char *reason )
 	// new workload from the configured pipeline instead of stepping on the old scene's stale
 	// over-deadline measurements.
 	g_device.framegenResetRungCosts();
+	g_framegenMotion.learning = {};
 	g_output.framegenOutputImages.clear();
 	g_output.framegenPresentImages.clear();
 	g_output.framegenCursorHistoryImages.clear();
 	g_framegenMotion = {};
 	g_framegenColorProbe = {};
+}
+
+// The one dormancy transition point: the compositor thread, once per main-loop
+// iteration, after steamcompmgr's mode/rotation remake and before any paint or
+// vblank-driven generated present. It is the only writer of the published
+// reason, so every framegen decision of an iteration sees one state.
+void vulkan_framegen_update_dormancy()
+{
+	if ( !framegen_configured() )
+		return;
+	// g_uOutputRotation and the virtual-connector convar are read here, on the
+	// thread that already reads them per iteration (the rotation remake block,
+	// the virtual-connector focus rebuild), never from feedback threads.
+	const FramegenDormantReason reason = gamescope::framegen::framegen_dormant_reason(
+		g_uOutputRotation,
+		gamescope::VirtualConnectorIsSingleOutput(),
+		g_bFramegenRingAllocationFailed.load( std::memory_order_relaxed ) );
+	const FramegenDormantReason previous = g_framegenDormancy.reason;
+	if ( reason == previous )
+		return;
+
+	const uint64_t ulNowNs = get_time_in_nanos();
+	if ( previous != FramegenDormantReason::NotDormant )
+		g_framegenDormancy.durationNs[ static_cast<size_t>( previous ) ] +=
+			ulNowNs - g_framegenDormancy.sinceNs;
+	g_framegenDormancy.reason = reason;
+	g_framegenDormancy.sinceNs = ulNowNs;
+	const char *pszReason = gamescope::framegen::framegen_dormant_reason_name( reason );
+	switch ( reason )
+	{
+		case FramegenDormantReason::NotDormant:
+			vk_log.infof( "framegen: active again (was %s)",
+				gamescope::framegen::framegen_dormant_reason_name( previous ) );
+			break;
+		case FramegenDormantReason::OutputRotation:
+			vk_log.infof( "framegen: dormant (output_rotation): composited output rotation is active; generated frames assume an unrotated output" );
+			break;
+		case FramegenDormantReason::MultiOutput:
+			vk_log.infof( "framegen: dormant (multi_output): more than one virtual output; framegen keeps a single frame history" );
+			break;
+		case FramegenDormantReason::RingAllocation:
+			// Straight from active, the failed allocation has just logged.
+			if ( previous != FramegenDormantReason::NotDormant )
+				vk_log.infof( "framegen: dormant (ring_allocation): the framegen output ring failed to allocate; retried at the next output remake" );
+			break;
+	}
+	g_eFramegenDormantReason.store( reason, std::memory_order_relaxed );
+
+	// Drop everything queued for presentation. Unlike focus_change (which keeps
+	// bidir's delayed reals for the next opportunity), nothing consumes the
+	// queue while dormant, so the delayed reals go too, counted as dropped. The
+	// reset then retires framegen-queue and base-ingest work and drops history,
+	// read pins and the framegen output/present images, as on a ring remake.
+	framegen_clear_pending();
+	char szResetReason[64];
+	snprintf( szResetReason, sizeof( szResetReason ), "dormant:%s", pszReason );
+	vulkan_framegen_reset( reason == FramegenDormantReason::NotDormant ? "resume" : szResetReason );
+
+	// Present tracking may toggle here (framegen_present_tracking_enabled), so
+	// restart its per-frame identity and timing learners. Tokens, slot and real
+	// frame ids stay monotonic for METRICS; feedback from tags taken before now
+	// still counts there but no longer teaches the display timing state.
+	const uint64_t ulLastPresentToken = g_framegenPresentState.ulLastPresentToken;
+	const uint64_t ulLastSlotId = g_framegenPresentState.ulLastSlotId;
+	const uint64_t ulNextRealFrameId = g_framegenPresentState.ulCurrentRealFrameId + 1u;
+	g_framegenPresentState = {};
+	g_framegenPresentState.ulLastPresentToken = ulLastPresentToken;
+	g_framegenPresentState.ulLastSlotId = ulLastSlotId;
+	g_framegenPresentState.ulCurrentRealFrameId = ulNextRealFrameId;
+	g_ulFramegenFirstPresentToken = ulLastPresentToken + 1u;
+
+	// vulkan_make_output_images sizes the ring by vulkan_framegen_is_enabled().
+	// A ring made under the other state is remade here, outside any paint: the
+	// remake only empties it (waitIdle first) and the next composite allocates
+	// lazily. An empty ring (the rotation remake just ran) needs nothing. A
+	// ring_allocation ring already is default-sized, so it is left alone and
+	// keeps its latch.
+	const uint32_t nWantedRing = reason == FramegenDormantReason::NotDormant
+		? gamescope::framegen::output_ring_size_for_multiplier( g_nFramegenMultiplier )
+		: k_uOutputRingSizeDefault;
+	if ( framegen_owns_output_ring() && !g_output.outputImages.empty()
+		&& g_output.outputImages.size() != nWantedRing )
+		vulkan_remake_output_images();
+
+	// Recomposite under the new policy (forced composite, VRR, tearing) and,
+	// on resume, prime history from a fresh real frame.
+	force_repaint();
+}
+
+void vulkan_framegen_flush_profile()
+{
+	framegen_net_profile_flush();
 }
 
 void vulkan_framegen_shutdown()
@@ -8430,7 +9559,7 @@ void vulkan_framegen_shutdown()
 	g_bFramegenFeedbackShutdown = true;
 	framegen_flush_present_wait_tags( false );
 
-	if ( !vulkan_framegen_is_enabled() )
+	if ( !framegen_configured() )
 	{
 		if ( framegen_metrics_enabled() )
 			framegen_metrics_shutdown();
@@ -8623,7 +9752,7 @@ static gamescope::framegen::PaintReport_t s_bidirPaintReport;
 // then the true flip target. It never depends on a pending present tag.
 static uint64_t framegen_bidir_opportunity_ns()
 {
-	return GetVBlankTimer().GetNextVBlank( 0 );
+	return framegen_next_vblank_ns();
 }
 
 // What the presenter knows at ulOpportunityNs, for the presenter and the
@@ -8682,6 +9811,18 @@ static size_t framegen_bidir_shed_to_capacity( size_t capacity )
 	return plan.indices.size();
 }
 
+// A queue front leaving at ulOpportunityNs: one the ring ceiling forced out
+// ahead of its slot (bidir_front_forced) is an overflow of the ring bound.
+static void framegen_bidir_note_ring_overflow( uint64_t ulTargetNs, uint64_t ulOpportunityNs, uint64_t ulVblankIntervalNs )
+{
+	if ( !gamescope::framegen::bidir_front_forced( ulTargetNs, ulOpportunityNs, ulVblankIntervalNs ) )
+		return;
+	gamescope::framegen::BidirTimelineState_t &bidir = g_framegenHistory.bidir;
+	bidir.ringBound = gamescope::framegen::observe_bidir_ring_overflow( bidir.ringBound, ulOpportunityNs,
+		bidir.epoch.valid ? bidir.epoch.delayNs : 0u );
+	framegen_metrics_note_ring_overflow();
+}
+
 // Whether a queued interpolation's GPU work has finished (reals: always).
 static bool framegen_bidir_entry_completed( const FramegenHistory_t::PendingGenerated_t &entry )
 {
@@ -8727,6 +9868,7 @@ static const FramegenHistory_t::PendingGenerated_t *framegen_bidir_due_front( ui
 				return nullptr;
 			case gamescope::framegen::BidirFrontAction_t::Discard:
 				framegen_metrics_note_discard( 1 );
+				framegen_bidir_note_ring_overflow( front.ulTargetFlipNs, ulOpportunityNs, view.vblankIntervalNs );
 				break;
 			case gamescope::framegen::BidirFrontAction_t::TooSlow:
 			{
@@ -8774,12 +9916,20 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_present_front( gamescope::Rc
 	framegen_select_present_tag(
 		front.bReal ? gamescope::FramegenPresentKind_t::DelayedReal
 			: gamescope::FramegenPresentKind_t::Generated,
-		front.ulPresentRealFrameId, front.ulSlotId,
-		front.ulCompositeSeqNo, front.ulTargetFlipNs );
+		front.ulPresentRealFrameId, front.ulSlotId, front.ulCompositeSeqNo,
+		gamescope::framegen::display_target_ns( front.ulTargetFlipNs, g_framegenPresentState.displayTiming ) );
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
+	if ( front.bReal && gamescope::framegen::bidir_real_on_slot( front.ulTargetFlipNs, ulOpportunityNs, ulVblankIntervalNs ) )
+	{
+		FramegenBidirBiasTokens_t &tokens = g_framegenPresentState.onSlotRealTokens;
+		std::shift_left( tokens.begin(), tokens.end(), 1 );
+		tokens.back() = { g_framegenPresentState.pendingTag.ulPresentToken, front.ulTargetFlipNs };
+	}
+	framegen_bidir_note_ring_overflow( front.ulTargetFlipNs, ulOpportunityNs, ulVblankIntervalNs );
 	static uint64_t s_uPresentedDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
-		vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u",
-			front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
+		vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u selection_ns=%" PRIu64,
+			front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ), get_time_in_nanos() );
 	return pImage;
 }
 
@@ -8861,7 +10011,7 @@ size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs )
 			? 0u : g_framegenHistory.pending.front().ulTargetFlipNs;
 		*pflFrontTargetDeltaMs = ulTargetNs != 0u
 			? gamescope::framegen::signed_ns_delta(
-				ulTargetNs, GetVBlankTimer().GetNextVBlank( 0 ) ) / 1.0e6
+				ulTargetNs, framegen_next_vblank_ns() ) / 1.0e6
 			: 0.0;
 	}
 	return g_framegenHistory.pending.size();
@@ -8872,15 +10022,17 @@ size_t vulkan_framegen_pending_queue_debug( double *pflFrontTargetDeltaMs )
 // stack (fresh overlays, latest cursor). Output-space cursor split: a frame
 // predicted from cursor-free history gets the LIVE pointer composited now, not
 // a motion-warped copy of where it was a real frame ago (front.tex untouched
-// when the live stack has no cursor layer). Otherwise the generated output is
+// when the live stack has no cursor layer). A frame predicted from HUD-free
+// history gets the live HUD the same way. Otherwise the generated output is
 // scanout-ready as is.
 static gamescope::Rc<CVulkanTexture> framegen_present_image( const FramegenHistory_t::PendingGenerated_t &front,
 	const struct FrameInfo_t *pPresentFrameInfo )
 {
 	if ( g_framegenHistory.bBaseLayer )
 		return framegen_base_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
-	if ( front.bCursorFree && !front.bReal )
-		return framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo );
+	if ( ( front.bCursorFree || front.bHudFree ) && !front.bReal )
+		return framegen_cursor_present_composite( front.tex, front.seqNo, pPresentFrameInfo,
+			front.bCursorFree, front.bHudFree );
 	return front.tex;
 }
 
@@ -8899,9 +10051,9 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 		// of unchanged base content (overlay ticks, repeat-vblank fills) consume
 		// a due front below; a front that is not due stays queued and the flip
 		// substitution holds the last output instead.
-		if ( pPresentFrameInfo && pPresentFrameInfo->layerCount > 0
-			&& pPresentFrameInfo->layers[ 0 ].tex != nullptr
-			&& pPresentFrameInfo->layers[ 0 ].tex.get() != g_framegenHistory.pLastBaseTexture )
+		if ( pPresentFrameInfo && pPresentFrameInfo->layers.count() > 0
+			&& pPresentFrameInfo->layers.get( 0 ).tex != nullptr
+			&& pPresentFrameInfo->layers.get( 0 ).tex.get() != g_framegenHistory.pLastBaseTexture )
 			return nullptr;
 		const uint64_t ulOpportunityNs = framegen_bidir_opportunity_ns();
 		const FramegenHistory_t::PendingGenerated_t *pFront = framegen_bidir_due_front( ulOpportunityNs );
@@ -8955,8 +10107,8 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 			front.ulCompositeSeqNo, front.ulTargetFlipNs );
 		static uint64_t s_uPresentedDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
-			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u",
-				front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
+			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u selection_ns=%" PRIu64,
+				front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ), get_time_in_nanos() );
 	}
 
 	if ( g_framegenHistory.pending.empty() )
@@ -9032,7 +10184,7 @@ static void framegen_bidir_select_hold_tag( uint64_t ulOpportunityNs )
 		g_framegenPresentState.ulCurrentRealFrameId,
 		framegen_next_present_slot_id(),
 		g_framegenPresentState.ulCurrentRealCompositeSeqNo,
-		ulOpportunityNs );
+		gamescope::framegen::display_target_ns( ulOpportunityNs, g_framegenPresentState.displayTiming ) );
 }
 
 // Flip substitution (see rendervulkan.hpp): present the bidir queue front in
@@ -9167,7 +10319,8 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_select_flip( const gamescope
 	framegen_bidir_note_consumed( g_framegenPresentState.ulCurrentRealFrameId );
 	static uint64_t s_uLiveDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uLiveDebugLogCounter ) )
-		vk_log.infof( "framegen: presented live real frame id=%" PRIu64 ".100", g_framegenHistory.currentFrameId );
+		vk_log.infof( "framegen: presented live real frame id=%" PRIu64 ".100 selection_ns=%" PRIu64,
+			g_framegenHistory.currentFrameId, get_time_in_nanos() );
 	return pComposite;
 }
 
@@ -9216,7 +10369,7 @@ static bool framegen_create_output_texture( gamescope::OwningRc<CVulkanTexture> 
 	//    into the acquired swapchain image, so it is ALWAYS a sampled source
 	//    there and must not depend on the cursor-split env var.
 	createFlags.bSampled = framegen_cursor_split_enabled() || !framegen_owns_output_ring();
-	createFlags.bOutputImage = true;
+	createFlags.bOutputImage = framegen_owns_output_ring();
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
@@ -9371,12 +10524,16 @@ static gamescope::Rc<CVulkanTexture> framegen_acquire_pool_image(
 // flippable — a cursor-free frame is a prediction input, not a scanout buffer.
 // bFramegenShared is mandatory: the framegen queue may live on another family
 // (see the split-family rules around framegen_create_base_history_texture).
+// With the framegen HUD on, the HUD split also copies the finished composite
+// into these images (transferDst). The HUD level is fixed for the process, so
+// the pool never mixes usage sets, and with the HUD off the flags stay as before.
 static bool framegen_create_cursor_history_texture( gamescope::OwningRc<CVulkanTexture> *ppTexture, uint32_t width, uint32_t height, uint32_t drmFormat )
 {
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bStorage = true;
 	createFlags.bSampled = true;
 	createFlags.bTransferSrc = true;
+	createFlags.bTransferDst = framegen_hud_level() != 0u;
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
@@ -9436,9 +10593,13 @@ static gamescope::Rc<CVulkanTexture> framegen_acquire_cursor_history_image( uint
 // edge differs — and it differs the same way on real and generated frames,
 // which is what matters for temporal consistency. It is also what a hardware
 // cursor plane does on KMS, where the cursor blends after the CRTC pipeline.
+//
+// pCursorLayer may be null: the generated-frame HUD present (no cursor to
+// draw) then gets a single PASSTHRU layer, i.e. a raw-value copy of pBase that
+// the HUD pass draws on.
 static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 	const gamescope::Rc<CVulkanTexture> &pBase,
-	const struct FrameInfo_t::Layer_t &cursorLayer,
+	const struct FrameInfo_t::Layer_t *pCursorLayer,
 	const struct FrameInfo_t *pSource )
 {
 	*pOut = FrameInfo_t{};
@@ -9451,9 +10612,7 @@ static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 		pOut->lut3D[ i ] = pSource->lut3D[ i ];
 	}
 
-	pOut->layerCount = 2;
-
-	FrameInfo_t::Layer_t &base = pOut->layers[ 0 ];
+	FrameInfo_t::Layer_t &base = *pOut->layers.push();
 	base.tex = pBase;
 	base.zpos = g_zposBase;
 	base.scale = vec2_t{ 1.0f, 1.0f };
@@ -9465,11 +10624,13 @@ static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 	base.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
 	base.eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
 
-	pOut->layers[ 1 ] = cursorLayer;
+	if ( pCursorLayer == nullptr )
+		return;
+	*pOut->layers.push() = *pCursorLayer;
 	// Compositor-owned layers carry no commit back-pointers; the import staging
 	// pass keys off these, and a stale pointer here would be a lifetime bug.
-	pOut->layers[ 1 ].pCommitTexture = nullptr;
-	pOut->layers[ 1 ].pStagedCopyCount = nullptr;
+	pOut->layers.get( 1 ).pCommitTexture = nullptr;
+	pOut->layers.get( 1 ).pStagedCopyCount = nullptr;
 }
 
 // Second half of the output-space cursor split: draw the CURRENT cursor onto a
@@ -9480,10 +10641,22 @@ static void framegen_build_cursor_overlay_frame_info( struct FrameInfo_t *pOut,
 // framegen_record_real_frame (no history poisoning) and off the output ring.
 // Returns the generated frame unchanged when there is nothing to draw, so a
 // frame with no cursor costs literally nothing.
-static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo )
+//
+// bCursorFree: the frame was predicted from cursor-free history, so the live
+// cursor goes on top. bHudFree: it was predicted from HUD-free history (the HUD
+// split in vulkan_composite), so the live HUD goes on top too, in the same
+// command buffer. Without that, the HUD would only reach real frames and
+// strobe at the real-frame rate. With no cursor to draw, the pass is a
+// single-layer PASSTHRU copy of the generated frame plus the HUD dispatch.
+// The present pool is flippable, and transfer usage on it would change the
+// scanout modifier negotiation, so this copy is the passthrough blit rather
+// than vkCmdCopyImage.
+static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedOutput, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo, bool bCursorFree, bool bHudFree )
 {
-	const int nCursorLayer = framegen_cursor_top_layer_index( pPresentFrameInfo );
-	if ( nCursorLayer < 0 )
+	const int nCursorLayer = bCursorFree
+		? framegen_cursor_top_layer_index( pPresentFrameInfo ) : -1;
+	const bool bDrawHud = bHudFree && framegen_hud_level() != 0u;
+	if ( nCursorLayer < 0 && !bDrawHud )
 		return pGeneratedOutput;
 
 	if ( !framegen_ensure_present_pool() || g_output.framegenPresentImages.empty()
@@ -9509,11 +10682,16 @@ static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescop
 
 	FrameInfo_t cursorFrameInfo;
 	framegen_build_cursor_overlay_frame_info( &cursorFrameInfo, pGeneratedOutput,
-		pPresentFrameInfo->layers[ nCursorLayer ], pPresentFrameInfo );
+		nCursorLayer >= 0 ? &pPresentFrameInfo->layers.get( nCursorLayer ) : nullptr,
+		pPresentFrameInfo );
 
 	auto pCmdBuffer = g_device.commandBuffer();
 	g_device.addFramegenDependency( pCmdBuffer.get(), ulFramegenSeqNo );
-	std::optional<uint64_t> oSeqNo = vulkan_composite( &cursorFrameInfo, nullptr, false, pTarget, false, std::move( pCmdBuffer ) );
+	// The HUD text is built from the live stack (pPresentFrameInfo), not from
+	// this compositor-only frame info: it carries no client commit, so the HUD's
+	// render-origin line would otherwise differ between real and generated frames.
+	std::optional<uint64_t> oSeqNo = vulkan_composite( &cursorFrameInfo, nullptr, false, pTarget, false, std::move( pCmdBuffer ),
+		bDrawHud, pPresentFrameInfo );
 	if ( !oSeqNo )
 		return pGeneratedOutput;
 	// Same wait the real composition path performs before its flip: the commit
@@ -9539,10 +10717,10 @@ static gamescope::Rc<CVulkanTexture> framegen_cursor_present_composite( gamescop
 // framegen_record_real_frame (no history poisoning) and off the output ring.
 static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope::Rc<CVulkanTexture> pGeneratedBase, uint64_t ulFramegenSeqNo, const struct FrameInfo_t *pPresentFrameInfo )
 {
-	if ( pPresentFrameInfo == nullptr || pPresentFrameInfo->layerCount < 1
-		|| pPresentFrameInfo->layers[ 0 ].tex == nullptr
-		|| pPresentFrameInfo->layers[ 0 ].tex->width() != pGeneratedBase->width()
-		|| pPresentFrameInfo->layers[ 0 ].tex->height() != pGeneratedBase->height() )
+	if ( pPresentFrameInfo == nullptr || pPresentFrameInfo->layers.count() < 1
+		|| pPresentFrameInfo->layers.get( 0 ).tex == nullptr
+		|| pPresentFrameInfo->layers.get( 0 ).tex->width() != pGeneratedBase->width()
+		|| pPresentFrameInfo->layers.get( 0 ).tex->height() != pGeneratedBase->height() )
 	{
 		// The live frame's base no longer matches the prediction (the paint
 		// config changed between plan and present). The supersede/invalidate
@@ -9572,7 +10750,7 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 	}
 
 	FrameInfo_t generatedFrameInfo = *pPresentFrameInfo;
-	generatedFrameInfo.layers[ 0 ].tex = pGeneratedBase;
+	generatedFrameInfo.layers.get( 0 ).tex = pGeneratedBase;
 
 	auto pCmdBuffer = g_device.commandBuffer();
 	g_device.addFramegenDependency( pCmdBuffer.get(), ulFramegenSeqNo );
@@ -9590,7 +10768,7 @@ static gamescope::Rc<CVulkanTexture> framegen_base_present_composite( gamescope:
 		vk_log.infof( "framegen: late composite base=%ux%u output=%ux%u layers=%d fsr=%d",
 			pGeneratedBase->width(), pGeneratedBase->height(),
 			pTarget->width(), pTarget->height(),
-			pPresentFrameInfo->layerCount,
+			pPresentFrameInfo->layers.count(),
 			pPresentFrameInfo->useFSRLayer0 ? 1 : 0 );
 
 	return pTarget;
@@ -9787,7 +10965,7 @@ static const char *framegen_net_weights_path()
 // served weights are written back there periodically while training.
 static bool framegen_net_online_enabled()
 {
-	static const bool s_bEnabled = env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_NET_ONLINE" ) );
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_NET_ONLINE", false );
 	return s_bEnabled;
 }
 
@@ -9847,6 +11025,11 @@ static bool g_bFramegenNetProfileLoaded = false;
 static uint64_t g_ulFramegenNetProgress = 0;                     // trained steps, all-time
 static uint64_t g_ulFramegenNetLiveProgress = 0;                 // progress at the cached readback
 static std::atomic<uint64_t> g_ulFramegenNetSavedProgress = { 0 }; // progress at the last successful write
+static FramegenNetProgress_t framegen_net_progress()
+{
+	return { g_ulFramegenNetProgress, g_ulFramegenNetLiveProgress,
+		g_ulFramegenNetSavedProgress.load() };
+}
 static std::atomic<bool> g_bFramegenNetWriteInFlight = { false };
 // Periodic profile I/O is off the render thread, but the worker remains owned:
 // reset/exit joins it before touching the same temp path or destroying process
@@ -9854,85 +11037,140 @@ static std::atomic<bool> g_bFramegenNetWriteInFlight = { false };
 // and race libc/static teardown.
 static std::thread g_framegenNetWriteThread;
 
-static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &weights, bool bLogMissing )
+// The offline trainer's bare GSFR blob (GAMESCOPE_FRAMEGEN_NET). It is not a
+// profile: an explicit prior for every encoding the profile has no set for.
+static bool framegen_net_parse_blob( const char *pszPath, std::vector<float> &weights )
 {
-	FILE *pFile = fopen( pszPath, "rb" );
-	if ( pFile == nullptr )
+	const gamescope::framegen::NetWeightsFileRead input =
+		gamescope::framegen::read_net_weights_file( pszPath, weights );
+	if ( input.status == gamescope::framegen::NetWeightsFileStatus::Unreadable )
 	{
-		if ( bLogMissing )
-			vk_log.errorf( "framegen: net weights '%s' unreadable", pszPath );
+		vk_log.errorf( "framegen: net weights '%s' unreadable", pszPath );
 		return false;
 	}
 
-	gamescope::framegen::NetProfileMetadata metadata = {};
-	bool bOk = fread( metadata.data(), sizeof( uint32_t ), metadata.size(), pFile ) == metadata.size();
-	const uint32_t uVersion = bOk
-		? gamescope::framegen::net_profile_metadata_version( metadata ) : 0u;
-	bOk = uVersion != 0u;
-	if ( bOk )
+	const bool bOk = input.status == gamescope::framegen::NetWeightsFileStatus::Loaded;
+	if ( input.status == gamescope::framegen::NetWeightsFileStatus::Profile )
 	{
-		weights.resize( k_uFramegenNetFloats );
-		bOk = fread( weights.data(), sizeof( float ), weights.size(), pFile ) == weights.size();
-		bOk = bOk && gamescope::framegen::validate_and_migrate_net_profile_weights(
-			uVersion, weights );
+		vk_log.errorf( "framegen: net weights '%s' are a per-game profile; pass it as GAMESCOPE_FRAMEGEN_NET_PROFILE (without NET_ONLINE it is served read-only)", pszPath );
 	}
-	fclose( pFile );
-
-	if ( !bOk )
+	else if ( !bOk )
 	{
-		weights.clear();
 		vk_log.errorf( "framegen: net weights '%s' malformed (want 3 finite fp32 conv layers 12->16->16->4, k=3)", pszPath );
 	}
-	else if ( uVersion < k_uFramegenNetVersion )
+	else if ( input.version < k_uFramegenNetVersion )
 	{
 		vk_log.infof( "framegen: net weights '%s' use legacy v%u training semantics; accepting as a bounded prior under v%u with the formerly-reserved shading head zeroed",
-			pszPath, uVersion, k_uFramegenNetVersion );
+			pszPath, input.version, k_uFramegenNetVersion );
 	}
 	return bOk;
 }
 
-// The refiner's starting weights, first match wins: a saved per-game profile,
-// the GAMESCOPE_FRAMEGEN_NET blob, or (online mode only) a synthesized
-// neutral init — He-random hidden layers, zero head, i.e. exactly Stage B
-// until learning moves it. Empty = refiner disabled.
-static const std::vector<float> &framegen_net_weights()
+// Per-game learning is keyed by the encoding of the history the net samples
+// (gamescope::framegen::net_input_key): a learned set is never served, decayed
+// toward or saved under another encoding. Render thread only; the checkpoint
+// writer receives encoded bytes, never this store.
+struct FramegenNetStore_t
 {
-	static const std::vector<float> s_weights = []() -> std::vector<float>
+	std::vector<gamescope::framegen::NetProfileSet> sets; // loaded from the profile, then committed
+	std::vector<uint32_t> profileKeys; // keys that came from the file (HUD provenance)
+	std::vector<float> blob;           // GAMESCOPE_FRAMEGEN_NET, if given
+	// He-random hidden layers, zero head: exactly Stage B until learning moves it.
+	std::vector<float> neutral;
+	uint64_t ulRevision = 0; // bumps whenever a committed set changes
+};
+
+static FramegenNetStore_t &framegen_net_store()
+{
+	static FramegenNetStore_t s_store = []()
 	{
-		std::vector<float> weights;
-		if ( framegen_net_profile_path() != nullptr && framegen_net_parse_blob( framegen_net_profile_path(), weights, false ) )
+		FramegenNetStore_t store;
+		if ( const char *pszProfile = framegen_net_profile_path() )
 		{
-			g_bFramegenNetProfileLoaded = true;
-			vk_log.infof( "framegen: net prior loaded from profile '%s'", framegen_net_profile_path() );
-			return weights;
-		}
-		if ( framegen_net_weights_path() != nullptr )
-		{
-			if ( framegen_net_parse_blob( framegen_net_weights_path(), weights, true ) )
+			// A missing file is a new profile. Anything but a current GSFP is
+			// incompatible: it is ignored, and the first save replaces it.
+			if ( gamescope::framegen::read_net_profile_file( pszProfile, store.sets )
+				== gamescope::framegen::NetProfileFileStatus::Malformed )
+				vk_log.infof( "framegen: net profile '%s' is not a current GSFP v%u profile (older format or damaged); starting a new profile there",
+					pszProfile, gamescope::framegen::k_uFramegenNetProfileVersion );
+			for ( const gamescope::framegen::NetProfileSet &set : store.sets )
 			{
-				vk_log.infof( "framegen: net weights loaded from '%s' (%u floats)", framegen_net_weights_path(), k_uFramegenNetFloats );
-				return weights;
+				char szName[ 48 ];
+				gamescope::framegen::net_input_key_name( set.key, szName, sizeof( szName ) );
+				vk_log.infof( "framegen: net profile '%s' holds a set for '%s'", pszProfile, szName );
+				store.profileKeys.push_back( set.key );
 			}
-			// Malformed blob (already logged loudly). Online mode still gets
-			// its neutral prior below; without online learning there is
-			// nothing safe to serve, so the refiner stays disabled.
 		}
-		if ( framegen_net_online_enabled() )
-		{
-			weights.assign( k_uFramegenNetFloats, 0.0f );
-			std::mt19937 rng( 7u );
-			std::normal_distribution<float> dist1( 0.0f, std::sqrt( 2.0f / 108.0f ) );
-			std::normal_distribution<float> dist2( 0.0f, std::sqrt( 2.0f / 144.0f ) );
-			for ( uint32_t i = 0; i < k_uFramegenNetLayer1Weights; i++ )
-				weights[ i ] = dist1( rng );
-			for ( uint32_t i = k_uFramegenNetLayer2Offset;
-				i < k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights; i++ )
-				weights[ i ] = dist2( rng );
-			vk_log.infof( "framegen: net starting from a neutral prior (no blob/profile); online learning will shape it" );
-		}
-		return weights;
+		if ( framegen_net_weights_path() != nullptr
+			&& framegen_net_parse_blob( framegen_net_weights_path(), store.blob ) )
+			vk_log.infof( "framegen: net weights loaded from '%s' (%u floats)", framegen_net_weights_path(), k_uFramegenNetFloats );
+
+		store.neutral.assign( k_uFramegenNetFloats, 0.0f );
+		std::mt19937 rng( 7u );
+		std::normal_distribution<float> dist1( 0.0f, std::sqrt( 2.0f / 108.0f ) );
+		std::normal_distribution<float> dist2( 0.0f, std::sqrt( 2.0f / 144.0f ) );
+		for ( uint32_t i = 0; i < k_uFramegenNetLayer1Weights; i++ )
+			store.neutral[ i ] = dist1( rng );
+		for ( uint32_t i = k_uFramegenNetLayer2Offset;
+			i < k_uFramegenNetLayer2Offset + k_uFramegenNetLayer2Weights; i++ )
+			store.neutral[ i ] = dist2( rng );
+		return store;
 	}();
-	return s_weights;
+	return s_store;
+}
+
+// The active input key and its activation prior: the weights a fresh upload
+// carries, the decay target, and what a state re-init re-seeds from. An empty
+// prior means no weights exist for this encoding, so the refiner stays off,
+// as it always has without weights and without online learning.
+static uint32_t g_uFramegenNetActiveKey = 0;
+static bool g_bFramegenNetKeyActive = false;
+static std::vector<float> g_framegenNetActivePrior;
+// A key switch left netWeightsUpload holding the outgoing set.
+static bool g_bFramegenNetStagingStale = false;
+static std::atomic<uint64_t> g_ulFramegenNetSavedRevision = { 0 };
+
+static bool framegen_net_configured()
+{
+	const FramegenNetStore_t &store = framegen_net_store();
+	return framegen_net_online_enabled() || !store.sets.empty() || !store.blob.empty();
+}
+
+// Before any real frame chose a key (the in-binary benchmark) a fresh upload
+// carries the neutral init, which only times the passes.
+static const std::vector<float> &framegen_net_activation_weights()
+{
+	if ( g_bFramegenNetKeyActive && !g_framegenNetActivePrior.empty() )
+		return g_framegenNetActivePrior;
+	return framegen_net_store().neutral;
+}
+
+// Commit one key's weights. Capped like the file format; realistic games use
+// one to three encodings.
+static void framegen_net_store_put( uint32_t uKey, const std::vector<float> &weights )
+{
+	FramegenNetStore_t &store = framegen_net_store();
+	for ( gamescope::framegen::NetProfileSet &set : store.sets )
+	{
+		if ( set.key == uKey )
+		{
+			set.weights = weights;
+			store.ulRevision++;
+			return;
+		}
+	}
+	if ( store.sets.size() >= gamescope::framegen::k_uFramegenNetProfileMaxSets )
+	{
+		static bool s_bLoggedFull = false;
+		if ( !s_bLoggedFull )
+		{
+			vk_log.errorf( "framegen: net profile already holds %zu weight sets; not persisting another", store.sets.size() );
+			s_bLoggedFull = true;
+		}
+		return;
+	}
+	store.sets.push_back( { uKey, weights } );
+	store.ulRevision++;
 }
 
 static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
@@ -9951,7 +11189,7 @@ static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
 	}
 
 	return ePipeline >= GamescopeFramegenPipeline::Learned
-		&& !framegen_net_weights().empty();
+		&& ( g_bFramegenNetKeyActive ? !g_framegenNetActivePrior.empty() : framegen_net_configured() );
 }
 
 // Dataset capture: GAMESCOPE_FRAMEGEN_RECORD=<dir> dumps the raw field-res
@@ -9960,8 +11198,17 @@ static bool framegen_net_requested( GamescopeFramegenPipeline ePipeline )
 // samples (default 1000 — mind the disk; ~0.6 MB per 1080p sample).
 static const char *framegen_record_dir()
 {
-	static const char *s_pszDir = gamescope::framegen::non_empty_setting(
-		getenv( "GAMESCOPE_FRAMEGEN_RECORD" ) );
+	static const char *s_pszDir = []() -> const char *
+	{
+		const char *pszDir = gamescope::framegen::non_empty_setting( getenv( "GAMESCOPE_FRAMEGEN_RECORD" ) );
+		// GSFD samples and the trainer that reads them are defined at /8.
+		if ( pszDir != nullptr && framegen_motion_scale() != gamescope::framegen::k_uMotionReferenceScale )
+		{
+			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_RECORD ignored: captures hold /8 fields and the fine motion field is on" );
+			return nullptr;
+		}
+		return pszDir;
+	}();
 	return s_pszDir;
 }
 
@@ -9976,6 +11223,86 @@ static uint32_t framegen_record_max()
 }
 
 static uint32_t g_uFramegenRecordCount = 0;
+
+// Make uKey's set the served one. A switch first publishes a completed
+// outgoing snapshot and retires the outgoing set into the store, then drops
+// any unfinished readback: it holds the outgoing weights and must never be
+// published under the new key (at most one batch of learning is lost). The
+// GPU weights, decay prior and optimizer state re-seed on the next net batch;
+// work already submitted finishes on the old weights. Activation is a warm
+// restart, as after a GPU-state recreate: the set's latest weights become its
+// prior.
+static void framegen_net_activate_key( uint32_t uKey )
+{
+	FramegenNetStore_t &store = framegen_net_store();
+	char szName[ 48 ];
+	gamescope::framegen::net_input_key_name( uKey, szName, sizeof( szName ) );
+	if ( g_bFramegenNetKeyActive )
+	{
+		framegen_net_profile_consume();
+		if ( g_framegenNetLiveWeights.size() == k_uFramegenNetFloats )
+			framegen_net_store_put( g_uFramegenNetActiveKey, g_framegenNetLiveWeights );
+		g_framegenNetLiveWeights.clear();
+		framegen_net_drop_profile_readback();
+		// GSFD samples carry no key, so a capture directory must never mix
+		// encodings: saturating the counter ends capture for the process.
+		if ( framegen_record_dir() != nullptr && g_uFramegenRecordCount > 0
+			&& g_uFramegenRecordCount < framegen_record_max() )
+		{
+			vk_log.infof( "framegen: dataset capture stopped after %u samples: the input encoding changed to '%s'",
+				g_uFramegenRecordCount, szName );
+			g_uFramegenRecordCount = framegen_record_max();
+		}
+	}
+
+	const std::span<const float> prior = gamescope::framegen::net_profile_prior( uKey,
+		store.sets, store.blob,
+		framegen_net_online_enabled() ? std::span<const float>( store.neutral ) : std::span<const float>() );
+	g_framegenNetActivePrior.assign( prior.begin(), prior.end() );
+	const bool bFromProfile = !prior.empty()
+		&& std::ranges::find( store.profileKeys, uKey ) != store.profileKeys.end();
+	const char *pszSource = bFromProfile ? "profile set" : "set learned earlier in this session";
+	if ( prior.empty() )
+		pszSource = "no weights for this encoding; learned refinement off";
+	else if ( prior.data() == store.neutral.data() )
+		pszSource = "neutral prior; online learning will shape it";
+	else if ( prior.data() == store.blob.data() )
+		pszSource = "GAMESCOPE_FRAMEGEN_NET blob";
+
+	g_uFramegenNetActiveKey = uKey;
+	g_bFramegenNetKeyActive = true;
+	g_bFramegenNetProfileLoaded = bFromProfile;
+	g_bFramegenNetStagingStale = true;
+	g_framegenMotion.bNetWeightsUploaded = false;
+	g_framegenMotion.bNetStatePending = true;
+	g_framegenMotion.learning = {};
+	g_device.framegenResetTrainingCost();
+	vk_log.infof( "framegen: net set '%s' active: %s", szName, pszSource );
+}
+
+// One u32 compare per real frame unless the encoding changed. The output
+// transfer is the composite's effective one (vulkan_composite): EOTF_Count is
+// an identity output after input degamma, not pass-through SDR.
+static void framegen_net_note_input_key( const struct FrameInfo_t *pFrameInfo, bool bBaseLayer )
+{
+	if ( g_eFramegenPipeline < GamescopeFramegenPipeline::Learned || !framegen_net_configured() )
+		return;
+	const uint32_t uOutputTf = pFrameInfo->applyOutputColorMgmt
+		? (uint32_t)pFrameInfo->outputEncodingEOTF : (uint32_t)EOTF_Count;
+	const uint32_t uKey = gamescope::framegen::net_input_key( bBaseLayer,
+		bBaseLayer ? (uint32_t)pFrameInfo->layers.get( 0 ).colorspace : 0u, uOutputTf,
+		g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial );
+	if ( g_bFramegenNetKeyActive && uKey == g_uFramegenNetActiveKey )
+		return;
+	const bool bSwitch = g_bFramegenNetKeyActive;
+	framegen_net_activate_key( uKey );
+	// History across an encoding change pairs two encodings. The EOTF and base
+	// colourspace checks already cut for most switches; this also covers colour
+	// management toggles and an EOTF flip under base-layer history. A second
+	// invalidation of already-dropped history is a no-op.
+	if ( bSwitch )
+		vulkan_framegen_invalidate_history( "net_input_key_change" );
+}
 
 // The field the warps and the adaptation probe consume: the net's refined copy
 // when the refiner ran this batch, the checked Stage-B field otherwise.
@@ -9997,8 +11324,8 @@ static bool framegen_create_intermediate( gamescope::OwningRc<CVulkanTexture> *p
 	// Dataset capture copies the lumas and fields out to mapped readbacks.
 	// Predict and Guided also rotate the final field into a retained transfer destination.
 	createFlags.bTransferSrc = framegen_record_dir() != nullptr
-		|| g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
-	createFlags.bTransferDst = g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict;
+		|| gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline );
+	createFlags.bTransferDst = gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline );
 	createFlags.bFramegenShared = true;
 
 	*ppTexture = new CVulkanTexture();
@@ -10100,11 +11427,7 @@ static bool framegen_fbcheck_enabled( GamescopeFramegenPipeline ePipeline )
 	if ( ePipeline < GamescopeFramegenPipeline::Checked )
 		return false;
 
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_FB" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_FB", true );
 	return s_bEnabled;
 }
 
@@ -10136,11 +11459,7 @@ static bool framegen_agreement_enabled( GamescopeFramegenPipeline ePipeline )
 	if ( ePipeline < GamescopeFramegenPipeline::Checked )
 		return false;
 
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_AGREE" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_AGREE", true );
 	return s_bEnabled;
 }
 
@@ -10152,11 +11471,7 @@ static bool framegen_reservoir_enabled( GamescopeFramegenPipeline ePipeline )
 	if ( ePipeline != GamescopeFramegenPipeline::Guided )
 		return false;
 
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_RESERVOIR" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_RESERVOIR", true );
 	return s_bEnabled;
 }
 
@@ -10168,11 +11483,7 @@ static bool framegen_shading_enabled( GamescopeFramegenPipeline ePipeline )
 	if ( ePipeline != GamescopeFramegenPipeline::Guided )
 		return false;
 
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_SHADING" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_SHADING", true );
 	return s_bEnabled;
 }
 
@@ -10198,12 +11509,16 @@ static bool framegen_adapt_enabled( GamescopeFramegenPipeline ePipeline )
 	if ( ePipeline < GamescopeFramegenPipeline::Learned )
 		return false;
 
-	static const bool s_bEnabled = []()
-	{
-		const char *pszEnv = getenv( "GAMESCOPE_FRAMEGEN_ADAPT" );
-		return pszEnv == nullptr || env_to_bool( pszEnv );
-	}();
+	static const bool s_bEnabled = framegen_bool_setting( "GAMESCOPE_FRAMEGEN_ADAPT", true );
 	return s_bEnabled;
+}
+
+// The quality meter: the stats probe as a pure measurement for every motion
+// pipeline, feeding the q_* metrics fields and the debug log. On whenever one
+// of them is read.
+static bool framegen_quality_meter_enabled()
+{
+	return framegen_metrics_enabled() || g_bFramegenDebug;
 }
 
 static const FramegenMetricsWindow_t &framegen_metrics_last_closed_window()
@@ -10259,9 +11574,9 @@ static const CVulkanTexture *framegen_hud_base_client_texture( const struct Fram
 {
 	if ( pFrameInfo == nullptr )
 		return nullptr;
-	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
 	{
-		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers[i];
+		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers.get( i );
 		if ( layer.zpos == g_zposBase && layer.pCommitTexture != nullptr )
 		{
 			const gamescope::Rc<CVulkanTexture> &pClientTexture = *layer.pCommitTexture;
@@ -10310,6 +11625,7 @@ static gamescope::framegen::FramegenHudSnapshot_t framegen_hud_snapshot(
 		.otherDeviceName = g_device.framegenOtherDeviceName(),
 		.renderOrigin = pBaseClientTexture != nullptr
 			? pBaseClientTexture->renderOrigin() : nullptr,
+		.gpu = gamescope::framegen::gpu_diagnostics_store().snapshot(),
 		.mode = effective.mode,
 		.pipeline = effective.pipeline,
 		.multiplier = effective.multiplier,
@@ -10411,10 +11727,11 @@ static int framegen_hud_record( CVulkanCmdBuffer *pCmdBuffer,
 			auto &slot = g_framegenHud.uploadSlots[nUploadSlot];
 			const gamescope::framegen::FramegenHudUniform_t uniform =
 				gamescope::framegen::make_framegen_hud_uniform(
-					g_framegenHud.text, g_framegenHud.hdr );
+					g_framegenHud.text, g_framegenHud.hdr, framegen_hud_cga(), framegen_hud_opacity() );
 			memcpy( slot.pMapped, &uniform, sizeof( uniform ) );
 			slot.logicalWidthPixels = uniform.widthChars * 8u + 8u;
-			slot.logicalHeightPixels = uniform.lineCount * 8u + 8u;
+			slot.logicalHeightPixels = gamescope::framegen::framegen_hud_height(
+				uniform.lineCount, ( uniform.style & 1u ) != 0u );
 			g_framegenHud.activeUploadSlot = nUploadSlot;
 			g_framegenHud.dirty = false;
 		}
@@ -10484,7 +11801,7 @@ static bool framegen_fbcheck_tol_pinned()
 FramegenMotionStatsPush_t::FramegenMotionStatsPush_t( bool bClearOnly )
 	: clearOnly( bClearOnly ? 1u : 0u )
 	, badThresh( gamescope::framegen::k_flAdaptationBadResidual )
-	, staticMvMax( 0.25f )
+	, staticMvMax( gamescope::framegen::motion_reference_texels( 0.25f, framegen_motion_scale() ) )
 	, minConfSurvive( 0.25f )
 {
 }
@@ -10508,10 +11825,12 @@ static float framegen_adapt_agree_hi()
 		g_framegenHistory.adaptation, k_flFramegenAgreeHi );
 }
 
+// In texels of the session's field; the tolerance itself is defined at /8
+// (adaptation only runs on the learned pipelines, which always use /8).
 static float framegen_effective_fbcheck_tol( GamescopeFramegenPipeline ePipeline )
 {
-	return framegen_adapt_enabled( ePipeline )
-		? framegen_adapt_fbcheck_tol() : framegen_fbcheck_tol_base();
+	return gamescope::framegen::motion_reference_texels( framegen_adapt_enabled( ePipeline )
+		? framegen_adapt_fbcheck_tol() : framegen_fbcheck_tol_base(), framegen_motion_scale() );
 }
 
 static float framegen_effective_agree_lo( GamescopeFramegenPipeline ePipeline )
@@ -10532,21 +11851,40 @@ static float framegen_effective_agree_hi( GamescopeFramegenPipeline ePipeline )
 // new batch guarantees the mapped memory is no longer being written.
 static void framegen_adapt_consume( GamescopeFramegenPipeline ePipeline )
 {
-	if ( !framegen_adapt_enabled( ePipeline ) )
+	const bool bAdaptive = framegen_adapt_enabled( ePipeline );
+	if ( !bAdaptive && !framegen_quality_meter_enabled() )
 		return;
 
 	FramegenHistory_t &h = g_framegenHistory;
 	if ( h.ulAdaptStatsSeqNo == 0 || h.ulAdaptStatsSeqNo == h.ulAdaptConsumedSeqNo
 		|| g_framegenMotion.statsReadback == nullptr
-		|| g_framegenMotion.statsReadback->mappedData() == nullptr
+		|| g_framegenMotion.statsReadback->mappedPixels() == nullptr
 		|| !g_device.hasCompletedFramegen( h.ulAdaptStatsSeqNo ) )
 		return;
 	h.ulAdaptConsumedSeqNo = h.ulAdaptStatsSeqNo;
 
 	std::array<uint32_t, gamescope::framegen::k_uAdaptationStatsCount> stats;
-	memcpy( stats.data(), g_framegenMotion.statsReadback->mappedData(), sizeof( stats ) );
+	memcpy( stats.data(), g_framegenMotion.statsReadback->mappedPixels(), sizeof( stats ) );
 	const auto measurement = gamescope::framegen::decode_adaptation_stats( stats );
 	if ( !measurement.has_value() )
+		return;
+
+	if ( framegen_quality_meter_enabled() )
+	{
+		g_framegenMetricsPendingEvents.quality += measurement->quality;
+		static uint64_t s_uQualityDebugLogCounter = 0;
+		if ( FramegenDebugShouldLog( s_uQualityDebugLogCounter ) )
+		{
+			const gamescope::framegen::MotionQualityCounts &q = measurement->quality;
+			vk_log.infof( "framegen: quality changed=%" PRIu64 " resid=%.4f bad=%.1f%% killed=%.1f%% (matcher %.1f%%, after match %.1f%%)",
+				q.changed, q.residual(), q.badFraction() * 100.0,
+				q.killedFraction() * 100.0, q.killedMatchFraction() * 100.0,
+				q.killedFbFraction() * 100.0 );
+		}
+	}
+	// A meter sample only measures: no threshold, scene verdict or reset may
+	// follow from it, even once the pipeline is adaptive again.
+	if ( !bAdaptive || h.bAdaptStatsMeasureOnly )
 		return;
 
 	const bool bSceneCut = measurement->sceneCut != 0u;
@@ -10631,6 +11969,15 @@ static void framegen_record_release( const char *pszReason )
 	vk_log.infof( "framegen: dataset capture stopped (%s), readbacks released", pszReason );
 }
 
+// Only called after the consumer has retired the readback's framegen sequence.
+// The view borrows texel storage for the synchronous file write below.
+static gamescope::framegen::CapturePlane framegen_capture_plane( CVulkanTexture *pTexture )
+{
+	if ( pTexture == nullptr )
+		return {};
+	return { pTexture->mappedPixels(), pTexture->width(), pTexture->height(), pTexture->rowPitch() };
+}
+
 // Capture I/O is deliberately out of line: this function is polled by the
 // Vulkan batch recorder, and inlining its cold path bloats the production
 // command-recording footprint even when no GSFD capture is configured.
@@ -10663,36 +12010,18 @@ static __attribute__((noinline)) void framegen_record_consume()
 		return;
 	}
 
-	// Header + tightly packed planes (rows re-packed from the readbacks'
-	// rowPitch): lumaPrev, lumaCur, field (rgba16f), fieldRev (rgba16f).
-	// The trainer (scripts/framegen-net-train.py) parses exactly this.
-	const uint32_t uLumaBpp = g_framegenMotion.lumaFormat == DRM_FORMAT_R16F ? 2u : 8u;
-	const uint32_t uHeader[ 8 ] = {
-		0x44465347u /* 'GSFD' */, 1u,
-		g_framegenMotion.width, g_framegenMotion.height,
-		uLumaBpp, 8u /* field bpp */, 1u /* flags: has reverse field */, 0u,
-	};
-	const uint64_t ulSeq = h.ulNetRecordConsumedSeqNo;
-	bool bOk = output.write( uHeader, sizeof( uHeader ) )
-		&& output.write( &ulSeq, sizeof( ulSeq ) );
-
-	const auto writePlane = [&]( CVulkanTexture *pTex, uint32_t uBytesPerRow )
-	{
-		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
-			|| pTex->width() != g_framegenMotion.width
-			|| pTex->height() != g_framegenMotion.height )
-			return false;
-		const uint8_t *pData = pTex->mappedData();
-		if ( pData == nullptr )
-			return false;
-		for ( uint32_t y = 0; bOk && y < pTex->height(); y++ )
-			bOk = output.write( pData + (size_t)y * pTex->rowPitch(), uBytesPerRow );
-		return bOk;
-	};
-	bOk = bOk && writePlane( g_framegenMotion.recLumaPrev.get(), g_framegenMotion.width * uLumaBpp )
-		&& writePlane( g_framegenMotion.recLumaCur.get(), g_framegenMotion.width * uLumaBpp )
-		&& writePlane( g_framegenMotion.recField.get(), g_framegenMotion.width * 8u )
-		&& writePlane( g_framegenMotion.recFieldRev.get(), g_framegenMotion.width * 8u );
+	bool bOk = gamescope::framegen::write_field_capture( output, {
+		.width = g_framegenMotion.width,
+		.height = g_framegenMotion.height,
+		.lumaBytesPerPixel = g_framegenMotion.lumaFormat == DRM_FORMAT_R16F ? 2u : 8u,
+		.sequence = h.ulNetRecordConsumedSeqNo,
+		.planes = {
+			framegen_capture_plane( g_framegenMotion.recLumaPrev.get() ),
+			framegen_capture_plane( g_framegenMotion.recLumaCur.get() ),
+			framegen_capture_plane( g_framegenMotion.recField.get() ),
+			framegen_capture_plane( g_framegenMotion.recFieldRev.get() ),
+		},
+	} );
 	if ( bOk )
 		bOk = output.commit();
 
@@ -10780,7 +12109,7 @@ static bool framegen_color_probe_prepare( uint32_t width, uint32_t height, uint3
 		flags.bFramegenShared = true;
 		*ppTex = new CVulkanTexture();
 		return ( *ppTex )->BInit( width, height, 1u, drmFormat, flags )
-			&& ( *ppTex )->mappedData() != nullptr;
+			&& ( *ppTex )->mappedPixels() != nullptr;
 	};
 
 	bool bAllocated = true;
@@ -10822,43 +12151,29 @@ static void framegen_color_probe_consume()
 		return;
 	}
 
-	const uint32_t uHeader[ 12 ] = {
-		0x46435347u /* 'GSCF' */, 3u,
-		c.width, c.height, c.drmFormat, c.bytesPerPixel, (uint32_t)c.eotf,
-		3u /* flags: exact reference + paired candidates */, 4u /* planes */,
-		(uint32_t)c.pendingSweep, 0u, 0u,
-	};
-	const uint64_t uMetadata[ 8 ] = {
-		c.pendingSeqNo, c.pendingAnchorId, c.pendingReferenceId, c.pendingEndpointId,
-		c.pendingAnchorTimeNs, c.pendingReferenceTimeNs, c.pendingEndpointTimeNs, 0u,
-	};
-	const float flMetadata[ 4 ] = {
-		c.pendingPhase,
-		k_flFramegenColorProbeStrengths[ 0 ],
-		k_flFramegenColorProbeStrengths[ 1 ],
-		k_flFramegenColorProbeStrengths[ 2 ],
-	};
-	bool bOk = output.write( uHeader, sizeof( uHeader ) )
-		&& output.write( uMetadata, sizeof( uMetadata ) )
-		&& output.write( flMetadata, sizeof( flMetadata ) );
-
-	const auto writePlane = [&]( CVulkanTexture *pTex )
-	{
-		const uint32_t uBytesPerRow = c.width * c.bytesPerPixel;
-		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
-			|| pTex->width() != c.width || pTex->height() != c.height )
-			return false;
-		const uint8_t *pData = pTex->mappedData();
-		if ( pData == nullptr )
-			return false;
-		for ( uint32_t y = 0; bOk && y < c.height; y++ )
-			bOk = output.write( pData + (size_t)y * pTex->rowPitch(), uBytesPerRow );
-		return bOk;
-	};
-	// Plane order is generated strength 0/0.5/1, then exact real reference.
-	for ( const auto &pReadback : c.generatedReadback )
-		bOk = bOk && writePlane( pReadback.get() );
-	bOk = bOk && writePlane( c.referenceReadback.get() );
+	bool bOk = gamescope::framegen::write_color_capture( output, {
+		.width = c.width,
+		.height = c.height,
+		.drmFormat = c.drmFormat,
+		.bytesPerPixel = c.bytesPerPixel,
+		.eotf = (uint32_t)c.eotf,
+		.sweep = (uint32_t)c.pendingSweep,
+		.sequence = c.pendingSeqNo,
+		.anchorId = c.pendingAnchorId,
+		.referenceId = c.pendingReferenceId,
+		.endpointId = c.pendingEndpointId,
+		.anchorTimeNs = c.pendingAnchorTimeNs,
+		.referenceTimeNs = c.pendingReferenceTimeNs,
+		.endpointTimeNs = c.pendingEndpointTimeNs,
+		.phase = c.pendingPhase,
+		.strengths = { k_flFramegenColorProbeStrengths[ 0 ], k_flFramegenColorProbeStrengths[ 1 ], k_flFramegenColorProbeStrengths[ 2 ] },
+		.planes = {
+			framegen_capture_plane( c.generatedReadback[ 0 ].get() ),
+			framegen_capture_plane( c.generatedReadback[ 1 ].get() ),
+			framegen_capture_plane( c.generatedReadback[ 2 ].get() ),
+			framegen_capture_plane( c.referenceReadback.get() ),
+		},
+	} );
 	if ( bOk )
 		bOk = output.commit();
 
@@ -10910,6 +12225,38 @@ static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t
 	pCmdBuffer->setSamplerNearest( nSlot, bNearest );
 }
 
+// The matcher's own field for the current pair, before any consistency check
+// or refinement.
+static gamescope::Rc<CVulkanTexture> framegen_motion_match_field()
+{
+	return g_framegenMotion.bUncheckedFieldValid
+		? g_framegenMotion.mvFieldFwd : g_framegenMotion.mvField;
+}
+
+// Zero the counter image and accumulate the field's verdicts into it. The
+// image is the only storage binding; the lumas and both fields are sampled.
+// False when the counter images do not exist.
+static bool framegen_record_stats_accumulate( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH )
+{
+	if ( g_framegenMotion.statsAccum == nullptr || g_framegenMotion.statsReadback == nullptr )
+		return false;
+
+	const uint32_t pg = 8;
+	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_STATS ) );
+	pCmdBuffer->bindTarget( g_framegenMotion.statsAccum );
+	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaPrev, false );
+	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaCur, false );
+	// With the net refiner active this grades the REFINED field — the one the
+	// warps consume — so a misbehaving checkpoint shows up in the counters.
+	framegen_motion_bind_sampler( pCmdBuffer, 2, framegen_motion_field(), true );
+	framegen_motion_bind_sampler( pCmdBuffer, 3, framegen_motion_match_field(), true );
+	pCmdBuffer->pushConstants<FramegenMotionStatsPush_t>( true );
+	pCmdBuffer->dispatch( 1, 1 );
+	pCmdBuffer->pushConstants<FramegenMotionStatsPush_t>( false );
+	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
+	return true;
+}
+
 // Self-supervised stats probe, recorded after the motion field is final:
 // one workgroup zeroes the counter image, a field-size dispatch measures how
 // well the checked field predicts the real frame and accumulates the verdicts
@@ -10924,22 +12271,10 @@ static void framegen_motion_bind_sampler( CVulkanCmdBuffer *pCmdBuffer, uint32_t
 // copy: still sub-kilobyte and intended to remain in the microsecond range.
 static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH )
 {
-	if ( g_framegenMotion.statsAccum == nullptr || g_framegenMotion.statsReadback == nullptr )
+	if ( !framegen_record_stats_accumulate( pCmdBuffer, lowW, lowH ) )
 		return;
 
 	const uint32_t pg = 8;
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_STATS ) );
-	pCmdBuffer->bindTarget( g_framegenMotion.statsAccum );
-	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaPrev, false );
-	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaCur, false );
-	// With the net refiner active this grades (and trust-scales) the REFINED
-	// field — the one the warps consume — so a misbehaving checkpoint is
-	// clamped in the same batch and shows up in the adapt log lines.
-	framegen_motion_bind_sampler( pCmdBuffer, 2, framegen_motion_field(), true );
-	pCmdBuffer->pushConstants<FramegenMotionStatsPush_t>( true );
-	pCmdBuffer->dispatch( 1, 1 );
-	pCmdBuffer->pushConstants<FramegenMotionStatsPush_t>( false );
-	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 	// Scale the field confidence by the measured trust; in bidir the reverse
 	// field carries the same scene-level verdict.
 	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_STATS_APPLY ) );
@@ -10967,6 +12302,21 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 	// Copy after scene finalization so the next-batch debug/CPU consumer sees
 	// the same verdict that this batch's warps consumed.
 	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
+	pCmdBuffer->hostReadBarrier();
+}
+
+// The quality meter: the same counters, measured on the final field after
+// the generated frames were recorded, then read back. No scene verdict and no
+// trust: nothing here writes a resource that generation reads, in this batch
+// or a later one, so the output is bit-identical with the meter on or off.
+// Returns whether the readback was recorded.
+static bool framegen_record_quality_meter( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH )
+{
+	if ( !framegen_record_stats_accumulate( pCmdBuffer, lowW, lowH ) )
+		return false;
+	pCmdBuffer->copyImage( g_framegenMotion.statsAccum, g_framegenMotion.statsReadback );
+	pCmdBuffer->hostReadBarrier();
+	return true;
 }
 
 // Learned field refinement, recorded with the checked fields final.
@@ -10976,6 +12326,39 @@ static void framegen_record_adapt_probe( CVulkanCmdBuffer *pCmdBuffer, uint32_t 
 // keeps forward prediction at one inference dispatch per real frame instead of
 // paying for an unused reverse result. The one-time staging->GPU weight copy
 // rides the first batch after (re)allocation.
+// Fill the host-coherent upload staging with one full weight set; the next
+// framegen_record_net copies it to the served and prior textures.
+static void framegen_net_stage_weights( const std::vector<float> &weights )
+{
+	for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
+	{
+		const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, k_uFramegenNetFloats - y * k_uFramegenNetTexW );
+		memcpy( g_framegenMotion.netWeightsUpload->mappedPixels() + (size_t)y * g_framegenMotion.netWeightsUpload->rowPitch(),
+			weights.data() + (size_t)y * k_uFramegenNetTexW, uRowFloats * sizeof( float ) );
+	}
+}
+
+static void framegen_record_net_upload_barrier( CVulkanCmdBuffer *pCmdBuffer )
+{
+	auto &m = g_framegenMotion;
+	const VkImageMemoryBarrier barrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		.oldLayout = m.bNetUploadInitialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PREINITIALIZED,
+		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = m.netWeightsUpload->vkImage(),
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u },
+	};
+	// Preserve CPU-filled pixels before copyImage first tracks this as GENERAL.
+	// One-batch admission guarantees no preceding copy still reads the staging.
+	g_device.vk.CmdPipelineBarrier( pCmdBuffer->rawBuffer(), VK_PIPELINE_STAGE_HOST_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &barrier );
+	m.bNetUploadInitialized = true;
+}
+
 static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, uint32_t lowH, bool bRefineReverse )
 {
 	if ( g_framegenMotion.mvFieldNet == nullptr || g_framegenMotion.netWeightsGpu == nullptr
@@ -10985,6 +12368,16 @@ static void framegen_record_net( CVulkanCmdBuffer *pCmdBuffer, uint32_t lowW, ui
 
 	if ( !g_framegenMotion.bNetWeightsUploaded )
 	{
+		// A key switch leaves the staging holding the outgoing set. Refill it
+		// here rather than at the switch: every batch path admits a new batch
+		// only after the previous one completed (one batch in flight), so no
+		// earlier copy can still be reading the staging.
+		if ( g_bFramegenNetStagingStale )
+		{
+			framegen_net_stage_weights( framegen_net_activation_weights() );
+			g_bFramegenNetStagingStale = false;
+		}
+		framegen_record_net_upload_barrier( pCmdBuffer );
 		pCmdBuffer->copyImage( g_framegenMotion.netWeightsUpload, g_framegenMotion.netWeightsGpu );
 		if ( g_framegenMotion.netWeightsPrior != nullptr )
 			pCmdBuffer->copyImage( g_framegenMotion.netWeightsUpload, g_framegenMotion.netWeightsPrior );
@@ -11030,7 +12423,7 @@ static bool framegen_motion_history_valid( GamescopeFramegenPipeline ePipeline )
 	// the newly stored field immediately re-primes the next batch.
 	const bool bComparableIntervals = gamescope::framegen::motion_intervals_comparable(
 		ulCurrentIntervalNs, ulHistoryIntervalNs );
-	return ePipeline >= GamescopeFramegenPipeline::Predict
+	return gamescope::framegen::pipeline_uses_motion_history( ePipeline )
 		&& g_framegenMotion.mvFieldHistory != nullptr
 		&& g_framegenMotion.uMotionHistoryFrameId != 0
 		&& g_framegenMotion.uMotionHistoryFrameId + 1u == g_framegenHistory.currentFrameId
@@ -11081,15 +12474,20 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	FramegenMotionResources_t &m = g_framegenMotion;
 	if ( m.netState == nullptr || m.netGradSlices == nullptr || m.netWeightsPrior == nullptr
 		|| m.statsAccum == nullptr || m.mvFieldRevChk == nullptr || m.width < 16 || m.height < 16 )
+	{
+		framegen_net_note_skip( NetLearningSkip::Resources );
 		return false;
+	}
 
 	const uint32_t uOptGroups = div_roundup( k_uFramegenNetFloats, 64u );
-	const auto bindOpt = [&]()
+	const auto bindOpt = [&]( bool bInitialize )
 	{
 		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT ) );
 		pCmdBuffer->bindTarget( m.netState );
 		pCmdBuffer->bindTarget2( m.netWeightsGpu );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, m.netGradSlices, true );
+		// INIT never reads gradients. Keep its statically used descriptor valid
+		// without first tracking the fresh gradient image as an undefined source.
+		framegen_motion_bind_sampler( pCmdBuffer, 0, bInitialize ? m.netWeightsPrior : m.netGradSlices, true );
 		framegen_motion_bind_sampler( pCmdBuffer, 1, m.netWeightsPrior, true );
 	};
 
@@ -11097,21 +12495,17 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	// from the prior and zeroes the Adam moments.
 	if ( m.bNetStatePending )
 	{
-		bindOpt();
+		bindOpt( true );
 		pCmdBuffer->pushConstants<FramegenMotionNetOptPush_t>( 0.0f, 0.0f, 0.0f, 0u );
 		pCmdBuffer->dispatch( uOptGroups, 1 );
 		m.bNetStatePending = false;
 		m.uNetTrainStep = 0;
 	}
 
-	// GAMESCOPE_FRAMEGEN_NET_EVERY=N trains on every Nth real frame — the
-	// pressure valve for weak present GPUs (learning just converges slower).
-	static uint32_t s_uFrameCounter = 0;
-	if ( ( s_uFrameCounter++ % framegen_net_online_every() ) != 0 )
-		return false;
-
 	m.uNetTrainStep++;
 	g_ulFramegenNetProgress++;
+	g_framegenMetricsPendingEvents.trainedSteps++;
+	g_framegenNetLearningPair.step();
 	const uint32_t uHalf = k_uFramegenNetTrainTiles / 2;
 	const uint32_t uSeed = m.uNetTrainStep * 0x9E3779B9u + 0x61C88647u;
 	const bool bConservativeBidir = vulkan_framegen_bidir_active();
@@ -11159,7 +12553,7 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 		bSceneCutGuard, false, bConservativeBidir, 1.0f );
 	pCmdBuffer->dispatch( uHalf, 1 );
 
-	bindOpt();
+	bindOpt( false );
 	pCmdBuffer->pushConstants<FramegenMotionNetOptPush_t>( framegen_net_online_lr(), k_flFramegenNetEmaAlpha, k_flFramegenNetDecay, m.uNetTrainStep );
 	pCmdBuffer->dispatch( uOptGroups, 1 );
 
@@ -11170,9 +12564,30 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 	if ( m.netProfileReadback != nullptr )
 	{
 		pCmdBuffer->copyImage( m.netWeightsGpu, m.netProfileReadback );
+		pCmdBuffer->hostReadBarrier();
 		return true;
 	}
 	return false;
+}
+
+// Scheduling is outside the GPU recorder so the microbenchmark still measures
+// actual training. Foreground/refill/idle callers share the same per-real decision.
+static bool framegen_record_net_train_pair( CVulkanCmdBuffer *pCmdBuffer,
+	GamescopeFramegenPipeline ePipeline, bool bSceneCutGuard )
+{
+	auto &cadence = g_framegenMotion.netTrainingCadence;
+	const uint64_t pair = g_framegenHistory.currentFrameId;
+	if ( pair == cadence.consideredPair )
+	{
+		framegen_net_note_skip( NetLearningSkip::Reuse );
+		return false;
+	}
+	if ( !cadence.consider( pair, framegen_net_online_every() ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::Every );
+		return false;
+	}
+	return framegen_record_net_train( pCmdBuffer, ePipeline, bSceneCutGuard );
 }
 
 // The actual file write uses a unique same-directory staging file, so a process
@@ -11181,7 +12596,8 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 // close before publishing with rename.
 // Runs on an owned worker for periodic checkpoints — file I/O on the render
 // thread is a frametime spike — and synchronously for the exit/reset flush.
-static void framegen_net_profile_write_file( std::vector<float> weights, uint64_t ulProgress, bool bFromWorker )
+static void framegen_net_profile_write_file( std::vector<uint8_t> bytes, uint64_t ulProgress,
+	uint64_t ulRevision, size_t uSets, bool bFromWorker )
 {
 	const char *pszPath = framegen_net_profile_path();
 	static std::atomic<bool> s_bLoggedFail = { false };
@@ -11190,14 +12606,6 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 		if ( !s_bLoggedFail.exchange( true ) )
 			vk_log.errorf( "framegen: net profile %s '%s' failed (%s); keeping the previous file", pszWhat, pszPath, strerror( error ) );
 	};
-	if ( !gamescope::framegen::validate_and_migrate_net_profile_weights(
-		k_uFramegenNetVersion, weights ) )
-	{
-		fail( "validation for", EINVAL );
-		if ( bFromWorker )
-			g_bFramegenNetWriteInFlight = false;
-		return;
-	}
 
 	gamescope::framegen::AtomicOutputFile output( pszPath );
 	if ( !output.is_open() )
@@ -11207,9 +12615,7 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 			g_bFramegenNetWriteInFlight = false;
 		return;
 	}
-	constexpr auto metadata = gamescope::framegen::net_profile_metadata();
-	bool bOk = output.write( metadata.data(), metadata.size() * sizeof( uint32_t ) )
-		&& output.write( weights.data(), weights.size() * sizeof( float ) );
+	bool bOk = output.write( bytes.data(), bytes.size() );
 	if ( bOk )
 		bOk = output.commit();
 	if ( !bOk )
@@ -11219,12 +12625,34 @@ static void framegen_net_profile_write_file( std::vector<float> weights, uint64_
 	else
 	{
 		g_ulFramegenNetSavedProgress = ulProgress;
+		g_ulFramegenNetSavedRevision = ulRevision;
 		static std::atomic<bool> s_bLoggedFirstSave = { false };
-		if ( !s_bLoggedFirstSave.exchange( true ) || g_bFramegenDebug )
-			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps)", pszPath, ulProgress );
+		// Reset/exit flushes must identify their own persisted watermark even
+		// when an earlier short checkpoint already emitted the first-save log.
+		if ( !s_bLoggedFirstSave.exchange( true ) || g_bFramegenDebug || !bFromWorker )
+			vk_log.infof( "framegen: net profile saved to '%s' (%" PRIu64 " trained steps, %zu weight set%s)",
+				pszPath, ulProgress, uSets, uSets == 1u ? "" : "s" );
 	}
 	if ( bFromWorker )
 		g_bFramegenNetWriteInFlight = false;
+}
+
+// One atomic file holds every set. Render thread only: the active set is
+// refreshed from the latest healthy served weights and all sets are encoded
+// here, so the writer thread never touches the store. The encoder validates
+// every weight (finite, full length) before anything is written.
+static bool framegen_net_profile_snapshot( std::vector<uint8_t> &bytes, uint64_t &ulRevision, size_t &uSets )
+{
+	if ( g_bFramegenNetKeyActive && g_framegenNetLiveWeights.size() == k_uFramegenNetFloats )
+		framegen_net_store_put( g_uFramegenNetActiveKey, g_framegenNetLiveWeights );
+	const FramegenNetStore_t &store = framegen_net_store();
+	std::optional<std::vector<uint8_t>> encoded = gamescope::framegen::encode_net_profile( store.sets );
+	if ( !encoded )
+		return false;
+	bytes = std::move( *encoded );
+	ulRevision = store.ulRevision;
+	uSets = store.sets.size();
+	return true;
 }
 
 // The checkpoint writer's only lifetime proof. It logs through the file-scope
@@ -11248,11 +12676,19 @@ static void framegen_net_profile_flush()
 	// proof. Joining guarantees an older checkpoint cannot rename over the newer
 	// synchronous flush below.
 	framegen_net_profile_join_writer();
-	if ( framegen_net_profile_path() == nullptr || g_framegenNetLiveWeights.size() != k_uFramegenNetFloats )
+	// Only online learning writes the profile, and nothing was learned before
+	// a key was ever served. The gate is the store, not the live weights: a
+	// set switched away from must still persist at exit.
+	if ( framegen_net_profile_path() == nullptr || !framegen_net_online_enabled() || !g_bFramegenNetKeyActive )
 		return;
-	if ( g_ulFramegenNetLiveProgress == g_ulFramegenNetSavedProgress.load() )
+	if ( !gamescope::framegen::net_profile_needs_save( framegen_net_store().ulRevision, g_ulFramegenNetSavedRevision.load(),
+		g_ulFramegenNetLiveProgress, g_ulFramegenNetSavedProgress.load() ) )
 		return;
-	framegen_net_profile_write_file( g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, false );
+	std::vector<uint8_t> bytes;
+	uint64_t ulRevision = 0;
+	size_t uSets = 0;
+	if ( framegen_net_profile_snapshot( bytes, ulRevision, uSets ) )
+		framegen_net_profile_write_file( std::move( bytes ), g_ulFramegenNetLiveProgress, ulRevision, uSets, false );
 }
 
 // Weights readback, CPU half: same completion gate as every other readback.
@@ -11267,12 +12703,12 @@ static void framegen_net_profile_consume()
 	FramegenHistory_t &h = g_framegenHistory;
 	if ( h.ulNetProfileSeqNo == 0 || h.ulNetProfileSeqNo == h.ulNetProfileConsumedSeqNo
 		|| g_framegenMotion.netProfileReadback == nullptr
-		|| g_framegenMotion.netProfileReadback->mappedData() == nullptr
+		|| g_framegenMotion.netProfileReadback->mappedPixels() == nullptr
 		|| !g_device.hasCompletedFramegen( h.ulNetProfileSeqNo ) )
 		return;
 	h.ulNetProfileConsumedSeqNo = h.ulNetProfileSeqNo;
 
-	const uint8_t *pData = g_framegenMotion.netProfileReadback->mappedData();
+	const uint8_t *pData = g_framegenMotion.netProfileReadback->mappedPixels();
 	g_framegenNetReadbackWeights.resize( k_uFramegenNetFloats );
 	for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
 	{
@@ -11284,6 +12720,7 @@ static void framegen_net_profile_consume()
 	{
 		if ( !gamescope::framegen::is_finite_binary32( g_framegenNetReadbackWeights[ i ] ) )
 		{
+			g_framegenMetricsPendingEvents.rejectedNetReadbacks++;
 			vk_log.errorf( "framegen: net weights went non-finite at step %u — reinitializing from the prior (consider a lower GAMESCOPE_FRAMEGEN_NET_LR)", g_framegenMotion.uNetTrainStep );
 			// framegen_record_net runs before the optimizer-init dispatch in the
 			// next batch. Force its upload path too, otherwise that one inference
@@ -11293,10 +12730,29 @@ static void framegen_net_profile_consume()
 			return;
 		}
 	}
+	if ( h.ulAdaptStatsSeqNo == h.ulNetProfileSeqNo
+		&& g_device.framegenTrainingSampleSeqNo() == h.ulNetProfileSeqNo
+		&& g_device.framegenTrainingCostNs() != 0u
+		&& g_framegenMotion.statsReadback != nullptr
+		&& g_framegenMotion.statsReadback->mappedPixels() != nullptr )
+	{
+		std::array<uint32_t, gamescope::framegen::k_uAdaptationStatsCount> stats;
+		memcpy( stats.data(), g_framegenMotion.statsReadback->mappedPixels(), sizeof( stats ) );
+		const auto measurement = gamescope::framegen::decode_adaptation_stats( stats );
+		if ( measurement && measurement->sceneCut == 0u )
+		{
+			auto &learning = g_framegenMotion.learning;
+			if ( learning.pendingRecordSeqNo == h.ulNetProfileSeqNo )
+				learning.recordCostNs = std::max( learning.recordCostNs, learning.pendingRecordNs );
+			learning.warmedSeqNo = h.ulNetProfileSeqNo;
+		}
+	}
+
 	// Publish only after the full snapshot passes the health check. Swapping keeps
 	// the preceding live allocation as next frame's scratch storage, so a bad
 	// candidate cannot poison persistence and steady-state readback allocates none.
 	g_framegenNetLiveWeights.swap( g_framegenNetReadbackWeights );
+	g_framegenMetricsPendingEvents.publishedSteps += g_ulFramegenNetProgress - g_ulFramegenNetLiveProgress;
 	g_ulFramegenNetLiveProgress = g_ulFramegenNetProgress;
 
 	// Periodic checkpoint, off-thread — an fwrite into a possibly-contended
@@ -11310,8 +12766,14 @@ static void framegen_net_profile_consume()
 		// guarantees this join cannot wait on active I/O in the normal cadence.
 		if ( g_framegenNetWriteThread.joinable() )
 			g_framegenNetWriteThread.join();
-		g_framegenNetWriteThread = std::thread( framegen_net_profile_write_file,
-			g_framegenNetLiveWeights, g_ulFramegenNetLiveProgress, true );
+		std::vector<uint8_t> bytes;
+		uint64_t ulRevision = 0;
+		size_t uSets = 0;
+		if ( framegen_net_profile_snapshot( bytes, ulRevision, uSets ) )
+			g_framegenNetWriteThread = std::thread( framegen_net_profile_write_file,
+				std::move( bytes ), g_ulFramegenNetLiveProgress, ulRevision, uSets, true );
+		else
+			g_bFramegenNetWriteInFlight = false;
 	}
 }
 
@@ -11341,17 +12803,20 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	g_framegenMotion.uMotionFieldFrameId = 0;
 	g_framegenMotion.uMotionFieldIntervalNs = 0;
 
-	const uint32_t lowW = std::max( 1u, div_roundup( width, k_uFramegenMotionDownscale ) );
-	const uint32_t lowH = std::max( 1u, div_roundup( height, k_uFramegenMotionDownscale ) );
+	const uint32_t uScale = framegen_motion_scale();
+	const uint32_t lowW = std::max( 1u, div_roundup( width, uScale ) );
+	const uint32_t lowH = std::max( 1u, div_roundup( height, uScale ) );
 	const uint32_t uFieldFormat = DRM_FORMAT_ABGR16161616F;
-	const uint32_t uCoarseW[2] = { std::max( 1u, div_roundup( lowW, 2u ) ), std::max( 1u, div_roundup( lowW, 4u ) ) };
-	const uint32_t uCoarseH[2] = { std::max( 1u, div_roundup( lowH, 2u ) ), std::max( 1u, div_roundup( lowH, 4u ) ) };
+	// Level 0 is the base grid; level i > 0 is coarse level i - 1.
+	const uint32_t nCoarse = gamescope::framegen::motion_coarse_levels( uScale );
+	const auto levelW = [&]( uint32_t i ) { return std::max( 1u, div_roundup( lowW, 1u << i ) ); };
+	const auto levelH = [&]( uint32_t i ) { return std::max( 1u, div_roundup( lowH, 1u << i ) ); };
 	// Bidir gathers the previous frame along the reverse field. The learned
 	// refiner also consumes the checked reverse field as evidence even in the
 	// zero-latency forward-prediction path. Both therefore require the reverse
 	// chain and symmetric consistency check, overriding GAMESCOPE_FRAMEGEN_FB=0.
 	const bool bBidir = vulkan_framegen_bidir_active();
-	const bool bNeedMotionHistory = ePipeline >= GamescopeFramegenPipeline::Predict && !bBidir;
+	const bool bNeedMotionHistory = gamescope::framegen::pipeline_uses_motion_history( ePipeline ) && !bBidir;
 	const bool bNeedLumaReservoir = framegen_reservoir_enabled( ePipeline ) && !bBidir;
 	const bool bCaptureNeedsReverse = framegen_record_dir() != nullptr
 		&& g_uFramegenRecordCount < framegen_record_max();
@@ -11361,11 +12826,12 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	// Whether the net refiner ran is re-decided every batch (see
 	// framegen_record_net); consumers must never inherit a stale verdict.
 	g_framegenMotion.bNetActive = false;
+	g_framegenMotion.bUncheckedFieldValid = bFBCheck;
 
 	if ( g_framegenMotion.width != lowW || g_framegenMotion.height != lowH
 		|| g_framegenMotion.lumaFormat != dispatch.motionLumaFormat
 		|| g_framegenMotion.lumaPrev == nullptr || g_framegenMotion.lumaCur == nullptr || g_framegenMotion.mvField == nullptr
-		|| g_framegenMotion.mvFieldCoarse[ 1 ] == nullptr
+		|| g_framegenMotion.mvFieldCoarse[ nCoarse - 1 ] == nullptr
 		|| ( bFBCheck && ( g_framegenMotion.mvFieldFwd == nullptr || g_framegenMotion.mvFieldRev == nullptr ) )
 		|| ( bNeedCheckedReverse && g_framegenMotion.mvFieldRevChk == nullptr )
 		|| ( bNeedMotionHistory && g_framegenMotion.mvFieldHistory == nullptr )
@@ -11373,6 +12839,8 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		|| ( bBidir && framegen_net_requested( ePipeline ) && g_framegenMotion.mvFieldRevNet == nullptr )
 		|| ( bCaptureNeedsReverse && !g_framegenMotion.bRecAllocTried ) )
 	{
+		g_framegenMotion.learning = {};
+		g_device.framegenResetTrainingCost();
 		// Full-resolution history is keyed to the same reset as these field
 		// resources. Drop it before rebuilding a different-sized pyramid.
 		g_framegenMotion.lumaReservoir[0] = nullptr;
@@ -11383,11 +12851,11 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		bool bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrev, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.lumaCur, lowW, lowH, dispatch.motionLumaFormat )
 			&& framegen_create_intermediate( &g_framegenMotion.mvField, lowW, lowH, uFieldFormat );
-		for ( uint32_t i = 0; bAllocated && i < 2; i++ )
+		for ( uint32_t i = 0; bAllocated && i < nCoarse; i++ )
 		{
-			bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrevCoarse[ i ], uCoarseW[ i ], uCoarseH[ i ], dispatch.motionLumaFormat )
-				&& framegen_create_intermediate( &g_framegenMotion.lumaCurCoarse[ i ], uCoarseW[ i ], uCoarseH[ i ], dispatch.motionLumaFormat )
-				&& framegen_create_intermediate( &g_framegenMotion.mvFieldCoarse[ i ], uCoarseW[ i ], uCoarseH[ i ], uFieldFormat );
+			bAllocated = framegen_create_intermediate( &g_framegenMotion.lumaPrevCoarse[ i ], levelW( i + 1 ), levelH( i + 1 ), dispatch.motionLumaFormat )
+				&& framegen_create_intermediate( &g_framegenMotion.lumaCurCoarse[ i ], levelW( i + 1 ), levelH( i + 1 ), dispatch.motionLumaFormat )
+				&& framegen_create_intermediate( &g_framegenMotion.mvFieldCoarse[ i ], levelW( i + 1 ), levelH( i + 1 ), uFieldFormat );
 		}
 		if ( bAllocated && bFBCheck )
 		{
@@ -11400,34 +12868,8 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 			bAllocated = framegen_create_intermediate( &g_framegenMotion.mvFieldHistory, lowW, lowH, uFieldFormat );
 		g_framegenMotion.uMotionHistoryFrameId = 0;
 		g_framegenMotion.uMotionHistoryIntervalNs = 0;
-		// Adaptation stats are a Learned-pipeline resource. Cheaper pipelines must not fail motion
-		// setup because an adaptation-only image format/allocation failed.
-		g_framegenMotion.statsAccum = nullptr;
-		g_framegenMotion.statsReadback = nullptr;
+		// A pending readback describes the old field; the next probe starts afresh.
 		g_framegenHistory.ulAdaptStatsSeqNo = 0;
-		if ( bAllocated && ( framegen_adapt_enabled( ePipeline )
-			|| ( framegen_net_requested( ePipeline ) && framegen_net_online_enabled() ) ) )
-		{
-			CVulkanTexture::createFlags accumFlags;
-			accumFlags.bStorage = true;
-			accumFlags.bTransferSrc = true;
-			accumFlags.bFramegenShared = true;
-			g_framegenMotion.statsAccum = new CVulkanTexture();
-			bAllocated = g_framegenMotion.statsAccum->BInit(
-				gamescope::framegen::k_uAdaptationStatsCount,
-				1, 1u, DRM_FORMAT_R32UI, accumFlags );
-			if ( bAllocated )
-			{
-				CVulkanTexture::createFlags readbackFlags;
-				readbackFlags.bMappable = true;
-				readbackFlags.bTransferDst = true;
-				readbackFlags.bFramegenShared = true;
-				g_framegenMotion.statsReadback = new CVulkanTexture();
-				bAllocated = g_framegenMotion.statsReadback->BInit(
-					gamescope::framegen::k_uAdaptationStatsCount,
-					1, 1u, DRM_FORMAT_R32UI, readbackFlags );
-			}
-		}
 		// Stage C intermediates. Failures here disable the feature, not the
 		// motion path: the raw checked fields keep working untouched.
 		g_framegenMotion.mvFieldNet = nullptr;
@@ -11458,31 +12900,29 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 
 				CVulkanTexture::createFlags stagingFlags;
 				stagingFlags.bMappable = true;
+				stagingFlags.bHostUpload = true;
 				stagingFlags.bTransferSrc = true;
 				stagingFlags.bFramegenShared = true;
 				g_framegenMotion.netWeightsUpload = new CVulkanTexture();
 				bNetOk = bNetOk && g_framegenMotion.netWeightsUpload->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, stagingFlags )
-					&& g_framegenMotion.netWeightsUpload->mappedData() != nullptr;
+					&& g_framegenMotion.netWeightsUpload->mappedPixels() != nullptr;
 				if ( bNetOk )
 				{
 					// Warm-start after a resize/format reset from the latest served
 					// weights that passed the CPU finite check. Falling back to the
 					// immutable startup prior is only needed before the first healthy
 					// online readback (or when online learning is disabled).
+					// Live weights always belong to the active input key.
 					const bool bWarmStart = framegen_net_online_enabled()
 						&& g_framegenNetLiveWeights.size() == k_uFramegenNetFloats;
-					const std::vector<float> &weights = bWarmStart
-						? g_framegenNetLiveWeights : framegen_net_weights();
 					if ( bWarmStart && g_bFramegenDebug )
 						vk_log.infof( "framegen: net warm-starting recreated GPU state from the latest healthy served weights (%" PRIu64 " trained steps)", g_ulFramegenNetLiveProgress );
-					for ( uint32_t y = 0; y < k_uFramegenNetTexH; y++ )
-					{
-						const uint32_t uRowFloats = std::min( k_uFramegenNetTexW, (uint32_t)weights.size() - y * k_uFramegenNetTexW );
-						memcpy( g_framegenMotion.netWeightsUpload->mappedData() + (size_t)y * g_framegenMotion.netWeightsUpload->rowPitch(),
-							weights.data() + (size_t)y * k_uFramegenNetTexW, uRowFloats * sizeof( float ) );
-					}
+					framegen_net_stage_weights( bWarmStart
+						? g_framegenNetLiveWeights : framegen_net_activation_weights() );
+					g_bFramegenNetStagingStale = false;
 				}
 				g_framegenMotion.bNetWeightsUploaded = false;
+				g_framegenMotion.bNetUploadInitialized = false;
 
 				// In-situ learning state, also once.
 				if ( bNetOk && framegen_net_online_enabled() )
@@ -11516,7 +12956,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 						readbackFlags.bFramegenShared = true;
 						g_framegenMotion.netProfileReadback = new CVulkanTexture();
 						bOnlineOk = g_framegenMotion.netProfileReadback->BInit( k_uFramegenNetTexW, k_uFramegenNetTexH, 1u, DRM_FORMAT_R32F, readbackFlags )
-							&& g_framegenMotion.netProfileReadback->mappedData() != nullptr;
+							&& g_framegenMotion.netProfileReadback->mappedPixels() != nullptr;
 					}
 					if ( !bOnlineOk )
 					{
@@ -11527,7 +12967,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 						vk_log.errorf( "framegen: online-learning state allocation failed; serving the prior without training" );
 					}
 					g_framegenMotion.bNetStatePending = true;
-					g_framegenHistory.ulNetProfileSeqNo = 0;
+					framegen_net_drop_profile_readback();
 				}
 			}
 			if ( !bNetOk )
@@ -11559,7 +12999,7 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 				flags.bTransferDst = true;
 				flags.bFramegenShared = true;
 				*ppTex = new CVulkanTexture();
-				return ( *ppTex )->BInit( w, h, 1u, fmt, flags ) && ( *ppTex )->mappedData() != nullptr;
+				return ( *ppTex )->BInit( w, h, 1u, fmt, flags ) && ( *ppTex )->mappedPixels() != nullptr;
 			};
 			const bool bRecOk = makeReadback( &g_framegenMotion.recLumaPrev, lowW, lowH, dispatch.motionLumaFormat )
 				&& makeReadback( &g_framegenMotion.recLumaCur, lowW, lowH, dispatch.motionLumaFormat )
@@ -11604,6 +13044,37 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		}
 	}
 
+	// Stats counters: adaptation, online training, and the quality meter.
+	// Created the first time any of them is needed, whatever rung the session
+	// started on.
+	const bool bNeedStats = framegen_adapt_enabled( ePipeline )
+		|| ( framegen_net_requested( ePipeline ) && framegen_net_online_enabled() )
+		|| framegen_quality_meter_enabled();
+	if ( bNeedStats && !g_framegenMotion.bStatsAllocTried )
+	{
+		g_framegenMotion.bStatsAllocTried = true;
+		CVulkanTexture::createFlags accumFlags;
+		accumFlags.bStorage = true;
+		accumFlags.bTransferSrc = true;
+		accumFlags.bFramegenShared = true;
+		CVulkanTexture::createFlags readbackFlags;
+		readbackFlags.bMappable = true;
+		readbackFlags.bTransferDst = true;
+		readbackFlags.bFramegenShared = true;
+		g_framegenMotion.statsAccum = new CVulkanTexture();
+		g_framegenMotion.statsReadback = new CVulkanTexture();
+		const bool bStatsOk = g_framegenMotion.statsAccum->BInit(
+				gamescope::framegen::k_uAdaptationStatsCount, 1, 1u, DRM_FORMAT_R32UI, accumFlags )
+			&& g_framegenMotion.statsReadback->BInit(
+				gamescope::framegen::k_uAdaptationStatsCount, 1, 1u, DRM_FORMAT_R32UI, readbackFlags );
+		if ( !bStatsOk )
+		{
+			g_framegenMotion.statsAccum = nullptr;
+			g_framegenMotion.statsReadback = nullptr;
+			vk_log.errorf( "framegen: stats counter allocation failed; adaptation, online training and the quality meter stay off" );
+		}
+	}
+
 	const uint32_t pg = 8;
 
 	// Pass 1: downscale both real frames to the base low-res luma pair.
@@ -11620,69 +13091,61 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 	pCmdBuffer->setSamplerNearest( 1, false );
 	pCmdBuffer->dispatch( div_roundup( lowW, pg ), div_roundup( lowH, pg ) );
 
-	// Pass 2: build the coarser pyramid levels, one 2x step per dispatch, both
-	// frames per dispatch (bilinear tap = exact 2x2 box).
-	for ( uint32_t i = 0; i < 2; i++ )
+	// The luma of one frame and the scratch field at a pyramid level (0: base).
+	const auto lumaPrevAt = [&]( uint32_t i ) -> const gamescope::OwningRc<CVulkanTexture> &
+		{ return i == 0 ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ i - 1 ]; };
+	const auto lumaCurAt = [&]( uint32_t i ) -> const gamescope::OwningRc<CVulkanTexture> &
+		{ return i == 0 ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ i - 1 ]; };
+
+	// Pass 2: build the coarser pyramid levels down to /32, one 2x step per
+	// dispatch, both frames per dispatch (bilinear tap = exact 2x2 box).
+	for ( uint32_t i = 1; i <= nCoarse; i++ )
 	{
 		pCmdBuffer->bindPipeline( g_device.pipeline( dispatch.motionPyramidPair ) );
-		pCmdBuffer->bindTarget( g_framegenMotion.lumaPrevCoarse[ i ] );
-		pCmdBuffer->bindTarget2( g_framegenMotion.lumaCurCoarse[ i ] );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, i == 0 ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ 0 ], false );
-		framegen_motion_bind_sampler( pCmdBuffer, 1, i == 0 ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ 0 ], false );
-		pCmdBuffer->dispatch( div_roundup( uCoarseW[ i ], pg ), div_roundup( uCoarseH[ i ], pg ) );
+		pCmdBuffer->bindTarget( lumaPrevAt( i ) );
+		pCmdBuffer->bindTarget2( lumaCurAt( i ) );
+		framegen_motion_bind_sampler( pCmdBuffer, 0, lumaPrevAt( i - 1 ), false );
+		framegen_motion_bind_sampler( pCmdBuffer, 1, lumaCurAt( i - 1 ), false );
+		pCmdBuffer->dispatch( div_roundup( levelW( i ), pg ), div_roundup( levelH( i ), pg ) );
 	}
 
-	// Pass 3: full block match at the coarsest level only.
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
-	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldCoarse[ 1 ] );
-	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaPrevCoarse[ 1 ], true );
-	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaCurCoarse[ 1 ], true );
-	pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
-	pCmdBuffer->dispatch( div_roundup( uCoarseW[ 1 ], pg ), div_roundup( uCoarseH[ 1 ], pg ) );
-
-	// Passes 4-5: seeded +/-1 refinement down the pyramid. The finest pass also
-	// runs the sub-texel parabola and the confidence estimate, and writes the
-	// field the warps consume (.rg = mv in base low-res texels, .b = conf) —
-	// or, with the FB check on, the unchecked forward field it filters.
-	for ( uint32_t i = 0; i < 2; i++ )
+	// One direction's coarse-to-fine match: the full block search at /32 only,
+	// then seeded +/-1 refinement down the pyramid. The base level also runs the
+	// sub-texel parabola and the confidence estimate (.rg = mv in base texels,
+	// .b = conf). The coarse fields are scratch, so the reverse chain reuses
+	// them after the forward one; the per-dispatch barriers order the reuse.
+	const auto matchChain = [&]( const auto &srcAt, const auto &dstAt, const gamescope::OwningRc<CVulkanTexture> &finalField )
 	{
-		const bool bFinal = ( i == 1 );
-		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE ) );
-		pCmdBuffer->bindTarget( bFinal ? ( bFBCheck ? g_framegenMotion.mvFieldFwd : g_framegenMotion.mvField ) : g_framegenMotion.mvFieldCoarse[ 0 ] );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, bFinal ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 1, bFinal ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 2, bFinal ? g_framegenMotion.mvFieldCoarse[ 0 ] : g_framegenMotion.mvFieldCoarse[ 1 ], true );
-		pCmdBuffer->pushConstants<FramegenMotionRefinePush_t>( bFinal );
-		pCmdBuffer->dispatch( div_roundup( bFinal ? lowW : uCoarseW[ 0 ], pg ), div_roundup( bFinal ? lowH : uCoarseH[ 0 ], pg ) );
-	}
+		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
+		pCmdBuffer->bindTarget( g_framegenMotion.mvFieldCoarse[ nCoarse - 1 ] );
+		framegen_motion_bind_sampler( pCmdBuffer, 0, srcAt( nCoarse ), true );
+		framegen_motion_bind_sampler( pCmdBuffer, 1, dstAt( nCoarse ), true );
+		pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
+		pCmdBuffer->dispatch( div_roundup( levelW( nCoarse ), pg ), div_roundup( levelH( nCoarse ), pg ) );
+		for ( uint32_t i = nCoarse; i-- > 0; )
+		{
+			const bool bFinal = ( i == 0 );
+			pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE ) );
+			pCmdBuffer->bindTarget( bFinal ? finalField : g_framegenMotion.mvFieldCoarse[ i - 1 ] );
+			framegen_motion_bind_sampler( pCmdBuffer, 0, srcAt( i ), true );
+			framegen_motion_bind_sampler( pCmdBuffer, 1, dstAt( i ), true );
+			framegen_motion_bind_sampler( pCmdBuffer, 2, g_framegenMotion.mvFieldCoarse[ i ], true );
+			pCmdBuffer->pushConstants<FramegenMotionRefinePush_t>( bFinal );
+			pCmdBuffer->dispatch( div_roundup( levelW( i ), pg ), div_roundup( levelH( i ), pg ) );
+		}
+	};
+
+	// Forward flow, anchored at the current frame (cur(p) came from
+	// prev(p - F(p))): the field the warps consume, or with the FB check on the
+	// unchecked forward field it filters.
+	matchChain( lumaPrevAt, lumaCurAt, bFBCheck ? g_framegenMotion.mvFieldFwd : g_framegenMotion.mvField );
 
 	if ( !bFBCheck )
 		return true;
 
-	// Passes 6-8: the same coarse-to-fine match with the two luma bindings
-	// swapped estimates the REVERSE flow, anchored at the previous frame
-	// (prev(q) came from cur(q - R(q))). The forward chain is done with the
-	// coarse fields by now, so the reverse chain reuses them as scratch — the
-	// per-dispatch barriers order the reuse, and the only extra allocations
-	// are the two full-res fields.
-	pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH ) );
-	pCmdBuffer->bindTarget( g_framegenMotion.mvFieldCoarse[ 1 ] );
-	framegen_motion_bind_sampler( pCmdBuffer, 0, g_framegenMotion.lumaCurCoarse[ 1 ], true );
-	framegen_motion_bind_sampler( pCmdBuffer, 1, g_framegenMotion.lumaPrevCoarse[ 1 ], true );
-	pCmdBuffer->pushConstants<FramegenMotionMatchPush_t>( 4 );
-	pCmdBuffer->dispatch( div_roundup( uCoarseW[ 1 ], pg ), div_roundup( uCoarseH[ 1 ], pg ) );
-
-	for ( uint32_t i = 0; i < 2; i++ )
-	{
-		const bool bFinal = ( i == 1 );
-		pCmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE ) );
-		pCmdBuffer->bindTarget( bFinal ? g_framegenMotion.mvFieldRev : g_framegenMotion.mvFieldCoarse[ 0 ] );
-		framegen_motion_bind_sampler( pCmdBuffer, 0, bFinal ? g_framegenMotion.lumaCur : g_framegenMotion.lumaCurCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 1, bFinal ? g_framegenMotion.lumaPrev : g_framegenMotion.lumaPrevCoarse[ 0 ], true );
-		framegen_motion_bind_sampler( pCmdBuffer, 2, bFinal ? g_framegenMotion.mvFieldCoarse[ 0 ] : g_framegenMotion.mvFieldCoarse[ 1 ], true );
-		pCmdBuffer->pushConstants<FramegenMotionRefinePush_t>( bFinal );
-		pCmdBuffer->dispatch( div_roundup( bFinal ? lowW : uCoarseW[ 0 ], pg ), div_roundup( bFinal ? lowH : uCoarseH[ 0 ], pg ) );
-	}
+	// The same match with the lumas swapped estimates the REVERSE flow,
+	// anchored at the previous frame (prev(q) came from cur(q - R(q))).
+	matchChain( lumaCurAt, lumaPrevAt, g_framegenMotion.mvFieldRev );
 
 	// Pass 9: forward-backward consistency. A correct forward vector round-
 	// trips through the reverse field (R(p - F(p)) ~= -F(p)); lookalike
@@ -11736,7 +13199,9 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	const bool bAccelPipeline = bHistoryValid || bGuided;
 
 	pCmdBuffer->bindPipeline( g_device.pipeline( bAccelPipeline
-		? SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL : SHADER_TYPE_FRAMEGEN_MOTION_WARP ) );
+		? SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL
+		: ePipeline == GamescopeFramegenPipeline::Spatial
+			? SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL : SHADER_TYPE_FRAMEGEN_MOTION_WARP ) );
 	pCmdBuffer->bindTarget( pTarget );
 	pCmdBuffer->bindTexture( 0, g_framegenHistory.previousReal );
 	pCmdBuffer->setTextureSrgb( 0, true );
@@ -11773,7 +13238,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 			: gamescope::Rc<CVulkanTexture>( g_framegenMotion.lumaCur ), false );
 		pCmdBuffer->pushConstants<FramegenMotionAccelPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
-			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi,
+			(float)framegen_motion_scale(), flAgreeLo, flAgreeHi,
 			1.0f, bHistoryValid, bGuided, bReservoirValid, bShadingValid,
 			flHistoryFlowScale, flAccelTimeFactor );
 	}
@@ -11781,7 +13246,7 @@ static void framegen_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamescope::R
 	{
 		pCmdBuffer->pushConstants<FramegenMotionWarpPush_t>( flStrength,
 			k_flFramegenSuppressLo, k_flFramegenSuppressHi,
-			(float)k_uFramegenMotionDownscale, flAgreeLo, flAgreeHi );
+			(float)framegen_motion_scale(), flAgreeLo, flAgreeHi, framegen_sharp_fallback() );
 	}
 	pCmdBuffer->dispatch( div_roundup( pTarget->width(), pg ), div_roundup( pTarget->height(), pg ) );
 }
@@ -11825,7 +13290,7 @@ static void framegen_bidir_warp_slot( CVulkanCmdBuffer *pCmdBuffer, const gamesc
 	const float flOneSidedStrength = flOneSidedOverride >= 0.0f
 		? std::clamp( flOneSidedOverride, 0.0f, 1.0f )
 		: framegen_bidir_one_sided_strength();
-	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)k_uFramegenMotionDownscale,
+	pCmdBuffer->pushConstants<FramegenMotionBidirPush_t>( flPhase, (float)framegen_motion_scale(),
 		bAgree ? framegen_effective_agree_lo( ePipeline ) : 1e5f,
 		bAgree ? framegen_effective_agree_hi( ePipeline ) : 1e6f,
 		flOneSidedStrength, flEndpointTraceStrength );
@@ -11849,13 +13314,6 @@ struct FramegenColorProbeRequest_t
 	uint64_t referenceTimeNs;
 	uint64_t endpointTimeNs;
 };
-
-static uint64_t framegen_display_interval_ns()
-{
-	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-	return nFramegenRefreshMhz > 0
-		? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
-}
 
 static void framegen_shadow_plan_real( uint64_t ulRealFrameId,
 	uint64_t ulSourceReadyNs, uint64_t ulProvisionalTargetNs,
@@ -12040,7 +13498,8 @@ static void framegen_bidir_drop_queued_real( uint64_t ulRealFrameId )
 
 static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false, uint64_t ulAnchorRealFrameId = 0, bool bExplicitProvisional = false )
 {
-	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
+	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0
+		|| !framegen_work_completed() )
 		return false;
 
 	// Fold the previous batch's adaptation readback into the adaptation state
@@ -12055,6 +13514,9 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	if ( bClearPending )
 		g_framegenHistory.pending.clear();
+
+	const uint64_t ulRecordStartNs = get_time_in_nanos();
+	const bool bLearningPipelinesWarm = g_framegenMotion.learning.warmedSeqNo != 0u;
 
 	// Reserve this interval's output slots up front so an empty batch never
 	// records/submits a command buffer.
@@ -12106,7 +13568,10 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	}
 
 	if ( slots.empty() )
+	{
+		framegen_net_note_skip( NetLearningSkip::OutputPool );
 		return false;
+	}
 	if ( pColorProbe != nullptr
 		&& ( slots.size() != k_uFramegenColorProbeCandidates
 			|| pColorProbe->reference == nullptr
@@ -12151,7 +13616,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// physical acceleration. The copy and later history reads are ordered in
 	// this same command buffer.
 	if ( !bReuseMotion && pColorProbe == nullptr && bMotionRequested && !bBidir
-		&& eff.pipeline >= GamescopeFramegenPipeline::Predict )
+		&& gamescope::framegen::pipeline_uses_motion_history( eff.pipeline ) )
 	{
 		const bool bHistorySourceValid = g_framegenMotion.mvFieldHistory != nullptr
 			&& g_framegenMotion.uMotionFieldFrameId != 0
@@ -12200,6 +13665,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->copyImage( g_framegenMotion.lumaCur, g_framegenMotion.recLumaCur );
 		pCmdBuffer->copyImage( g_framegenMotion.mvField, g_framegenMotion.recField );
 		pCmdBuffer->copyImage( g_framegenMotion.mvFieldRevChk, g_framegenMotion.recFieldRev );
+		pCmdBuffer->hostReadBarrier();
 	}
 	// Gate on the effective (post-degradation) pipeline, not just allocation:
 	// once the ladder drops below the net-bearing rung the refiner's inputs
@@ -12209,8 +13675,13 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		&& g_framegenMotion.mvFieldNet != nullptr )
 		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
 	// With the field final, record the adaptation probe — the warps below
-	// read its verdict in this same batch, the CPU next batch.
+	// read its verdict in this same batch, the CPU next batch. The meter-only
+	// probe waits until the generated frames are recorded.
 	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.pipeline );
+	// A reused field was measured with the batch that estimated it, and a
+	// colour-validation field spans a skipped frame, not a display pair.
+	const bool bMeterProbe = bMotion && !bReuseMotion && !bAdaptProbe && pColorProbe == nullptr
+		&& framegen_quality_meter_enabled();
 	if ( bAdaptProbe )
 		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
 
@@ -12220,7 +13691,18 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// explicitly disabled, training retains its previous unguarded behavior.
 	const bool bNetStateReadback = pColorProbe == nullptr
 		&& !bReuseMotion && g_framegenMotion.bNetActive && framegen_net_online_enabled()
-		&& framegen_record_net_train( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
+		&& framegen_record_net_train_pair( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
+	// Mirrors bNetStateReadback above and framegen_net_requested's pipeline gate.
+	if ( pColorProbe != nullptr )
+		framegen_net_note_skip( NetLearningSkip::ColorProbe );
+	else if ( bReuseMotion )
+		framegen_net_note_skip( NetLearningSkip::Reuse );
+	else if ( eff.pipeline < GamescopeFramegenPipeline::Learned )
+		framegen_net_note_skip( NetLearningSkip::Pipeline );
+	else if ( !bMotion )
+		framegen_net_note_skip( NetLearningSkip::Motion );
+	else if ( !g_framegenMotion.bNetActive )
+		framegen_net_note_skip( NetLearningSkip::NetUnavailable );
 	if ( bMotion && !bReuseMotion && pColorProbe == nullptr )
 	{
 		g_framegenMotion.uMotionFieldFrameId = g_framegenHistory.currentFrameId;
@@ -12313,7 +13795,15 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		}
 	}
 
-	g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
+	if ( !bNetStateReadback || !bAdaptProbe )
+		g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
+	// Non-training batches exclude the meter/readback overhead from rung costs.
+	// Trained batches retain the complete cost as their optional-learning bound.
+	// The exclusion is only approximate: under synchronization2 the meter's
+	// dispatches can start while the last warps are still executing, so part of
+	// its cost can land before the end timestamp.
+	const bool bStatsRecorded = bAdaptProbe
+		|| ( bMeterProbe && framegen_record_quality_meter( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height ) );
 	if ( pColorProbe != nullptr )
 	{
 		// Readback copies deliberately sit after the end timestamp: held-out validation measures
@@ -12322,7 +13812,10 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		for ( uint32_t i = 0; i < k_uFramegenColorProbeCandidates; i++ )
 			pCmdBuffer->copyImage( slots[ i ].tex, g_framegenColorProbe.generatedReadback[ i ] );
 		pCmdBuffer->copyImage( pColorProbe->reference, g_framegenColorProbe.referenceReadback );
+		pCmdBuffer->hostReadBarrier();
 	}
+	if ( bNetStateReadback && bAdaptProbe )
+		g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
 	// Causal pacing reuses the existing small timestamp table, but causal one-slot work
 	// is keyed by preparation shape instead of the now-constant output count.
 	const uint32_t nCostKey = bDeadlineCostKeying
@@ -12336,9 +13829,15 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const uint64_t ulWaitCompositeSeqNo =
 		std::max( ulCompositeSeqNo, g_framegenHistory.lastBaseIngestSeqNo );
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ),
-		ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey );
+		ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey,
+		bNetStateReadback && bAdaptProbe );
 	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
 	const uint64_t ulSubmitNs = get_time_in_nanos();
+	if ( bNetStateReadback && bAdaptProbe && bLearningPipelinesWarm )
+	{
+		g_framegenMotion.learning.pendingRecordSeqNo = ulSeqNo;
+		g_framegenMotion.learning.pendingRecordNs = ulSubmitNs - ulRecordStartNs;
+	}
 
 	for ( const SlotPlan_t &slot : slots )
 	{
@@ -12366,6 +13865,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		// a second one would double it.
 		entry.bCursorFree = g_framegenHistory.bCursorFreePrevious
 			&& g_framegenHistory.bCursorFreeCurrent;
+		entry.bHudFree = g_framegenHistory.bHudFreePrevious
+			&& g_framegenHistory.bHudFreeCurrent;
 		entry.bProvisional = bExplicitProvisional
 			|| ( bDeadlineCostKeying && ulAnchorRealFrameId == 0u
 				&& !g_framegenHistory.causalAnchor.correctedFlipNs.has_value() );
@@ -12375,8 +13876,11 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	g_framegenHistory.lastGeneratedSeqNo = ulSeqNo;
 	g_framegenHistory.nLastGenerationGapVblanks = nGapVblanks;
-	if ( bAdaptProbe )
+	if ( bStatsRecorded )
+	{
 		g_framegenHistory.ulAdaptStatsSeqNo = ulSeqNo;
+		g_framegenHistory.bAdaptStatsMeasureOnly = !bAdaptProbe;
+	}
 	if ( bNetRecord )
 		g_framegenHistory.ulNetRecordSeqNo = ulSeqNo;
 	if ( bNetStateReadback )
@@ -12440,8 +13944,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// connector changes) and participates in the repaint-deferral budget. A
 	// nudge is sufficient here: under VRR every wake arbitrates, and under a
 	// fixed refresh only the vblank timer may present a generated frame.
+	// framegen_batch_repaint() opts back into the composite request.
 	if ( pColorProbe == nullptr && !vulkan_framegen_vrr_hybrid_active() )
-		nudge_steamcompmgr();
+	{
+		if ( framegen_batch_repaint() && !vulkan_framegen_bidir_active() )
+			force_repaint();
+		else
+			nudge_steamcompmgr();
+	}
 	return true;
 }
 
@@ -12500,10 +14010,22 @@ struct FramegenCausalRungSelection_t
 	bool bDeadlineMissSkip = false;
 };
 
+static FramegenCausalRungSelection_t framegen_sample_causal_rung( uint32_t nRung )
+{
+	FramegenCausalRungSelection_t sample;
+	sample.eff = framegen_effective_config( nRung );
+	sample.workClass = framegen_causal_work_class( sample.eff );
+	const uint32_t nCostKey = gamescope::framegen::deadline_work_class_cost_key(
+		sample.workClass );
+	sample.ulCostNs = g_device.framegenRungCostNs( nRung, nCostKey );
+	sample.uSamples = g_device.framegenRungSampleCount( nRung, nCostKey );
+	return sample;
+}
+
 static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const gamescope::framegen::CausalSlotPlan_t &plan, uint64_t ulNowNs,
 	uint64_t ulPlainWakeNs, bool bNativeCommitDeadline,
-	uint64_t ulNativeSlotBudgetNs )
+	uint64_t ulNativeSlotBudgetNs, uint64_t ulShortfallSlotBudgetNs )
 {
 	FramegenCausalRungSelection_t result;
 	// A multiplier notch cannot reduce a one-slot submission. Stop this ladder
@@ -12516,17 +14038,6 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const uint64_t ulStartEstimateNs = plan.provisional
 		? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
 
-	const auto sampleRung = [&]( uint32_t nRung )
-	{
-		FramegenCausalRungSelection_t sample;
-		sample.eff = framegen_effective_config( nRung );
-		sample.workClass = framegen_causal_work_class( sample.eff );
-		const uint32_t nCostKey = gamescope::framegen::deadline_work_class_cost_key(
-			sample.workClass );
-		sample.ulCostNs = g_device.framegenRungCostNs( nRung, nCostKey );
-		sample.uSamples = g_device.framegenRungSampleCount( nRung, nCostKey );
-		return sample;
-	};
 	const auto sampleFitsAt = [&]( const FramegenCausalRungSelection_t &sample,
 		uint64_t ulWakeNs )
 	{
@@ -12543,7 +14054,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	const uint32_t nCurrentRung = g_framegenHistory.nDegradeSteps;
 	const bool bPriorDeadlineMiss = g_framegenHistory.bCausalDeadlineMissed;
 	g_framegenHistory.bCausalDeadlineMissed = false;
-	result = sampleRung( nCurrentRung );
+	result = framegen_sample_causal_rung( nCurrentRung );
 	bool bDegradeForPriorMiss = bPriorDeadlineMiss;
 	if ( ulNativeSlotBudgetNs != 0u )
 	{
@@ -12596,7 +14107,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				CVulkanDevice::kFramegenLadderSlots> rungCosts = {};
 			for ( uint32_t nRung = 0u; nRung < nCurrentRung; nRung++ )
 			{
-				const FramegenCausalRungSelection_t sample = sampleRung( nRung );
+				const FramegenCausalRungSelection_t sample = framegen_sample_causal_rung( nRung );
 				rungCosts[ nRung ] = { sample.ulCostNs, sample.uSamples };
 			}
 			const gamescope::framegen::LadderRecoveryTarget_t recoveryTarget =
@@ -12625,7 +14136,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 				framegen_log_ladder_recovery(
 					nMaxCausalDegradeSteps, nCurrentRung,
 					uEvidenceDecisions );
-				FramegenCausalRungSelection_t richer = sampleRung(
+				FramegenCausalRungSelection_t richer = framegen_sample_causal_rung(
 					recoveryTarget.rung );
 				richer.bAdmit = true;
 				richer.bCommittedRung = true;
@@ -12636,30 +14147,37 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	}
 
 	// The admission gate above remains tied to this decision's actual remaining
-	// time. If the mature rung fits a normally planned native slot, a late-phase
-	// decision is not capacity evidence: skip it without degrading or resetting
-	// the recovery streak, and try again at the normal phase.
+	// time. If the mature rung fits a normally planned slot (native: the KMS
+	// commit budget; nested: the refresh interval less the compositor's wake
+	// lead), a late-phase decision is not capacity evidence: skip it without
+	// degrading or resetting the recovery streak, and try again at the normal
+	// phase. Nested decisions hit this when the learned present bias moves the
+	// slot's wake towards the provisional (raw-vblank) start bound.
+	//
+	// Otherwise retain the existing post-degradation hold. Known work that
+	// misses this slot's actual remaining budget is skipped rather than
+	// submitted late; each such decision still advances the hold just as the
+	// old per-frame evaluator did, so the ladder cannot deadlock at an
+	// over-budget rung.
 	const uint64_t ulDecisionStartNs = std::max(
 		ulNowNs, ulStartEstimateNs );
 	const uint64_t ulRemainingBudgetNs = plan.wakeNs > ulDecisionStartNs
 		? gamescope::framegen::deadline_budget_ns(
 			plan.wakeNs - ulDecisionStartNs )
 		: 0u;
-	if ( !bDegradeForPriorMiss && ulNativeSlotBudgetNs != 0u
-		&& gamescope::framegen::deadline_shortfall_is_phase_only(
-			result.ulCostNs, result.uSamples,
-			ulRemainingBudgetNs, ulNativeSlotBudgetNs ) )
-		return result;
-
-	// Retain the existing post-degradation hold. Known work that misses this
-	// slot's actual remaining budget is skipped rather than submitted late; each
-	// such decision still advances the hold just as the old per-frame evaluator
-	// did, so the ladder cannot deadlock at an over-budget rung.
-	if ( !bDegradeForPriorMiss && g_framegenHistory.nDegradeHold > 0u )
+	switch ( gamescope::framegen::causal_shortfall_action(
+		bDegradeForPriorMiss, result.ulCostNs, result.uSamples,
+		ulRemainingBudgetNs, ulShortfallSlotBudgetNs,
+		g_framegenHistory.nDegradeHold ) )
 	{
-		g_framegenHistory.nDegradeHold--;
-		framegen_recovery_note_capacity_failure();
-		return result;
+		case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly:
+			return result;
+		case gamescope::framegen::CausalShortfallAction_t::SkipHeld:
+			g_framegenHistory.nDegradeHold--;
+			framegen_recovery_note_capacity_failure();
+			return result;
+		case gamescope::framegen::CausalShortfallAction_t::Degrade:
+			break;
 	}
 
 	// Select one new monotonic rung for this decision. Mature non-fitting rungs
@@ -12668,7 +14186,7 @@ static FramegenCausalRungSelection_t framegen_select_causal_rung(
 	for ( uint32_t nRung = nCurrentRung + 1u;
 		nRung <= nMaxCausalDegradeSteps; nRung++ )
 	{
-		FramegenCausalRungSelection_t candidate = sampleRung( nRung );
+		FramegenCausalRungSelection_t candidate = framegen_sample_causal_rung( nRung );
 		const bool bMature = candidate.ulCostNs != 0u
 			&& candidate.uSamples >= gamescope::framegen::k_uDeadlineMinSamples;
 		if ( sampleFits( candidate ) )
@@ -12725,9 +14243,8 @@ static void framegen_record_causal_anchor( uint64_t ulRealFrameId,
 	g_framegenHistory.causalAnchor = {
 		.realFrameId = ulRealFrameId,
 		.sourceReadyNs = ulSourceReadyNs,
-		.provisionalTargetNs = gamescope::framegen::apply_present_bias_ns(
-			ulProvisionalTargetNs,
-			g_framegenPresentState.displayTiming.presentBias.emaNs ),
+		.provisionalTargetNs = gamescope::framegen::display_target_ns(
+			ulProvisionalTargetNs, g_framegenPresentState.displayTiming ),
 		.provisionalBiasNs =
 			g_framegenPresentState.displayTiming.presentBias.emaNs,
 		.correctedFlipNs = std::nullopt,
@@ -12740,7 +14257,8 @@ static void framegen_record_causal_anchor( uint64_t ulRealFrameId,
 static uint64_t framegen_nested_slot_wake_ns( uint64_t ulSlotVBlankNs )
 {
 	const gamescope::VBlankScheduleTime schedule = GetVBlankTimer().CalcNextWakeupTime( true ); // preemptive: no side effect
-	const uint64_t ulOffsetNs = schedule.ulTargetVBlank - schedule.ulScheduledWakeupPoint;
+	const uint64_t ulOffsetNs = gamescope::framegen::compositor_wake_lead_ns(
+		schedule.ulTargetVBlank, schedule.ulScheduledWakeupPoint );
 	return ulSlotVBlankNs > ulOffsetNs ? ulSlotVBlankNs - ulOffsetNs : 0u;
 }
 
@@ -12767,12 +14285,21 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 		|| framegen_predicted_interval_ns() == 0u
 		|| g_framegenHistory.causalAnchor.realFrameId == 0u
 		|| ulCompositeSeqNo == 0u )
+	{
+		if ( vulkan_framegen_is_enabled() && framegen_causal_deadline_enabled()
+			&& !vulkan_framegen_vrr_hybrid_active() && !vulkan_framegen_bidir_active() )
+			framegen_net_note_skip( !g_framegenHistory.pending.empty()
+				? NetLearningSkip::NoSlot : NetLearningSkip::History );
 		return false;
+	}
 
 	// One batch in flight, always: the lockless descriptor/timestamp rings and
 	// the cross-queue read pins all depend on it.
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
+	{
+		framegen_net_note_skip( NetLearningSkip::Busy );
 		return false;
+	}
 
 	const uint64_t now = get_time_in_nanos();
 	if ( now > g_framegenHistory.currentPresentTimeNs
@@ -12826,6 +14353,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			} );
 	if ( !plan.admit )
 	{
+		framegen_net_note_skip( NetLearningSkip::NoSlot );
 		if ( plan.skipReason
 			== gamescope::framegen::DeadlineSkipReason_t::NextRealSafelyDue )
 			framegen_metrics_note_admission_skip();
@@ -12834,7 +14362,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	const uint64_t ulStartEstimateNs = plan.provisional
 		? g_framegenHistory.causalAnchor.provisional_start_estimate() : 0u;
 	if ( std::max( now, ulStartEstimateNs ) >= plan.wakeNs )
+	{
+		framegen_net_note_skip( NetLearningSkip::Budget );
 		return false;
+	}
 
 	const uint64_t ulGridIndex = gamescope::framegen::grid_index_at_or_after(
 		plainGrid, plan.targetNs );
@@ -12844,7 +14375,10 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 	// that can no longer be submitted before that wake is skipped, never slid;
 	// the next planning call (tick or drain) takes the following slot.
 	if ( oTargetVBlankNs && !framegen_nested_slot_submittable( *oTargetVBlankNs, now ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::NoSlot );
 		return false;
+	}
 	const uint64_t ulPlainWakeNs = plainGrid.wake( ulGridIndex );
 	const gamescope::framegen::FixedRefreshCommitPlan_t commitPlan =
 		gridCommitPlan.earlyCommit
@@ -12862,11 +14396,18 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 			// subtract. Keep native miss hysteresis active against the maximum
 			// refresh-slot budget; warm-up is far shorter than recovery evidence.
 			: gamescope::framegen::deadline_budget_ns( ulVblankIntervalNs );
+	// Capacity reference for classifying a budget shortfall. Nested keeps its
+	// immediate miss handling and remaining-time recovery budget; only the
+	// phase-only skip gains a slot reference (causal_shortfall_slot_budget_ns).
+	const uint64_t ulShortfallSlotBudgetNs =
+		gamescope::framegen::causal_shortfall_slot_budget_ns(
+			bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );
 	FramegenCausalRungSelection_t rung = framegen_select_causal_rung(
 		plan, now, ulPlainWakeNs, commitPlan.earlyCommit,
-		ulNativeSlotBudgetNs );
+		ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );
 	if ( !rung.bAdmit )
 	{
+		framegen_net_note_skip( NetLearningSkip::Budget );
 		const uint64_t ulDecisionStartNs = std::max( now, ulStartEstimateNs );
 		const uint64_t ulRemainingNs = plan.wakeNs > ulDecisionStartNs
 			? plan.wakeNs - ulDecisionStartNs : 0u;
@@ -12967,22 +14508,44 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 	{
 		const size_t nBefore = g_framegenHistory.pending.size();
 		const uint64_t ulNowNs = get_time_in_nanos();
-		// A provisional slot is discarded only while a corrected replacement can
-		// still be submitted for its opportunity. Later, its pixels are kept: the
-		// replan could only be skipped, and the repeat replacing them is the larger
-		// error (|residual| vs. one slot spacing). Native slots: unchanged.
+		// Keep submitted nested pixels unless a measured corrected replacement
+		// fits both its raw opportunity and its biased admission deadline. This
+		// check samples the current rung without advancing any ladder state.
 		std::erase_if( g_framegenHistory.pending,
 			[&]( const FramegenHistory_t::PendingGenerated_t &entry ) {
-				return !entry.bReal
-					&& gamescope::framegen::discard_pending_provisional_slot(
+				if ( entry.bReal
+					|| !gamescope::framegen::discard_pending_provisional_slot(
 						correction, entry.ulAnchorRealFrameId,
-						entry.bProvisional )
-					&& !( entry.oTargetVBlankNs
-						&& !gamescope::framegen::fixed_grid_slot_submittable(
-							*entry.oTargetVBlankNs,
-							framegen_nested_slot_wake_ns( *entry.oTargetVBlankNs ),
-							g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs,
-							g_framegenHistory.ulDeadlineGridIntervalNs, ulArrivalGuardNs ) );
+						entry.bProvisional ) )
+					return false;
+				if ( !entry.oTargetVBlankNs )
+					return true;
+				const uint64_t ulRawWakeNs = framegen_nested_slot_wake_ns( *entry.oTargetVBlankNs );
+				if ( !gamescope::framegen::fixed_grid_slot_submittable(
+					*entry.oTargetVBlankNs, ulRawWakeNs,
+					g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank, ulNowNs,
+					g_framegenHistory.ulDeadlineGridIntervalNs, ulArrivalGuardNs ) )
+					return false;
+				const uint64_t ulReplacementWakeNs = gamescope::framegen::apply_present_bias_ns(
+					ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs );
+				const FramegenCausalRungSelection_t replacement = framegen_sample_causal_rung(
+					g_framegenHistory.nDegradeSteps );
+				const bool bDiscard = gamescope::framegen::discard_pending_provisional_slot(
+					correction, entry.ulAnchorRealFrameId, entry.bProvisional,
+					replacement.ulCostNs, replacement.uSamples, ulReplacementWakeNs, ulNowNs );
+				// The one-batch-in-flight gate in framegen_causal_submit also
+				// prevents replacement while the framegen GPU is busy. Keep the
+				// submitted pixels in that case; this query never waits.
+				const bool bCanReplace = bDiscard
+					&& framegen_work_completed();
+				if ( !bCanReplace && g_bFramegenDebug )
+					vk_log.infof( "LADDER_RETAIN real_id=%" PRIu64 " raw_target_ns=%" PRIu64
+						" raw_wake_ns=%" PRIu64 " wake_ns=%" PRIu64 " decision_ns=%" PRIu64
+						" cost_ns=%" PRIu64 " samples=%u reason=%s",
+						entry.ulAnchorRealFrameId, *entry.oTargetVBlankNs, ulRawWakeNs,
+						ulReplacementWakeNs, ulNowNs, replacement.ulCostNs, replacement.uSamples,
+						bDiscard ? "gpu_busy" : "replacement_budget" );
+				return bCanReplace;
 			} );
 		const size_t nDiscarded = nBefore - g_framegenHistory.pending.size();
 		// The discarded target was computed from the wrong grid phase and is not
@@ -13029,11 +14592,10 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 		return false;
 
 	// One batch in flight, always (same invariant as every other submit path).
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 		return false;
 
-	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-	const uint64_t ulVblankIntervalNs = nFramegenRefreshMhz > 0 ? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
 
 	const float flPhase = 0.5f;
 	const float flStrength = gamescope::framegen::clamp_forward_strength(
@@ -13125,7 +14687,7 @@ static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback 
 		return;
 	}
 
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 	{
 		vulkan_framegen_cancel_vrr_hybrid_slot( "generation_in_flight" );
 		return;
@@ -13441,11 +15003,10 @@ static bool framegen_refill_idle()
 		|| g_framegenHistory.lastCompositeSeqNo == 0 || g_framegenHistory.nLastGenerationGapVblanks == 0 )
 		return false;
 
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 		return false;
 
-	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-	const uint64_t ulVblankIntervalNs = nFramegenRefreshMhz > 0 ? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
 	const uint64_t now = get_time_in_nanos();
 	if ( now <= g_framegenHistory.currentPresentTimeNs )
 		return false;
@@ -13467,6 +15028,178 @@ static bool framegen_refill_idle()
 	const FramegenEffective_t eff = framegen_effective_config( g_framegenHistory.nDegradeSteps );
 	return framegen_submit_batch( nNextSlot, g_framegenHistory.nLastGenerationGapVblanks, 1,
 		eff, g_framegenHistory.lastCompositeSeqNo, framegen_max_degrade_steps(), false );
+}
+
+// ---------------------------------------------------------------------------
+// Idle learning uses the existing Learned batch through training, without warps.
+// It never creates a generated entry, client commit or presentation-feedback tag.
+static bool framegen_learning_resources_ready( const FramegenDispatch_t &dispatch )
+{
+	const auto &m = g_framegenMotion;
+	const uint32_t scale = framegen_motion_scale();
+	const uint32_t levels = gamescope::framegen::motion_coarse_levels( scale );
+	if ( !dispatch.motionSupported || levels == 0u
+		|| m.width != std::max( 1u, div_roundup( g_framegenHistory.currentReal->width(), scale ) )
+		|| m.height != std::max( 1u, div_roundup( g_framegenHistory.currentReal->height(), scale ) )
+		|| m.lumaFormat != dispatch.motionLumaFormat || m.width < 16u || m.height < 16u
+		|| !m.lumaPrev || !m.lumaCur || !m.mvField || !m.mvFieldFwd || !m.mvFieldRev || !m.mvFieldRevChk
+		|| !m.bNetAllocTried || !m.bStatsAllocTried || !m.netState || !m.netWeightsUpload
+		|| !m.netWeightsGpu || !m.netWeightsPrior || !m.netGradSlices || !m.netProfileReadback
+		|| !m.mvFieldNet || !m.netShadingFocus || !m.statsAccum || !m.statsReadback
+		|| !m.bNetWeightsUploaded || g_bFramegenNetStagingStale || m.bNetStatePending
+		|| ( vulkan_framegen_bidir_active() && !m.mvFieldRevNet ) )
+		return false;
+	for ( uint32_t i = 0; i < levels; i++ )
+		if ( !m.mvFieldCoarse[i] || !m.lumaPrevCoarse[i] || !m.lumaCurCoarse[i] )
+			return false;
+	return true;
+}
+
+static uint64_t framegen_learning_deadline()
+{
+	const auto &h = g_framegenHistory;
+	const uint64_t period = framegen_predicted_interval_ns();
+	if ( period == 0u || h.currentPresentTimeNs == 0u )
+		return 0u;
+	uint64_t deadline = std::min(
+		GetVBlankTimer().CalcNextWakeupTime( true ).ulScheduledWakeupPoint,
+		gamescope::framegen::saturating_add_ns( h.currentPresentTimeNs, period - period / 4u ) );
+	for ( const auto &pending : h.pending )
+		if ( pending.ulWakeDeadlineNs != 0u )
+			deadline = std::min( deadline, pending.ulWakeDeadlineNs );
+	return deadline;
+}
+
+// All images/pipelines are already warm, so recording cannot replace live
+// resources. Abandoning a command restores every CPU publication made by the
+// existing prepare/inference/training helpers; their image tracking is CB-local.
+struct FramegenLearningRecording
+{
+	bool uploaded = g_framegenMotion.bNetWeightsUploaded;
+	bool uploadInitialized = g_framegenMotion.bNetUploadInitialized;
+	bool stagingStale = g_bFramegenNetStagingStale;
+	bool statePending = g_framegenMotion.bNetStatePending;
+	bool netActive = g_framegenMotion.bNetActive;
+	bool uncheckedValid = g_framegenMotion.bUncheckedFieldValid;
+	uint32_t step = g_framegenMotion.uNetTrainStep;
+	gamescope::framegen::NetTrainingCadence cadence = g_framegenMotion.netTrainingCadence;
+	uint64_t cachedFrame = g_framegenMotion.uMotionFieldFrameId;
+	uint64_t cachedInterval = g_framegenMotion.uMotionFieldIntervalNs;
+	uint64_t progress = g_ulFramegenNetProgress;
+	uint64_t trainedSteps = g_framegenMetricsPendingEvents.trainedSteps;
+	gamescope::framegen::NetLearningPair pair = g_framegenNetLearningPair;
+	bool committed = false;
+
+	~FramegenLearningRecording()
+	{
+		if ( committed )
+			return;
+		g_framegenMotion.bNetWeightsUploaded = uploaded;
+		g_framegenMotion.bNetUploadInitialized = uploadInitialized;
+		g_bFramegenNetStagingStale = stagingStale;
+		g_framegenMotion.bNetStatePending = statePending;
+		g_framegenMotion.bNetActive = netActive;
+		g_framegenMotion.bUncheckedFieldValid = uncheckedValid;
+		g_framegenMotion.uNetTrainStep = step;
+		g_framegenMotion.netTrainingCadence = cadence;
+		g_framegenMotion.uMotionFieldFrameId = cachedFrame;
+		g_framegenMotion.uMotionFieldIntervalNs = cachedInterval;
+		g_ulFramegenNetProgress = progress;
+		g_framegenMetricsPendingEvents.trainedSteps = trainedSteps;
+		g_framegenNetLearningPair = pair;
+	}
+};
+
+// Called after the compositor serviced this iteration's presentation. Only the
+// scratch owner token changes; queued presentation completion tokens stay intact.
+void vulkan_framegen_train_idle()
+{
+	auto &h = g_framegenHistory;
+	auto &m = g_framegenMotion;
+	if ( !vulkan_framegen_is_enabled() || !g_device.hasFramegenQueue()
+		|| ( h.bBaseLayer && g_device.framegenFamilySplit() )
+		|| !g_bFramegenNetKeyActive || !framegen_net_online_enabled()
+		|| !framegen_net_requested( g_eFramegenPipeline )
+		|| !framegen_adapt_enabled( g_eFramegenPipeline )
+		|| framegen_record_dir() != nullptr || framegen_color_record_dir() != nullptr
+		|| !h.valid || !h.previousReal || !h.currentReal
+		|| ( framegen_hud_level() != 0u && !h.bBaseLayer
+			&& !( h.bHudFreePrevious && h.bHudFreeCurrent ) ) )
+		return;
+	const auto effective = framegen_effective_config( h.nDegradeSteps );
+	if ( effective.mode == GamescopeFramegenMode::Motion
+		&& effective.pipeline >= GamescopeFramegenPipeline::Learned )
+		return;
+	// Recycle completed buffers before the admission clock; optional recording
+	// must not pay cold allocation or synchronous pipeline compilation.
+	g_device.framegenGarbageCollect();
+	if ( !g_device.hasCompletedFramegen( h.lastFramegenWorkSeqNo )
+		|| !framegen_work_completed()
+		|| !g_device.hasCompleted( std::max( h.lastCompositeSeqNo, h.lastBaseIngestSeqNo ) ) )
+		return;
+	framegen_net_profile_consume();
+	framegen_adapt_consume( effective.pipeline );
+	const auto &dispatch = framegen_dispatch_for_format( h.drmFormat );
+	if ( !framegen_learning_resources_ready( dispatch )
+		|| m.learning.warmedSeqNo == 0u || m.learning.recordCostNs == 0u )
+		return;
+	const uint64_t now = get_time_in_nanos();
+	if ( !gamescope::framegen::background_learning_due( m.learning.lastAttemptNs,
+		now, h.currentFrameId, m.netTrainingCadence.consideredPair ) )
+		return;
+	// A deliberate cadence skip is a CPU-only decision, kept across idle polls.
+	if ( !m.netTrainingCadence.due( h.currentFrameId, framegen_net_online_every() ) )
+	{
+		m.netTrainingCadence.consider( h.currentFrameId, framegen_net_online_every() );
+		framegen_net_note_skip( NetLearningSkip::Every );
+		return;
+	}
+	const uint64_t gpuCost = g_device.framegenTrainingCostNs();
+	const uint64_t deadline = framegen_learning_deadline();
+	if ( !gamescope::framegen::background_learning_fits(
+		now, deadline, gpuCost, m.learning.recordCostNs ) )
+		return;
+	m.learning.lastAttemptNs = now;
+	FramegenLearningRecording transaction;
+	auto cmd = g_device.commandBuffer( true );
+	if ( !cmd )
+		return;
+	cmd->markFramegen();
+	const int query = g_device.framegenTimestampBegin( cmd.get() );
+	if ( query < 0 || !framegen_prepare_motion( cmd.get(), h.currentReal->width(),
+		h.currentReal->height(), dispatch, GamescopeFramegenPipeline::Learned ) )
+		return;
+	framegen_record_net( cmd.get(), m.width, m.height, vulkan_framegen_bidir_active() );
+	framegen_record_adapt_probe( cmd.get(), m.width, m.height );
+	const bool readback = framegen_record_net_train_pair( cmd.get(),
+		GamescopeFramegenPipeline::Learned, true );
+	if ( !readback || g_ulFramegenNetProgress == transaction.progress )
+		return;
+	g_device.framegenTimestampEnd( cmd.get(), query );
+	const uint64_t finalNow = get_time_in_nanos();
+	// A real scheduling hitch is still real CPU cost, even when no GPU work ran.
+	m.learning.recordCostNs = std::max( m.learning.recordCostNs, finalNow - now );
+	if ( !gamescope::framegen::background_learning_fits( finalNow,
+		std::min( deadline, framegen_learning_deadline() ), gpuCost ) )
+		return;
+	const uint64_t seq = g_device.submitFramegen( std::move( cmd ),
+		std::max( h.lastCompositeSeqNo, h.lastBaseIngestSeqNo ), query, 0u, 0u, true );
+	transaction.committed = true;
+	m.uMotionFieldFrameId = 0u;
+	m.uMotionFieldIntervalNs = 0u;
+	m.bNetActive = false;
+	h.ulAdaptStatsSeqNo = 0u;
+	h.ulAdaptConsumedSeqNo = 0u;
+	h.lastFramegenWorkSeqNo = seq;
+	h.lastLearningSeqNo = seq;
+	h.genReadA = h.previousReal;
+	h.genReadB = h.currentReal;
+	h.genReadSeqNo = seq;
+	h.ulNetProfileSeqNo = seq;
+	if ( g_bFramegenDebug )
+		vk_log.infof( "framegen: idle training submitted real id=%" PRIu64 " seq=%" PRIu64
+			" effective=%s progress=%" PRIu64, h.currentFrameId, seq,
+			gamescope::framegen::pipeline_name( effective.pipeline ), g_ulFramegenNetProgress );
 }
 
 // ---------------------------------------------------------------------------
@@ -13495,6 +15228,184 @@ static gamescope::OwningRc<CVulkanTexture> framegen_bench_make_image( uint32_t n
 }
 
 } // namespace
+
+// Exercise the same preserving upload barrier used by learned inference with
+// nonzero float bytes, including a second host refill of an existing GENERAL image.
+static bool framegen_net_upload_guard()
+{
+	constexpr uint32_t W = 7u, H = 2u;
+	CVulkanTexture::createFlags uploadFlags;
+	uploadFlags.bMappable = true;
+	uploadFlags.bTransferSrc = true;
+	uploadFlags.bHostUpload = true;
+	CVulkanTexture::createFlags gpuFlags;
+	gpuFlags.bTransferSrc = true;
+	gpuFlags.bTransferDst = true;
+	CVulkanTexture::createFlags readbackFlags;
+	readbackFlags.bMappable = true;
+	readbackFlags.bTransferDst = true;
+	gamescope::OwningRc<CVulkanTexture> upload = new CVulkanTexture();
+	gamescope::OwningRc<CVulkanTexture> gpu = new CVulkanTexture();
+	gamescope::OwningRc<CVulkanTexture> readback = new CVulkanTexture();
+	if ( !upload->BInit( W, H, 1u, DRM_FORMAT_R32F, uploadFlags )
+		|| !gpu->BInit( W, H, 1u, DRM_FORMAT_R32F, gpuFlags )
+		|| !readback->BInit( W, H, 1u, DRM_FORMAT_R32F, readbackFlags ) )
+		return false;
+	struct RestoreUpload
+	{
+		gamescope::OwningRc<CVulkanTexture> texture = g_framegenMotion.netWeightsUpload;
+		bool initialized = g_framegenMotion.bNetUploadInitialized;
+		~RestoreUpload()
+		{
+			g_framegenMotion.netWeightsUpload = std::move( texture );
+			g_framegenMotion.bNetUploadInitialized = initialized;
+		}
+	} restore;
+	g_framegenMotion.netWeightsUpload = upload;
+	g_framegenMotion.bNetUploadInitialized = false;
+	for ( uint32_t pass = 0u; pass < 2u; pass++ )
+	{
+		std::array<float, W * H> expected;
+		for ( uint32_t i = 0u; i < expected.size(); i++ )
+			expected[i] = 0.25f + float( pass ) + float( i ) * 0.125f;
+		for ( uint32_t y = 0u; y < H; y++ )
+			memcpy( upload->mappedPixels() + y * upload->rowPitch(), expected.data() + y * W, W * sizeof( float ) );
+		auto cmd = g_device.commandBuffer();
+		if ( !cmd )
+			return false;
+		framegen_record_net_upload_barrier( cmd.get() );
+		cmd->copyImage( upload, gpu );
+		cmd->copyImage( gpu, readback );
+		cmd->hostReadBarrier();
+		// This guard runs before the compositor loop, never on normal presentation.
+		g_device.wait( g_device.submit( std::move( cmd ) ) );
+		for ( uint32_t y = 0u; y < H; y++ )
+			if ( memcmp( readback->mappedPixels() + y * readback->rowPitch(), expected.data() + y * W, W * sizeof( float ) ) != 0 )
+				return false;
+	}
+	vk_log.infof( "framegen: net upload guard preserved first and repeated nonzero R32F bytes (row bytes=%u upload pitch=%u readback pitch=%u)",
+		W * uint32_t( sizeof( float ) ), upload->rowPitch(), readback->rowPitch() );
+	return true;
+}
+
+// GPU contract guard for the opt-in spatial shader. Uses known translations,
+// cuts and disagreement rather than another implementation of its algorithm.
+bool vulkan_framegen_spatial_guard()
+{
+	if ( !framegen_net_upload_guard() )
+		return false;
+	constexpr uint32_t W = 64, H = 32, S = 8;
+	using Pixels = std::vector<glm::vec4>;
+	const auto makeImage = []( uint32_t w, uint32_t h, bool mapped ) {
+		CVulkanTexture::createFlags flags;
+		flags.bSampled = !mapped;
+		flags.bStorage = !mapped;
+		flags.bTransferSrc = !mapped;
+		flags.bTransferDst = true;
+		flags.bMappable = mapped;
+		gamescope::OwningRc<CVulkanTexture> tex = new CVulkanTexture();
+		if ( !tex->BInit( w, h, 1u, DRM_FORMAT_ABGR32323232F, flags ) )
+			tex = nullptr;
+		return tex;
+	};
+	auto previous = makeImage( W, H, false );
+	auto current = makeImage( W, H, false );
+	auto field = makeImage( W / S, H / S, false );
+	auto output = makeImage( W, H, false );
+	auto readback = makeImage( W, H, true );
+	if ( !previous || !current || !field || !output || !readback )
+		return false;
+	const auto color = []( float x, float y ) {
+		return glm::vec4( 1.5f + x / 64.0f, -0.5f + y / 128.0f,
+			0.125f + x / 128.0f, 0.25f + x / 256.0f );
+	};
+	const auto upload = [&]( CVulkanCmdBuffer *cmd, const auto &texture, const Pixels &pixels ) {
+		const uint32_t size = static_cast<uint32_t>( pixels.size() * sizeof( glm::vec4 ) );
+		auto [data, offset] = g_device.uploadBufferData( size );
+		memcpy( data, pixels.data(), size );
+		cmd->copyBufferToImage( g_device.uploadBuffer(), offset, texture->width(), texture );
+	};
+	uint32_t boundaryDifferences = 0;
+	float maxTranslationError = 0.0f;
+	for ( uint32_t scene = 0; scene < 4u; scene++ )
+	{
+		Pixels prev( W * H ), cur( W * H ), mv( W / S * H / S );
+		for ( uint32_t y = 0; y < H; y++ )
+			for ( uint32_t x = 0; x < W; x++ )
+			{
+				cur[y * W + x] = color( float(x), float(y) );
+				const float shift = scene == 3u && x < W / 2u ? -4.0f : 4.0f;
+				prev[y * W + x] = color( std::clamp( float(x) + shift, 0.0f, float(W - 1u) ), float(y) );
+				if ( scene == 2u )
+					prev[y * W + x] += glm::vec4( 4.0f, 4.0f, 4.0f, 0.0f );
+			}
+		for ( uint32_t y = 0; y < H / S; y++ )
+			for ( uint32_t x = 0; x < W / S; x++ )
+				mv[y * ( W / S ) + x] = glm::vec4(
+					scene == 3u && x < W / S / 2u ? -0.5f : 0.5f,
+					0.0f, 1.0f, scene == 0u ? -1.0f : 0.0f );
+		{
+			auto cmd = g_device.commandBuffer();
+			upload( cmd.get(), previous, prev );
+			upload( cmd.get(), current, cur );
+			upload( cmd.get(), field, mv );
+			g_device.submit( std::move( cmd ) );
+			g_device.waitIdle();
+		}
+		for ( float phase : { 1.0f / 3.0f, 0.5f, 2.0f / 3.0f, 1.0f, 1.5f } )
+		{
+			Pixels baseline;
+			for ( const ShaderType shader : { SHADER_TYPE_FRAMEGEN_MOTION_WARP, SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL } )
+			{
+				auto cmd = g_device.commandBuffer();
+				cmd->bindPipeline( g_device.pipeline( shader ) );
+				cmd->bindTarget( output );
+				framegen_motion_bind_sampler( cmd.get(), 0, previous, false );
+				framegen_motion_bind_sampler( cmd.get(), 1, current, false );
+				framegen_motion_bind_sampler( cmd.get(), 2, field, false );
+				cmd->pushConstants<FramegenMotionWarpPush_t>( phase, k_flFramegenSuppressLo,
+					k_flFramegenSuppressHi, float(S), 0.03f, 0.10f, 1.0f );
+				cmd->dispatch( W / 8u, H / 8u );
+				cmd->copyImage( output, readback );
+				cmd->hostReadBarrier();
+				g_device.submit( std::move( cmd ) );
+				g_device.waitIdle();
+				// Address the queried subresource origin explicitly in this guard.
+				const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
+				VkSubresourceLayout layout;
+				g_device.vk.GetImageSubresourceLayout( g_device.device(), readback->vkImage(), &subresource, &layout );
+				Pixels actual( W * H );
+				for ( uint32_t y = 0; y < H; y++ )
+					memcpy( actual.data() + y * W, readback->mappedData() + layout.offset + y * layout.rowPitch, W * sizeof(glm::vec4) );
+				for ( uint32_t y = 0; y < H; y++ )
+					for ( uint32_t x = 0; x < W; x++ )
+					{
+						const glm::vec4 a = actual[y * W + x];
+						for ( uint32_t c = 0; c < 4u; c++ )
+							if ( !std::isfinite( a[c] ) )
+								return false;
+						if ( std::abs( a.a - cur[y * W + x].a ) > 1e-5f )
+							return false;
+						if ( scene < 3u && x >= 12u && x < W - 12u )
+						{
+							const auto expected = scene == 1u ? color( float(x) - phase * 4.0f, float(y) ) : cur[y * W + x];
+							for ( uint32_t c = 0; c < 3u; c++ )
+								maxTranslationError = std::max( maxTranslationError, std::abs( a[c] - expected[c] ) );
+						}
+						if ( !baseline.empty() && scene == 3u
+							&& glm::length( glm::vec3(a - baseline[y * W + x]) ) > 1e-4f )
+							boundaryDifferences++;
+					}
+				if ( shader == SHADER_TYPE_FRAMEGEN_MOTION_WARP )
+					baseline = std::move( actual );
+			}
+		}
+	}
+	const bool passed = maxTranslationError < 0.002f && boundaryDifferences != 0u;
+	printf( "framegen-spatial-guard: %s translation/cut/disagreement_max_error=%.7f boundary_differences=%u alpha=preserved HDR=unclamped phases=5\n",
+		passed ? "PASS" : "FAIL", maxTranslationError, boundaryDifferences );
+	return passed;
+}
 
 void vulkan_framegen_benchmark()
 {
@@ -13650,7 +15561,7 @@ void vulkan_framegen_benchmark()
 			{
 				auto cmd = g_device.commandBuffer();
 				framegen_prepare_motion( cmd.get(), res.nWidth, res.nHeight, dispatch, g_eFramegenPipeline );
-				if ( g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict
+				if ( gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline )
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 					cmd->copyImage( framegen_motion_field(), g_framegenMotion.mvFieldHistory );
 				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
@@ -13658,7 +15569,7 @@ void vulkan_framegen_benchmark()
 					cmd->copyImage( g_framegenMotion.lumaPrev, g_framegenMotion.lumaReservoir[0] );
 				g_device.submit( std::move( cmd ) );
 				g_device.waitIdle();
-				if ( g_eFramegenPipeline >= GamescopeFramegenPipeline::Predict
+				if ( gamescope::framegen::pipeline_uses_motion_history( g_eFramegenPipeline )
 					&& g_framegenMotion.mvFieldHistory != nullptr )
 				{
 					g_framegenMotion.uMotionHistoryFrameId = 2;
@@ -13687,6 +15598,16 @@ void vulkan_framegen_benchmark()
 				} );
 				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "adapt stats probe (per real)", msAdaptProbe );
 			}
+			// Quality meter (clear + accumulate + readback copy), recorded after
+			// the generated frames in production. Its counters exist when the
+			// meter is on (GAMESCOPE_FRAMEGEN_METRICS=1) or the pipeline adapts.
+			if ( g_framegenMotion.statsAccum != nullptr )
+			{
+				double msMeter = timePass( [&]( CVulkanCmdBuffer *cmd ) {
+					framegen_record_quality_meter( cmd, g_framegenMotion.width, g_framegenMotion.height );
+				} );
+				printf( "%-8s  %-26s  %10.3f\n", res.pszName, "quality meter (per real)", msMeter );
+			}
 
 			// Stage C net refinement — one direction for causal prediction,
 			// both only when bidir is active. Runs first so the warp rows below
@@ -13713,7 +15634,9 @@ void vulkan_framegen_benchmark()
 				g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
 					? "motion guided warp (per gen)"
 					: g_eFramegenPipeline == GamescopeFramegenPipeline::Predict
-						? "motion accel warp (per gen)" : "motion warp (per gen)",
+						? "motion accel warp (per gen)"
+						: g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial
+							? "motion spatial warp (gen)" : "motion warp (per gen)",
 				msMotionWarp );
 
 			if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided
@@ -13932,17 +15855,36 @@ static bool framegen_record_color_probe_real( gamescope::Rc<CVulkanTexture> pRea
 	return true;
 }
 
+// The HUD-free history split in vulkan_composite is not always available
+// (vulkan_composite names the reason). The composited HUD then becomes
+// output-space history: motion estimation, generated frames and online
+// training see it. Not redesigned here (bidir flips its history images);
+// documented, and said once so a quality capture can be judged.
+static void framegen_note_hud_in_history( bool bHudFreeRealFrame, const char *pszReason )
+{
+	static gamescope::framegen::FramegenHudInHistoryNote s_note;
+	if ( const char *pszLog = s_note.take( bHudFreeRealFrame, framegen_hud_level() != 0u, pszReason ) )
+		vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
+			pszLog );
+}
+
 // bCursorFreeRealFrame: output-space mode only — pRealFrame carries no cursor,
 // either because the composite split it out (vulkan_composite) or because the
 // stack had no cursor layer to begin with. It is the caller's verdict, not a
 // property recomputable here: pFrameInfo still describes the FULL stack.
-static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame )
+// bHudFreeRealFrame: likewise for the framegen HUD — pRealFrame is a composite
+// the HUD was not drawn into, while the scanout image carries it.
+// pszHudInHistoryReason: when it is not HUD-free, why (for the one-time note).
+static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame, const struct FrameInfo_t *pFrameInfo, uint64_t ulCompositeSeqNo, bool bCursorFreeRealFrame, bool bHudFreeRealFrame, const char *pszHudInHistoryReason )
 {
 	if ( !vulkan_framegen_is_enabled() || !pRealFrame || !pFrameInfo )
 		return;
 
 	if ( !g_bLoggedFramegenConfig )
 	{
+		// Bidir as the steady pipeline: with base-layer generation requested, base
+		// scenes run causal and only output-space scenes run bidir.
+		const bool bBidirScheduled = framegen_bidir_requested() && !framegen_base_layer_enabled();
 		vk_log.infof( "framegen: enabled mode=%s pipeline=%s multiplier=%d%s",
 			gamescope::framegen::mode_name( g_eFramegenMode ),
 			gamescope::framegen::pipeline_name( g_eFramegenPipeline ), g_nFramegenMultiplier,
@@ -13957,25 +15899,33 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		if ( vulkan_framegen_vrr_hybrid_requested() )
 			vk_log.infof( "framegen: VRR hybrid requested — adaptive sync stays active, generated frames flip mid-interval; tearing remains suppressed" );
 		else
+		{
+			if ( framegen_vrr_hybrid_configured() )
+				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_VRR_HYBRID ignored: it needs a dedicated framegen queue, and generation shares the composite queue" );
 			vk_log.infof( "framegen: adaptive sync (VRR) and tearing flips are suppressed while framegen is active" );
-		if ( env_to_bool( getenv( "GAMESCOPE_FRAMEGEN_JIT" ) ) )
-			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_JIT is now default and has no effect" );
+		}
+		if ( getenv( "GAMESCOPE_FRAMEGEN_JIT" ) != nullptr )
+			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_JIT has no effect: deadline scheduling is the default, and GAMESCOPE_FRAMEGEN_CLASSIC=1 selects the classic batch path" );
 		if ( framegen_causal_deadline_enabled()
 			&& !vulkan_framegen_vrr_hybrid_active()
-			&& !vulkan_framegen_bidir_active() )
+			&& !bBidirScheduled )
 			vk_log.infof( "framegen: causal fixed-refresh deadline scheduling active by default — one exact display slot is planned at a time; multiplier is a resource ceiling" );
 		else if ( g_device.hasFramegenQueue() && framegen_classic_enabled()
 			&& !vulkan_framegen_vrr_hybrid_active()
-			&& !vulkan_framegen_bidir_active() )
+			&& !bBidirScheduled )
 			vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_CLASSIC=1 selected the classic batch path" );
 		if ( framegen_bidir_enabled() )
 		{
-			if ( !framegen_owns_output_ring() )
+			if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial )
+				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored (spatial is a causal-only pipeline)" );
+			else if ( !framegen_owns_output_ring() )
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored on a Vulkan-swapchain backend — bidir presents output-ring images directly by flip substitution, and swapchain images are owned by the presentation engine between present and re-acquire" );
-			else if ( g_eFramegenMode == GamescopeFramegenMode::Motion && !vulkan_framegen_vrr_hybrid_requested() )
-				vk_log.infof( "framegen: bidirectional interpolation requested — generated frames interpolate between the two real frames; real frames are shown up to the target delay D (bidir_delay_ms) plus one refresh after they are recorded" );
-			else
+			else if ( !framegen_bidir_requested() )
 				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR ignored (requires motion mode and is incompatible with VRR-hybrid pacing)" );
+			else if ( framegen_base_layer_enabled() )
+				vk_log.infof( "framegen: GAMESCOPE_FRAMEGEN_BIDIR and GAMESCOPE_FRAMEGEN_BASE share scenes: base-layer scenes use causal generation, and bidir runs only in scenes that fall back to output-space generation" );
+			else
+				vk_log.infof( "framegen: bidirectional interpolation requested — generated frames interpolate between the two real frames; real frames are shown up to the target delay D (bidir_delay_ms) plus one refresh after they are recorded" );
 		}
 		if ( !framegen_owns_output_ring() )
 			vk_log.infof( "framegen: base-layer generation forced — a Vulkan-swapchain backend has no compositor-owned output ring, so history keys on the client's buffer and generated frames are late-composited into the acquired swapchain image" );
@@ -13983,8 +15933,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 			vk_log.infof( "framegen: base-layer generation + late overlay composite requested — predicting on the pre-upscale game layer, overlays/cursor composite fresh onto generated frames" );
 		if ( g_eFramegenMode == GamescopeFramegenMode::Motion )
 		{
-			const bool bBidirActive = vulkan_framegen_bidir_active();
-			if ( bBidirActive )
+			if ( bBidirScheduled )
 			{
 				vk_log.infof( "framegen: bidirectional pipeline — symmetric checked forward/reverse fields%s; causal acceleration, Guided color-guided reconstruction, reservoir and shading are not scheduled",
 					framegen_agreement_enabled( g_eFramegenPipeline ) ? " + full-resolution agreement" : "" );
@@ -13999,6 +15948,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: warp pipeline — forward matcher + constant-velocity warp only" );
 			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Checked )
 				vk_log.infof( "framegen: checked pipeline — reverse consistency + full-resolution agreement enabled" );
+			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Spatial )
+				vk_log.infof( "framegen: spatial pipeline: learned constant-velocity warp with RGB-guided boundaries; no acceleration, reservoir or shading history" );
 			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Predict )
 				vk_log.infof( "framegen: predict pipeline — confidence-gated causal temporal acceleration enabled after one consecutive field warm-up" );
 			else if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided )
@@ -14014,17 +15965,16 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 				vk_log.infof( "framegen: self-supervised adaptation disabled (GAMESCOPE_FRAMEGEN_ADAPT=0)" );
 			if ( framegen_net_requested( g_eFramegenPipeline ) )
 			{
-				const bool bConservativeBidir = vulkan_framegen_bidir_active();
-				if ( bConservativeBidir )
+				if ( bBidirScheduled )
 					vk_log.infof( "framegen: learned bidirectional confidence veto active (C) — FB-checked geometry is preserved and confidence can only decrease" );
 				else
 					vk_log.infof( "framegen: learned forward-field refinement active (C) — the net improves causal motion prediction once per real frame (bounded flow residual + evidence-gated confidence)" );
-				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided && !bBidirActive )
+				if ( g_eFramegenPipeline == GamescopeFramegenPipeline::Guided && !bBidirScheduled )
 					vk_log.infof( "framegen: causal shading-persistence head %s — three-frame in-situ supervision, bounded color-trend correction (GAMESCOPE_FRAMEGEN_SHADING=0 disables)",
 						framegen_shading_enabled( g_eFramegenPipeline ) ? "enabled" : "disabled" );
 				if ( framegen_net_online_enabled() )
 					vk_log.infof( "framegen: in-situ learning active — %s (lr=%g, %u tiles/step, decay-to-prior; GAMESCOPE_FRAMEGEN_NET_EVERY=%u)%s",
-						bConservativeBidir
+						bBidirScheduled
 							? "each real frame trains only bidir's conservative confidence output row; geometry heads and shared trunk stay frozen"
 							: "the net keeps training on the framegen GPU against every real frame",
 						framegen_net_online_lr(), k_uFramegenNetTrainTiles, framegen_net_online_every(),
@@ -14064,9 +16014,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// id, so a client that reacquires and recommits a buffer mapping to the
 	// same texture object is still recognised as new content; pointer identity
 	// only backs layers that carry no commit id.
-	const CVulkanTexture *pBaseTexture = pFrameInfo->layerCount > 0 ? pFrameInfo->layers[ 0 ].tex.get() : nullptr;
-	const uint64_t ulBaseCommitID = pFrameInfo->layerCount > 0
-		? pFrameInfo->layers[ 0 ].ulCommitID : 0u;
+	const CVulkanTexture *pBaseTexture = pFrameInfo->layers.count() > 0 ? pFrameInfo->layers.get( 0 ).tex.get() : nullptr;
+	const uint64_t ulBaseCommitID = pFrameInfo->layers.count() > 0
+		? pFrameInfo->layers.get( 0 ).ulCommitID : 0u;
 	if ( pBaseTexture && !gamescope::framegen::is_new_real_frame_content(
 			{ g_framegenHistory.ulLastBaseCommitID, g_framegenHistory.pLastBaseTexture },
 			{ ulBaseCommitID, pBaseTexture } ) )
@@ -14079,14 +16029,42 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	}
 	g_framegenHistory.pLastBaseTexture = pBaseTexture;
 	g_framegenHistory.ulLastBaseCommitID = ulBaseCommitID;
-	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
-		return;
+
+	if ( framegen_net_online_enabled() )
+		g_framegenMetricsPendingEvents.learningSkips.add(
+			g_framegenNetLearningPair.begin( g_framegenPresentState.ulCurrentRealFrameId ) );
 
 	// Base-layer dispatcher: decide per recorded frame whether the base-layer path
 	// applies. History then tracks the pre-upscale game buffer instead of the
 	// composited output; the dims/mode-keyed reset inside ensure_resources
 	// mediates any live switch between the two, so they never mix in a scene.
 	const bool bBaseLayer = framegen_base_layer_usable( pFrameInfo );
+	// Settle the net's input key before anything below can record, train or
+	// generate from this frame (the colour probe included).
+	framegen_net_note_input_key( pFrameInfo, bBaseLayer );
+	if ( framegen_record_color_probe_real( pRealFrame, pFrameInfo, ulCompositeSeqNo ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::ColorProbe );
+		return;
+	}
+
+	// Bidir and base-layer generation are exclusive per scene. The first
+	// decision is always reported; later changes only under framegen debug and
+	// rate-limited, since layer 0 can flip between the two paths every frame.
+	if ( framegen_bidir_requested() && framegen_base_layer_enabled() )
+	{
+		static std::optional<bool> s_oLoggedBaseScene;
+		static uint64_t s_uBidirBaseSceneDebugLogCounter = 0;
+		if ( s_oLoggedBaseScene != bBaseLayer )
+		{
+			const bool bFirstDecision = !s_oLoggedBaseScene.has_value();
+			s_oLoggedBaseScene = bBaseLayer;
+			if ( bFirstDecision || FramegenDebugShouldLog( s_uBidirBaseSceneDebugLogCounter ) )
+				vk_log.infof( bBaseLayer
+					? "framegen: bidir off for this scene: base-layer generation applies"
+					: "framegen: bidir on for this scene: layer 0 cannot take base-layer generation" );
+		}
+	}
 	if ( !bBaseLayer && !framegen_owns_output_ring() )
 	{
 		// Hard bail-out, not a fallback. Output-space history would retain
@@ -14101,7 +16079,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		}
 		return;
 	}
-	const gamescope::Rc<CVulkanTexture> &pHistoryFrame = bBaseLayer ? pFrameInfo->layers[ 0 ].tex : pRealFrame;
+	const gamescope::Rc<CVulkanTexture> &pHistoryFrame = bBaseLayer ? pFrameInfo->layers.get( 0 ).tex : pRealFrame;
 
 	if ( !framegen_ensure_resources( pHistoryFrame->width(), pHistoryFrame->height(), pHistoryFrame->drmFormat(), bBaseLayer ) )
 		return;
@@ -14115,31 +16093,31 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		// doesn't). What IS a discontinuity is the game buffer's own
 		// colorspace flipping on an unchanged DRM format: prediction across
 		// it would blend two encodings.
-		const int nBaseColorspace = (int)pFrameInfo->layers[ 0 ].colorspace;
+		const int nBaseColorspace = (int)pFrameInfo->layers.get( 0 ).colorspace;
 		if ( g_framegenHistory.nLastBaseColorspace != nBaseColorspace )
 		{
 			if ( g_framegenHistory.nLastBaseColorspace != -1 )
 				vulkan_framegen_invalidate_history( "base_colorspace_change" );
 			g_framegenHistory.nLastBaseColorspace = nBaseColorspace;
 		}
-		g_framegenHistory.nLastLayerCount = pFrameInfo->layerCount;
+		g_framegenHistory.nLastLayerCount = pFrameInfo->layers.count();
 		g_framegenHistory.eLastEOTF = pFrameInfo->outputEncodingEOTF;
 	}
 	// A layer-count change (overlay appearing/vanishing) or an output-encoding
 	// change (SDR<->HDR can flip the EOTF without changing the image format)
 	// abruptly replaces scene content; drop the history rather than smear the
 	// old scene over the new one for a frame.
-	else if ( g_framegenHistory.nLastLayerCount != pFrameInfo->layerCount || g_framegenHistory.eLastEOTF != pFrameInfo->outputEncodingEOTF )
+	else if ( g_framegenHistory.nLastLayerCount != pFrameInfo->layers.count() || g_framegenHistory.eLastEOTF != pFrameInfo->outputEncodingEOTF )
 	{
 		vulkan_framegen_invalidate_history( g_framegenHistory.eLastEOTF != pFrameInfo->outputEncodingEOTF ? "output_eotf_change" : "layer_count_change" );
-		g_framegenHistory.nLastLayerCount = pFrameInfo->layerCount;
+		g_framegenHistory.nLastLayerCount = pFrameInfo->layers.count();
 		g_framegenHistory.eLastEOTF = pFrameInfo->outputEncodingEOTF;
 	}
 
 	uint64_t now = get_time_in_nanos();
 	uint64_t ulPrevRealFrameTimeNs = g_framegenHistory.currentPresentTimeNs;
-	const uint64_t ulSourceReadyTimeNs = pFrameInfo->layerCount > 0
-		? pFrameInfo->layers[ 0 ].acquireReadyTimeNs : 0u;
+	const uint64_t ulSourceReadyTimeNs = pFrameInfo->layers.count() > 0
+		? pFrameInfo->layers.get( 0 ).acquireReadyTimeNs : 0u;
 	const bool bSourceTimestampValid = ulSourceReadyTimeNs != 0u
 		&& ulSourceReadyTimeNs <= now;
 
@@ -14149,7 +16127,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// Provisional display-clock anchor: the vblank this composite is expected to
 	// scan out at. The tagged backend feedback replaces it with the correlated
 	// actual flip before future causal phases are planned.
-	uint64_t ulRawRealVblankNs = GetVBlankTimer().GetNextVBlank( 0 );
+	uint64_t ulRawRealVblankNs = framegen_next_vblank_ns();
 	g_framegenHistory.ulCurrentRealVblankNs = ulRawRealVblankNs;
 	g_framegenHistory.lastCompositeSeqNo = ulCompositeSeqNo;
 	g_framegenHistory.nLastGeneratedSlot = 0;
@@ -14171,22 +16149,14 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	// A very long gap is a scene discontinuity (stall, load screen); drop history
 	// so the previous scene is never smeared across the resume.
-	// Pace against the SAME refresh the vblank scheduler counts in. The vblank
-	// timer uses GetRefresh() == (g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh);
-	// in nested mode g_nOutputRefresh is later overwritten with the PARENT monitor's
-	// refresh while slots are still placed on g_nNestedRefresh's cadence. Deriving the
-	// interval from g_nOutputRefresh there desynchronises nGapVblanks / phase / strength
-	// from where the frame is actually shown — the temporal wobble. On DRM the two are
-	// equal, so this is a no-op there.
-	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-	const uint64_t ulVblankIntervalNs = nFramegenRefreshMhz > 0 ? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
+	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
 	if ( g_framegenHistory.valid && ulPrevRealFrameTimeNs != 0 && now - ulPrevRealFrameTimeNs > k_ulFramegenMaxRealFrameGapNs )
 	{
 		vulkan_framegen_invalidate_history( "frame_gap" );
 		ulPrevRealFrameTimeNs = 0;
 		g_framegenHistory.previousPresentTimeNs = 0;
 		g_framegenHistory.currentPresentTimeNs = now;
-		ulRawRealVblankNs = GetVBlankTimer().GetNextVBlank( 0 );
+		ulRawRealVblankNs = framegen_next_vblank_ns();
 		g_framegenHistory.ulCurrentRealVblankNs = ulRawRealVblankNs;
 		g_framegenHistory.lastCompositeSeqNo = ulCompositeSeqNo;
 	}
@@ -14289,7 +16259,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// adding real-frame latency.
 	const bool bLeavesEmptyVblank = gamescope::framegen::leaves_empty_vblank(
 		now, ulPrevRealFrameTimeNs, ulVblankIntervalNs );
-	const bool bGpuHasHeadroom = g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
+	const bool bGpuHasHeadroom = framegen_work_completed();
 	const bool bGeneratable = bLeavesEmptyVblank && bGpuHasHeadroom;
 	const bool bCanSpeculate = g_device.hasFramegenQueue() && bGpuHasHeadroom && ulPrevRealFrameTimeNs != 0;
 	const uint32_t nShadowConfidence = g_framegenHistory.valid
@@ -14331,6 +16301,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		// inert here and must never claim otherwise.
 		g_framegenHistory.bCursorFreePrevious = false;
 		g_framegenHistory.bCursorFreeCurrent = false;
+		g_framegenHistory.bHudFreePrevious = false;
+		g_framegenHistory.bHudFreeCurrent = false;
 	}
 	else
 	{
@@ -14338,12 +16310,16 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 		g_framegenHistory.currentReal = pRealFrame;
 		g_framegenHistory.bCursorFreePrevious = g_framegenHistory.bCursorFreeCurrent;
 		g_framegenHistory.bCursorFreeCurrent = bCursorFreeRealFrame;
+		g_framegenHistory.bHudFreePrevious = g_framegenHistory.bHudFreeCurrent;
+		g_framegenHistory.bHudFreeCurrent = bHudFreeRealFrame;
+		framegen_note_hud_in_history( bHudFreeRealFrame, pszHudInHistoryReason );
 	}
 	g_framegenHistory.previousFrameId = g_framegenHistory.currentFrameId - 1;
 
 	// Prime: the first frame after a reset/invalidation only establishes history.
 	if ( !g_framegenHistory.valid )
 	{
+		framegen_net_note_skip( NetLearningSkip::History );
 		static uint64_t s_uPrimeDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uPrimeDebugLogCounter ) )
 			vk_log.infof( "framegen: priming history with real frame id=%" PRIu64, g_framegenHistory.currentFrameId );
@@ -14391,6 +16367,8 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 	if ( !bShouldGenerate )
 	{
+		framegen_net_note_skip( !bGpuHasHeadroom ? NetLearningSkip::Busy
+			: bGeneratable ? NetLearningSkip::Cadence : NetLearningSkip::NoSlot );
 		if ( bBidirDeadline )
 		{
 			framegen_bidir_plan_pair(
@@ -14607,9 +16585,9 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 
 static bool frame_has_non_device_local_base_import( const struct FrameInfo_t *pFrameInfo )
 {
-	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
 	{
-		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers[ i ];
+		const FrameInfo_t::Layer_t &layer = pFrameInfo->layers.get( i );
 		if ( layer.zpos == g_zposBase
 			&& layer.tex
 			&& layer.tex->externalImage()
@@ -14626,9 +16604,9 @@ static bool stage_non_device_local_base_imports( struct FrameInfo_t *pFrameInfo,
 	CVulkanCmdBuffer *pCmdBuffer )
 {
 	bool bCopied = false;
-	for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+	for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
 	{
-		FrameInfo_t::Layer_t &layer = pFrameInfo->layers[ i ];
+		FrameInfo_t::Layer_t &layer = pFrameInfo->layers.get( i );
 		gamescope::Rc<CVulkanTexture> pSource = layer.tex;
 		if ( layer.zpos != g_zposBase
 			|| !pSource
@@ -14754,8 +16732,34 @@ static void stage_base_imports_in_own_submission( struct FrameInfo_t *pFrameInfo
 		g_device.noteStagingSubmission( ulSeqNo, nQuerySlot );
 }
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud )
+// The live inputs gamescope::framegen::framegen_hud_in_history_reason asks for,
+// one at a time. tests/framegen_deadline.cpp pins this mapping.
+static bool framegen_hud_history_check( gamescope::framegen::FramegenHudHistoryCheck eCheck )
 {
+	switch ( eCheck )
+	{
+		case gamescope::framegen::FramegenHudHistoryCheck::FramegenEnabled:
+			return vulkan_framegen_is_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::OwnsOutputRing:
+			return framegen_owns_output_ring();
+		case gamescope::framegen::FramegenHudHistoryCheck::CursorSplitEnabled:
+			return framegen_cursor_split_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::BidirActive:
+			return vulkan_framegen_bidir_active();
+		case gamescope::framegen::FramegenHudHistoryCheck::ColorProbeRecording:
+			return framegen_color_record_dir() != nullptr;
+	}
+	return false;
+}
+
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool bForceFramegenHud, const struct FrameInfo_t *pHudFrameInfo )
+{
+	if (!pOutputOverride && increment) {
+		const auto *client=framegen_hud_base_client_texture(frameInfo);
+		gamescope::framegen::gpu_diagnostics_store().observe(
+			client ? client->renderOrigin() : nullptr, client && client->deviceLocalStagingImage());
+	}
+
 	// Offscreen overrides do not consume a swapchain image. The generated
 	// window-present path reconciles before selecting its explicit override.
 	if ( !pOutputOverride && GetBackend()->UsesVulkanSwapchain()
@@ -14784,10 +16788,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		else if ( !g_reshade_effect.empty() )
 			pszPath = "ReShade/effect composite";
 
-		CVulkanTexture *pLayer0 = frameInfo->layerCount > 0 ? frameInfo->layers[0].tex.get() : nullptr;
+		CVulkanTexture *pLayer0 = frameInfo->layers.count() > 0 ? frameInfo->layers.get( 0 ).tex.get() : nullptr;
 		vk_log.infof( "dual-gpu-route: frame path %s layers %d partial %s output %ux%u pipewire %s override %s queue family %u",
 			pszPath,
-			frameInfo->layerCount,
+			frameInfo->layers.count(),
 			partial ? "yes" : "no",
 			currentOutputWidth,
 			currentOutputHeight,
@@ -14800,9 +16804,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				pLayer0->width(),
 				pLayer0->height(),
 				pLayer0->drmFormat(),
-				frameInfo->layers[0].scale.x,
-				frameInfo->layers[0].scale.y,
-				frameInfo->layers[0].colorspace );
+				frameInfo->layers.get( 0 ).scale.x,
+				frameInfo->layers.get( 0 ).scale.y,
+				frameInfo->layers.get( 0 ).colorspace );
 		}
 	}
 
@@ -14815,15 +16819,15 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())
 	{
-		if (frameInfo->layers[0].tex)
+		if (frameInfo->layers.get( 0 ).tex)
 		{
 			ReshadeEffectKey key
 			{
 				.path             = g_reshade_effect,
-				.bufferWidth      = frameInfo->layers[0].tex->width(),
-				.bufferHeight     = frameInfo->layers[0].tex->height(),
-				.bufferColorSpace = frameInfo->layers[0].colorspace,
-				.bufferFormat     = frameInfo->layers[0].tex->format(),
+				.bufferWidth      = frameInfo->layers.get( 0 ).tex->width(),
+				.bufferHeight     = frameInfo->layers.get( 0 ).tex->height(),
+				.bufferColorSpace = frameInfo->layers.get( 0 ).colorspace,
+				.bufferFormat     = frameInfo->layers.get( 0 ).tex->format(),
 				.techniqueIdx     = g_reshade_technique_idx,
 			};
 
@@ -14832,7 +16836,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 			if (pipeline != nullptr)
 			{
-				uint64_t seq = pipeline->execute(frameInfo->layers[0].tex, &frameInfo->layers[0].tex);
+				uint64_t seq = pipeline->execute(frameInfo->layers.get( 0 ).tex, &frameInfo->layers.get( 0 ).tex);
 				g_device.wait(seq);
 			}
 		}
@@ -14841,6 +16845,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	{
 		g_reshadeManager.clear();
 	}
+
+	if ( !pOutputOverride && !vulkan_ensure_output_images() )
+		return std::nullopt;
 
 	gamescope::Rc<CVulkanTexture> compositeImage;
 	if ( pOutputOverride )
@@ -14891,6 +16898,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				// Exceptional recovery is atomic for bidir: flush its entire
 				// timeline and invalidate; the next composite flips live.
 				// Non-bidir keeps the same history-release behavior.
+				static uint64_t s_uOutputRingFlushDebugLogCounter = 0;
+				if ( FramegenDebugShouldLog( s_uOutputRingFlushDebugLogCounter ) )
+					framegen_log_output_ring_pressure( "flushing history" );
 				vulkan_framegen_invalidate_history( "real_output_ring_pressure" );
 				nAvailable = framegen_find_available_output_image( g_output.nOutImage );
 			}
@@ -14898,7 +16908,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			{
 				static uint64_t s_uOutputRingPressureDebugLogCounter = 0;
 				if ( FramegenDebugShouldLog( s_uOutputRingPressureDebugLogCounter ) )
-					framegen_log_output_ring_pressure();
+					framegen_log_output_ring_pressure( "skipping live-buffer composite" );
 				return std::nullopt;
 			}
 			g_output.nOutImage = *nAvailable;
@@ -14908,6 +16918,38 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			|| outputImages[ g_output.nOutImage ] == nullptr )
 			return std::nullopt;
 		compositeImage = outputImages[ g_output.nOutImage ];
+	}
+
+	// Overrides (screenshots, upscale cache) are logical-sized, so never rotated.
+	const uint32_t uOutputRotation = pOutputOverride ? 0u : g_uOutputRotation;
+
+	// The pre-emptive upscale is the only caller that brings its own command buffer.
+	const bool bPreemptiveUpscale = pOutputOverride != nullptr && pInCommandBuffer != nullptr;
+
+	// Optional filters must not turn an allocation/capability failure into a
+	// skipped real frame. Keep the original layer stack so staging mutations
+	// remain visible to callers, but label/record the ordinary BLIT that runs.
+	const bool bRequestedFSR = frameInfo->useFSRLayer0;
+	const bool bRequestedSGSR = frameInfo->useSGSRLayer0;
+	const bool bRequestedNIS = frameInfo->useNISLayer0;
+	const BlurMode requestedBlur = frameInfo->blurLayer0;
+	bool bRestoreFilters = false;
+	defer(
+		if ( bRestoreFilters )
+		{
+			frameInfo->useFSRLayer0 = bRequestedFSR;
+			frameInfo->useSGSRLayer0 = bRequestedSGSR;
+			frameInfo->useNISLayer0 = bRequestedNIS;
+			frameInfo->blurLayer0 = requestedBlur;
+		}
+	);
+	if ( !vulkan_prepare_composite_intermediate( frameInfo ) )
+	{
+		frameInfo->useFSRLayer0 = false;
+		frameInfo->useSGSRLayer0 = false;
+		frameInfo->useNISLayer0 = false;
+		frameInfo->blurLayer0 = BLUR_MODE_OFF;
+		bRestoreFilters = true;
 	}
 
 	// Output-space cursor split, first half. Only a composite that will actually
@@ -14922,8 +16964,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// When it engages, everything below composites the stack WITHOUT the cursor
 	// into an owned image, and the second pass at the end of the recording block
 	// draws the live cursor from that image into the real scanout target.
-	const bool bCursorSplitCandidate = framegen_cursor_split_enabled()
-		&& vulkan_framegen_is_enabled()
+	// Enabled check first: with framegen off the cursor switch is never read.
+	const bool bCursorSplitCandidate = vulkan_framegen_is_enabled()
+		&& framegen_cursor_split_enabled()
 		&& framegen_owns_output_ring()
 		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
 		&& !vulkan_framegen_bidir_active()
@@ -14940,8 +16983,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
 		if ( pCursorFreeImage != nullptr )
 		{
-			cursorSplitLayer = frameInfo->layers[ nCursorSplitLayer ];
-			frameInfo->layerCount--;
+			cursorSplitLayer = frameInfo->layers.get( nCursorSplitLayer );
+			frameInfo->layers.pop();
 			pCursorScanoutImage = compositeImage;
 			compositeImage = std::move( pCursorFreeImage );
 		}
@@ -14954,6 +16997,47 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	const bool bCursorFreeHistory = bCursorSplitCandidate
 		&& ( bCursorSplit || !framegen_frame_has_cursor_layer( frameInfo ) );
 
+	// Framegen HUD split. The HUD is the last pass of this composite and lands
+	// in compositeImage; when that image is also the framegen history, motion
+	// estimation, every generated frame and the learned net's online training
+	// see the HUD. Same candidates as the cursor split, so it rides on its
+	// switch too (GAMESCOPE_FRAMEGEN_CURSOR=0 keeps the HUD in history, as
+	// before). When the cursor split ran, history is already the owned
+	// cursor-free image and the HUD only reaches the scanout target. Otherwise
+	// the composite still renders straight into the ring image exactly as with
+	// the HUD off, and a bit-exact copy of it into an owned image from the same
+	// pool, taken before the HUD pass, becomes history. Copying this way round
+	// needs transferSrc on the ring image (already requested for screenshots)
+	// and transferDst only on the non-flippable pool, so scanout usage and
+	// modifier selection stay as they are. A busy pool, or a ring image that
+	// lost transferSrc in BInit, keeps the HUD in history for this frame, and
+	// bHudFreeHistory says so to the present side. The present side then draws
+	// the live HUD onto generated frames (framegen_cursor_present_composite),
+	// so the HUD does not strobe at the real-frame rate.
+	//
+	// The decisions live in framegen/hud_history.hpp (unit-tested there); this
+	// block only gathers the facts, and tests/framegen_deadline.cpp pins it.
+	// framegen_hud_level() is a cached setting, first read at device init.
+	gamescope::framegen::FramegenHudHistoryState hudHistory;
+	hudHistory.splitCandidate = bCursorSplitCandidate;
+	hudHistory.hudOn = framegen_hud_level() != 0u;
+	hudHistory.cursorSplit = bCursorSplit;
+	hudHistory.compositeImage = compositeImage != nullptr;
+	hudHistory.transferSrc = compositeImage != nullptr && compositeImage->transferSrc();
+	gamescope::Rc<CVulkanTexture> pHudFreeHistoryImage;
+	if ( gamescope::framegen::framegen_hud_history_copy_wanted( hudHistory ) )
+	{
+		pHudFreeHistoryImage = framegen_acquire_cursor_history_image(
+			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
+	}
+	hudHistory.hudFreeImage = pHudFreeHistoryImage != nullptr;
+	const bool bHudFreeHistory = gamescope::framegen::framegen_hud_free_history( hudHistory );
+	// Why the HUD stays in this frame's history: the first reason that holds,
+	// for framegen_record_real_frame's one-time note. Side composites never
+	// reach it, and base-layer scenes or repaints are not output-space history.
+	const char *pszHudInHistoryReason = gamescope::framegen::framegen_hud_in_history_reason(
+		hudHistory, framegen_hud_history_check );
+
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 	// Off the real-frame critical path: the staging copy goes out as its own
 	// submission now, so the composite recorded below (and the flip that waits on
@@ -14963,16 +17047,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	if ( g_reshade_effect.empty() )
 		stage_base_imports_in_own_submission( frameInfo, cmdBuffer.get() );
 
+	const std::optional<uint32_t> oTimingSlot = CompositeTimingBegin( cmdBuffer.get() );
+
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
 
-	if ( frameInfo->useFSRLayer0 )
+	if ( frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 )
 	{
-		uint32_t inputX = frameInfo->layers[0].tex->width();
-		uint32_t inputY = frameInfo->layers[0].tex->height();
+		uint32_t inputX = frameInfo->layers.get( 0 ).tex->width();
+		uint32_t inputY = frameInfo->layers.get( 0 ).tex->height();
 
-		uint32_t tempX = frameInfo->layers[0].integerWidth();
-		uint32_t tempY = frameInfo->layers[0].integerHeight();
+		uint32_t tempX = frameInfo->layers.get( 0 ).integerWidth();
+		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
 
 		if ( g_bDebugDualGpuRoute )
 		{
@@ -14986,38 +17072,42 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				g_device.queueFamily() );
 		}
 
-		update_tmp_images(tempX, tempY);
-
-		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_EASU));
+		cmdBuffer->bindPipeline(g_device.pipeline(frameInfo->useSGSRLayer0 ? SHADER_TYPE_SGSR : SHADER_TYPE_EASU));
 		cmdBuffer->bindTarget(g_output.tmpOutput);
-		cmdBuffer->bindTexture(0, frameInfo->layers[0].tex);
+		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
 		cmdBuffer->setTextureSrgb(0, true);
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
-		cmdBuffer->uploadConstants<EasuPushData_t>(inputX, inputY, tempX, tempY);
+		if ( frameInfo->useSGSRLayer0 )
+			cmdBuffer->uploadConstants<SgsrPushData_t>(tempX, tempY);
+		else
+			cmdBuffer->uploadConstants<EasuPushData_t>(inputX, inputY, tempX, tempY);
 
 		int pixelsPerGroup = 16;
 
 		cmdBuffer->dispatch(div_roundup(tempX, pixelsPerGroup), div_roundup(tempY, pixelsPerGroup));
 
-		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_RCAS, frameInfo->layerCount, frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF ));
+		if ( oTimingSlot )
+			CompositeTimingMid( cmdBuffer.get(), *oTimingSlot );
+
+		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_RCAS, frameInfo->layers.count(), frameInfo->ycbcrMask() & ~1, 0u, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTexture(0, g_output.tmpOutput);
 		cmdBuffer->setTextureSrgb(0, true);
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
 		cmdBuffer->bindTarget(compositeImage);
-		cmdBuffer->uploadConstants<RcasPushData_t>(frameInfo, g_upscaleFilterSharpness / 10.0f);
+		cmdBuffer->uploadConstants<RcasPushData_t>(frameInfo, frameInfo->nUpscaleSharpness / 10.0f, uOutputRotation);
 
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
 	else if ( frameInfo->useNISLayer0 )
 	{
-		uint32_t inputX = frameInfo->layers[0].tex->width();
-		uint32_t inputY = frameInfo->layers[0].tex->height();
+		uint32_t inputX = frameInfo->layers.get( 0 ).tex->width();
+		uint32_t inputY = frameInfo->layers.get( 0 ).tex->height();
 
-		uint32_t tempX = frameInfo->layers[0].integerWidth();
-		uint32_t tempY = frameInfo->layers[0].integerHeight();
+		uint32_t tempX = frameInfo->layers.get( 0 ).integerWidth();
+		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
 
 		if ( g_bDebugDualGpuRoute )
 		{
@@ -15031,13 +17121,11 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				g_device.queueFamily() );
 		}
 
-		update_tmp_images(tempX, tempY);
-
-		float nisSharpness = (20 - g_upscaleFilterSharpness) / 20.0f;
+		float nisSharpness = (20 - frameInfo->nUpscaleSharpness) / 20.0f;
 
 		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_NIS));
 		cmdBuffer->bindTarget(g_output.tmpOutput);
-		cmdBuffer->bindTexture(0, frameInfo->layers[0].tex);
+		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
 		cmdBuffer->setTextureSrgb(0, true);
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
@@ -15055,14 +17143,14 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->dispatch(div_roundup(tempX, pixelsPerGroupX), div_roundup(tempY, pixelsPerGroupY));
 
 		struct FrameInfo_t nisFrameInfo = *frameInfo;
-		nisFrameInfo.layers[0].tex = g_output.tmpOutput;
-		nisFrameInfo.layers[0].scale.x = 1.0f;
-		nisFrameInfo.layers[0].scale.y = 1.0f;
+		nisFrameInfo.layers.get( 0 ).tex = g_output.tmpOutput;
+		nisFrameInfo.layers.get( 0 ).scale.x = 1.0f;
+		nisFrameInfo.layers.get( 0 ).scale.y = 1.0f;
 
-		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, nisFrameInfo.layerCount, nisFrameInfo.ycbcrMask(), 0u, nisFrameInfo.colorspaceMask(), outputTF ));
+		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, nisFrameInfo.layers.count(), nisFrameInfo.ycbcrMask(), 0u, nisFrameInfo.colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), &nisFrameInfo);
 		cmdBuffer->bindTarget(compositeImage);
-		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo, uOutputRotation);
 
 		int pixelsPerGroup = 8;
 
@@ -15070,34 +17158,32 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	else if ( frameInfo->blurLayer0 )
 	{
-		update_tmp_images(currentOutputWidth, currentOutputHeight);
-
 		ShaderType type = SHADER_TYPE_BLUR_FIRST_PASS;
 
 		uint32_t blur_layer_count = 1;
 		// Also blur the override on top if we have one.
-		if (frameInfo->layerCount >= 2 && frameInfo->layers[1].zpos == g_zposOverride)
+		if (frameInfo->layers.count() >= 2 && frameInfo->layers.get( 1 ).zpos == g_zposOverride)
 			blur_layer_count++;
 
 		cmdBuffer->bindPipeline(g_device.pipeline(type, blur_layer_count, frameInfo->ycbcrMask() & 0x3u, 0, frameInfo->colorspaceMask(), outputTF ));
 		cmdBuffer->bindTarget(g_output.tmpOutput);
 		for (uint32_t i = 0; i < blur_layer_count; i++)
 		{
-			cmdBuffer->bindTexture(i, frameInfo->layers[i].tex);
+			cmdBuffer->bindTexture(i, frameInfo->layers.get( i ).tex);
 			cmdBuffer->setTextureSrgb(i, false);
 			cmdBuffer->setSamplerUnnormalized(i, true);
 			cmdBuffer->setSamplerNearest(i, false);
 		}
-		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
 
 		int pixelsPerGroup = 8;
 
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 
-		bool useSrgbView = frameInfo->layers[0].colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
+		bool useSrgbView = frameInfo->layers.get( 0 ).colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
 
 		type = frameInfo->blurLayer0 == BLUR_MODE_COND ? SHADER_TYPE_BLUR_COND : SHADER_TYPE_BLUR;
-		cmdBuffer->bindPipeline(g_device.pipeline(type, frameInfo->layerCount, frameInfo->ycbcrMask(), blur_layer_count, frameInfo->colorspaceMask(), outputTF ));
+		cmdBuffer->bindPipeline(g_device.pipeline(type, frameInfo->layers.count(), frameInfo->ycbcrMask(), blur_layer_count, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTarget(compositeImage);
 		cmdBuffer->bindTexture(VKR_BLUR_EXTRA_SLOT, g_output.tmpOutput);
@@ -15109,10 +17195,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	else
 	{
-		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layerCount, frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
+		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTarget(compositeImage);
-		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
 
 		const int pixelsPerGroup = 8;
 
@@ -15134,9 +17220,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	{
 		FrameInfo_t cursorFrameInfo;
 		framegen_build_cursor_overlay_frame_info( &cursorFrameInfo, compositeImage,
-			cursorSplitLayer, frameInfo );
+			&cursorSplitLayer, frameInfo );
 
-		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, cursorFrameInfo.layerCount, cursorFrameInfo.ycbcrMask(), 0u, cursorFrameInfo.colorspaceMask(), EOTF_Count ));
+		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, cursorFrameInfo.layers.count(), cursorFrameInfo.ycbcrMask(), 0u, cursorFrameInfo.colorspaceMask(), EOTF_Count ));
 		bind_all_layers(cmdBuffer.get(), &cursorFrameInfo);
 		cmdBuffer->bindTarget(pCursorScanoutImage);
 		cmdBuffer->uploadConstants<BlitPushData_t>(&cursorFrameInfo);
@@ -15152,7 +17238,20 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		// Restore the caller's layer stack before anything else reads it;
 		// framegen_record_real_frame keys scene changes on layerCount and must
 		// keep seeing the true count.
-		frameInfo->layerCount++;
+		*frameInfo->layers.push() = cursorSplitLayer;
+	}
+
+	// HUD split, second half: freeze the finished, HUD-free composite as
+	// history before the HUD pass below draws into the scanout image. A plain
+	// vkCmdCopyImage between images of the same size and VkFormat: bit-exact,
+	// no shader, no re-encode, so HDR (PQ, scRGB fp16) history is the very
+	// values the display gets minus the HUD. The command buffer's sync2
+	// tracking orders it after the composite write and orders the HUD write
+	// after this read.
+	if ( pHudFreeHistoryImage != nullptr )
+	{
+		cmdBuffer->copyImage( compositeImage, pHudFreeHistoryImage );
+		pFramegenHistoryImage = std::move( pHudFreeHistoryImage );
 	}
 
 	if ( pPipewireTexture != nullptr )
@@ -15202,6 +17301,31 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		}
 	}
 
+	if ( oTimingSlot )
+	{
+		// Keys are stable buffers so the accumulator can hash the pointer.
+		static char szKeys[ 3 ][ 2 ][ 8 ][ 32 ];
+		GamescopeUpscaleFilter eFilter = frameInfo->layers.count() ? frameInfo->layers.get( 0 ).filter : GamescopeUpscaleFilter::LINEAR;
+		// Label the pass that ran, including HDR fallback and cached frames.
+		if ( frameInfo->useSGSRLayer0 )
+			eFilter = GamescopeUpscaleFilter::SGSR;
+		else if ( frameInfo->useFSRLayer0 )
+			eFilter = GamescopeUpscaleFilter::FSR;
+		else if ( frameInfo->useNISLayer0 )
+			eFilter = GamescopeUpscaleFilter::NIS;
+		else if ( UpscaleFilterUsesSharpness( eFilter ) )
+			eFilter = GamescopeUpscaleFilter::LINEAR;
+		const uint32_t uFilter = std::min<uint32_t>( uint32_t( eFilter ), 7u );
+		const char *pszMode = bPreemptiveUpscale ? "preupscale" : "composite";
+		char *pszKey = szKeys[ 0 ][ bPreemptiveUpscale ][ uFilter ];
+		char *pszKeyPre = szKeys[ 1 ][ bPreemptiveUpscale ][ uFilter ];
+		char *pszKeyPost = szKeys[ 2 ][ bPreemptiveUpscale ][ uFilter ];
+		snprintf( pszKey, sizeof( szKeys[ 0 ][ 0 ][ 0 ] ), "%s %s", pszMode, UpscaleFilterName( eFilter ) );
+		snprintf( pszKeyPre, sizeof( szKeys[ 0 ][ 0 ][ 0 ] ), "%s %s pre-pass", pszMode, UpscaleFilterName( eFilter ) );
+		snprintf( pszKeyPost, sizeof( szKeys[ 0 ][ 0 ][ 0 ] ), "%s %s rcas", pszMode, UpscaleFilterName( eFilter ) );
+		CompositeTimingEnd( cmdBuffer.get(), *oTimingSlot, pszKey, pszKeyPre, pszKeyPost );
+	}
+
 	// The HUD is the final pass of a real composite. Capture/screenshot side
 	// composites and base-layer late composites are identified by their capture
 	// or override target and deliberately never enter this path; the direct
@@ -15211,8 +17335,12 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// presents a generated frame by compositing it into the acquired swapchain
 	// image with pOutputOverride set, and that IS the frame that reaches the
 	// display. Without the opt-in the HUD would only be drawn on real frames
-	// and would visibly strobe at half the presented rate. No existing caller
-	// passes true, so DRM / nested Wayland are unchanged.
+	// and would visibly strobe at half the presented rate. The output-space
+	// overlay present (framegen_cursor_present_composite) passes true for the
+	// same reason, but only for a generated frame predicted from HUD-free
+	// history: the HUD split above keeps the HUD out of the real frame's
+	// history, so the generated frame has none and needs the live one drawn on.
+	// Real composites here never go through it and draw the HUD as before.
 	int nFramegenHudSlot = -1;
 	if ( framegen_hud_level() != 0u
 		&& vulkan_framegen_is_enabled()
@@ -15220,10 +17348,12 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			|| ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr ) ) )
 	{
 		nFramegenHudSlot = framegen_hud_record(
-			cmdBuffer.get(), compositeImage, frameInfo );
+			cmdBuffer.get(), compositeImage, pHudFrameInfo != nullptr ? pHudFrameInfo : frameInfo );
 	}
 
 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+	if ( oTimingSlot )
+		g_CompositeTiming.pending.back().ulSeqNo = sequence;
 	framegen_hud_note_submit( nFramegenHudSlot, sequence );
 
 	// Submitted separately, after the composite: the real frame's present
@@ -15236,7 +17366,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// swapchain backend must key on. It early-outs when framegen is disabled, and
 	// refuses output-space history when the compositor does not own the ring.
 	if ( !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr )
-		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory );
+		framegen_record_real_frame( pFramegenHistoryImage, frameInfo, sequence, bCursorFreeHistory, bHudFreeHistory,
+			pszHudInHistoryReason );
 
 	if ( framegen_owns_output_ring() && pOutputOverride == nullptr && increment )
 	{
@@ -15266,6 +17397,37 @@ bool vulkan_has_drm_props()
 {
 	for (const auto& ext : g_device.supportedExtensions()) {
 		if ( strcmp(ext.extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0 )
+			return true;
+	}
+
+	return false;
+}
+
+bool vulkan_format_supports_features(VkFormat format, VkFormatFeatureFlags features)
+{
+	VkDrmFormatModifierPropertiesListEXT modifierPropList = {
+		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+	};
+	VkFormatProperties2 formatProps = {
+		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+		.pNext = g_device.supportsModifiers() ? &modifierPropList : nullptr,
+	};
+
+	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
+
+	// Without modifiers, flippable images are created with optimal tiling
+	if ( !g_device.supportsModifiers() )
+		return ( formatProps.formatProperties.optimalTilingFeatures & features ) == features;
+
+	if ( modifierPropList.drmFormatModifierCount == 0 )
+		return false;
+
+	std::vector<VkDrmFormatModifierPropertiesEXT> modifierProps(modifierPropList.drmFormatModifierCount);
+	modifierPropList.pDrmFormatModifierProperties = modifierProps.data();
+	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
+
+	for ( size_t j = 0; j < modifierProps.size(); j++ ) {
+		if ( ( modifierProps[j].drmFormatModifierTilingFeatures & features ) == features )
 			return true;
 	}
 
@@ -15467,6 +17629,7 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
 	CVulkanTexture::createFlags texCreateFlags;
 	texCreateFlags.bSampled = true;
+	texCreateFlags.bTransferSrc = true;
 	texCreateFlags.bTransferDst = true;
 	texCreateFlags.bFlippable = true;
 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )

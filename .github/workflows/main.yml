@@ -14,7 +14,7 @@ jobs:
         run: |
           pacman-key --init
           pacman -Syu --noconfirm
-          pacman -S --noconfirm git meson clang glslang libcap wlroots0.19 \
+          pacman -S --noconfirm git meson clang glslang libcap wlroots0.20 \
             sdl2 vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
             libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
             xorg-xwayland pipewire cmake \
@@ -23,13 +23,14 @@ jobs:
             catch2 gcovr
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          submodules: true
       - name: Check framegen maintenance tooling
         run: |
           framegen_shell='scripts/env-gamescope-local.sh scripts/test-framegen.sh
             scripts/framegen-launch-common.sh scripts/watch-framegen.sh
             scripts/run-framegen-native.sh scripts/framegen-doctor.sh
-            scripts/gamescope-hybrid.sh tests/gamescope_hybrid_test.sh'
+            scripts/gamescope-hybrid.sh tests/gamescope_hybrid_test.sh
+            scripts/framegen-showcase.sh scripts/framegen-capture.sh'
           # bash -n parses only its first operand; check each file.
           for script in $framegen_shell; do bash -n "$script"; done
           shellcheck -x $framegen_shell
@@ -37,7 +38,13 @@ jobs:
           PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
             python3 -m py_compile scripts/framegen-net-train.py \
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py \
-              scripts/framegen-nested-smoke.py
+              scripts/framegen-nested-smoke.py scripts/framegen-showcase-report.py \
+              scripts/framegen-hindsight-eval.py scripts/framegen-headless-host.py \
+              scripts/framegen-field-gate.py scripts/framegen-temporal-gate.py \
+              scripts/framegen_field_reference.py scripts/framegen_net_formats.py \
+              scripts/framegen_net.py scripts/framegen_color_capture.py \
+              scripts/framegen_field_capture.py scripts/framegen_net_features.py \
+              scripts/framegen_color_metrics.py
           c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
             tests/test_framegen.cpp src/framegen/atomic_file.cpp \
             -o /tmp/gamescope-framegen-contracts
@@ -50,7 +57,7 @@ jobs:
             scripts/watch-framegen.sh scripts/run-framegen-native.sh \
             scripts/framegen-doctor.sh scripts/gamescope-hybrid.sh scripts/README.md \
             scripts/framegen-\*.py tests/gamescope_hybrid_test.sh tests/fixtures \
-            scripts/framegen-launch-common.sh src/framegen \
+            scripts/framegen-launch-common.sh scripts/framegen-showcase.sh src/framegen \
             tests/test_framegen.cpp; then
             echo 'Machine-specific home path found in a published framegen file.' >&2
             exit 1
@@ -88,9 +95,10 @@ jobs:
       - name: Run unit tests and collect coverage
         run: |
           export CC=gcc CXX=g++
-          meson configure -Db_coverage=true build-gcc
-          meson test -C build-gcc --suite gamescope -v
-          gcovr -f src --xml -o coverage.xml -s build-gcc
+          meson setup build-coverage -Dinput_emulation=disabled --werror --auto-features=enabled -Db_coverage=true
+          meson compile -C build-coverage
+          meson test -C build-coverage --suite gamescope -v
+          gcovr -r src -e src/reshade -e src/shaders --xml -o coverage.xml -s build-coverage
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:

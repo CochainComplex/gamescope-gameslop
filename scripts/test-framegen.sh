@@ -18,7 +18,7 @@
 #   LIMIT=2            game fps = REFRESH / LIMIT (the gap framegen fills; 2 => x2)
 #   DEBUG_EVERY=1      log every Nth framegen event (1 = exact counts, higher = less spam)
 #   DURATION=          seconds to auto-stop a 'run' (empty = until you close the window)
-#   PIPELINE=warp      motion pipeline: warp | checked | learned | predict | guided
+#   PIPELINE=warp      motion pipeline: warp | checked | learned | predict | guided | spatial
 #
 # Examples:
 #   ./scripts/test-framegen.sh bench amd
@@ -94,7 +94,7 @@ cmd_gpus() {
 cmd_bench() {
     require_binary
     local id pipeline="${PIPELINE:-warp}"; id=$(resolve_gpu "${1:-auto}")
-    case "$pipeline" in warp|checked|learned|predict|guided) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided" >&2; exit 1 ;; esac
+    case "$pipeline" in warp|checked|learned|predict|guided|spatial) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided|spatial" >&2; exit 1 ;; esac
     echo "# framegen GPU microbenchmark — device $id"
     echo "# pipeline=$pipeline (compare extrapolate variants and the selected motion pipeline)"
     GAMESCOPE_FRAMEGEN_BENCHMARK=1 "$BIN" --backend headless --prefer-vk-device "$id" \
@@ -162,7 +162,7 @@ cmd_run() {
     local refresh="${REFRESH:-144}" limit="${LIMIT:-2}" every="${DEBUG_EVERY:-1}" pipeline="${PIPELINE:-warp}"
 
     case "$mode" in extrapolate|motion|blend) ;; *) echo "error: mode must be extrapolate|motion|blend" >&2; exit 1 ;; esac
-    case "$pipeline" in warp|checked|learned|predict|guided) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided" >&2; exit 1 ;; esac
+    case "$pipeline" in warp|checked|learned|predict|guided|spatial) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided|spatial" >&2; exit 1 ;; esac
     [[ "$refresh" =~ ^[1-9][0-9]*$ ]] || { echo "error: REFRESH must be a positive integer" >&2; return 1; }
     [[ "$limit" =~ ^[1-9][0-9]*$ ]] || { echo "error: LIMIT must be a positive integer" >&2; return 1; }
     [[ "$every" =~ ^[1-9][0-9]*$ ]] || { echo "error: DEBUG_EVERY must be a positive integer" >&2; return 1; }

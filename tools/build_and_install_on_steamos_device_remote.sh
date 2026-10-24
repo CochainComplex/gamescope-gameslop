@@ -6,4 +6,4 @@ source "$(dirname "$0")/steamos_common_remote.sh" "$@"
 
 ./copy_to_steamos_device_rsync.sh "$STEAMOS_DEVICE_IP"
 envsshpass ssh -t "steamos@$STEAMOS_DEVICE_IP" \
-    "$STEAMOS_REMOTE_REPO/tools/build_and_install_on_steamos_device_local.sh '$STEAMOS_USER_PASSWORD'"
+    "$(envquote "$STEAMOS_DEVICE_PATH/tools/build_and_install_on_steamos_device_local.sh") $(envquote "$STEAMOS_USER_PASSWORD")"

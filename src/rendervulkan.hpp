@@ -11,6 +11,8 @@
 #include <bitset>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <thread>
 
 #include "main.hpp"
 
@@ -32,11 +34,14 @@ class CVulkanCmdBuffer;
 
 // 1: Fade Plane (Fade outs between switching focus)
 // 2: Base Plane (Game, App)
-// 3: Override Plane (Dropdowns, etc)
-// 4: External Overlay (Mangoapp, etc)
-// 5: Primary Overlay (Steam Overlay)
-// 6: Cursor
-#define k_nMaxLayers 6
+// 3-4: Override Underlays (Ancestors of a nested dropdown, yield first)
+// 5: Override Plane (Dropdowns, etc)
+// 6: External Overlay (Mangoapp, etc)
+// 7: Primary Overlay (Steam Overlay)
+// 8: Cursor
+#define k_nMaxLayers 8
+// The shader constant must agree, and per-layer filter and alpha modes pack four bits each into a uint32_t.
+static_assert( k_nMaxLayers == VKR_MAX_LAYERS && k_nMaxLayers <= 8 );
 #define k_nMaxYcbcrMask 16
 #define k_nMaxYcbcrMask_ToPreCompile 3
 
@@ -133,6 +138,7 @@ public:
 		{
 			bFlippable = false;
 			bMappable = false;
+			bHostUpload = false;
 			bSampled = false;
 			bStorage = false;
 			bTransferSrc = false;
@@ -147,6 +153,8 @@ public:
 
 		bool bFlippable : 1;
 		bool bMappable : 1;
+		// Owned linear staging populated by the host before its first GPU read.
+		bool bHostUpload : 1;
 		bool bSampled : 1;
 		bool bStorage : 1;
 		bool bTransferSrc : 1;
@@ -161,6 +169,37 @@ public:
 		// VK_SHARING_MODE_CONCURRENT instead of explicit ownership transfers.
 		bool bFramegenShared : 1;
 		VkImageType imageType;
+
+		static createFlags LinearCapture( bool exportable )
+		{
+			createFlags flags;
+			flags.bMappable = true;
+			flags.bTransferDst = true;
+			flags.bStorage = true;
+			flags.bExportable = exportable;
+			flags.bLinear = exportable;
+			return flags;
+		}
+
+		VkImageUsageFlags imageUsage() const
+		{
+			VkImageUsageFlags usage = 0;
+			if ( bSampled ) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+			if ( bStorage ) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+			if ( bColorAttachment ) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+			if ( bTransferSrc ) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+			if ( bTransferDst ) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			return usage;
+		}
+
+		VkImageCreateFlags imageCreateFlags( VkFormat format, VkFormat alternateFormat ) const
+		{
+			VkImageCreateFlags flags = format != alternateFormat ? VkImageCreateFlags( VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT ) : 0u;
+			// Storage support comes from compatible NV12 plane views.
+			if ( format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM && bStorage )
+				flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+			return flags;
+		}
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
@@ -183,8 +222,12 @@ public:
 	inline uint32_t contentHeight() {return m_contentHeight; }
 	inline uint32_t rowPitch() { return m_unRowPitch; }
 	inline gamescope::IBackendFb* GetBackendFb() { return m_pBackendFb.get(); }
+	// Allocation base, for callers that explicitly apply subresource/plane offsets.
 	inline uint8_t *mappedData() { return m_pMappedData; }
+	// First texel of a single-plane image; rowPitch() still includes row padding.
+	inline uint8_t *mappedPixels() { return m_pMappedData ? m_pMappedData + m_mappedOffset : nullptr; }
 	inline VkFormat format() const { return m_format; }
+	inline bool transferSrc() const { return m_bTransferSrc; }
 	inline const struct wlr_dmabuf_attributes& dmabuf() { return m_dmabuf; }
 	inline VkImage vkImage() { return m_vkImage; }
 	inline bool outputImage() { return m_bOutputImage; }
@@ -219,7 +262,6 @@ public:
 		return format() == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
 	}
 
-	int memoryFence();
 
 	CVulkanTexture( void );
 	~CVulkanTexture( void );
@@ -229,11 +271,13 @@ public:
 private:
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
+	bool m_bTransferSrc = false;
 	bool m_bConcurrentSharing = false;
 	bool m_bOutputImage = false;
+	// Swapchain images are borrowed; an owned image may borrow its allocation.
+	bool m_bOwnsImage = false;
 	bool m_bDeviceLocal = false;
 	bool m_bDeviceLocalStagingImage = false;
-	bool m_bTransferSrc = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
 
@@ -254,6 +298,7 @@ private:
 	uint32_t m_contentHeight = 0;
 
 	uint32_t m_unRowPitch = 0;
+	VkDeviceSize m_mappedOffset = 0;
 	VkDeviceSize m_size = 0;
 
 	uint32_t m_lumaOffset = 0;
@@ -309,6 +354,11 @@ struct FrameInfo_t
 {
 	bool useFSRLayer0;
 	bool useNISLayer0;
+	bool useSGSRLayer0;
+	// Upscale settings for this frame.
+	GamescopeUpscaleFilter eUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
+	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+	int nUpscaleSharpness = 0;
 	bool bFadingOut;
 	BlurMode blurLayer0;
 	int blurRadius;
@@ -320,7 +370,11 @@ struct FrameInfo_t
 	bool applyOutputColorMgmt; // drm only
 	EOTF outputEncodingEOTF;
 
-	int layerCount;
+	// Maps output space onto the focused window's own space for absolute input.
+	// Not the base layer's transform, whose texture may already be upscaled.
+	vec2_t focusedWindowScale = { 1.0f, 1.0f };
+	vec2_t focusedWindowOffset = { 0.0f, 0.0f };
+
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
@@ -403,31 +457,73 @@ struct FrameInfo_t
 			float y = offset.y + 0.5f / scale.y;
 			return { x, y };
 		}
-	} layers[ k_nMaxLayers ];
+	};
+
+	class LayerStack_t
+	{
+	public:
+		Layer_t *push()
+		{
+			if ( m_nCount >= k_nMaxLayers )
+				return nullptr;
+
+			return &m_Layers[ m_nCount++ ];
+		}
+
+		void pop()
+		{
+			assert( m_nCount > 0 );
+			m_nCount--;
+		}
+
+		void truncate( int nCount )
+		{
+			assert( nCount >= 0 && nCount <= m_nCount );
+			m_nCount = nCount;
+		}
+
+		int count() const { return m_nCount; }
+
+		Layer_t &get( int nIndex )
+		{
+			assert( nIndex >= 0 && nIndex < m_nCount );
+			return m_Layers[ nIndex ];
+		}
+
+		const Layer_t &get( int nIndex ) const
+		{
+			assert( nIndex >= 0 && nIndex < m_nCount );
+			return m_Layers[ nIndex ];
+		}
+
+	private:
+		Layer_t m_Layers[ k_nMaxLayers ];
+		int m_nCount = 0;
+	} layers;
 
 	uint32_t borderMask() const {
 		uint32_t result = 0;
-		for (int i = 0; i < layerCount; i++)
+		for (int i = 0; i < layers.count(); i++)
 		{
-			if (layers[ i ].blackBorder)
+			if (layers.get( i ).blackBorder)
 				result |= 1 << i;
 		}
 		return result;
 	}
 	uint32_t ycbcrMask() const {
 		uint32_t result = 0;
-		for (int i = 0; i < layerCount; i++)
+		for (int i = 0; i < layers.count(); i++)
 		{
-			if (layers[ i ].isYcbcr())
+			if (layers.get( i ).isYcbcr())
 				result |= 1 << i;
 		}
 		return result;
 	}
 	uint32_t colorspaceMask() const {
 		uint32_t result = 0;
-		for (int i = 0; i < layerCount; i++)
+		for (int i = 0; i < layers.count(); i++)
 		{
-result |= layers[ i ].colorspace << (i * GamescopeAppTextureColorspace_Bits);
+			result |= layers.get( i ).colorspace << (i * GamescopeAppTextureColorspace_Bits);
 		}
 		return result;
 	}
@@ -456,14 +552,24 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
+bool vulkan_prepare_composite_intermediate( const FrameInfo_t *frameInfo );
+
 // bForceFramegenHud: draw the framegen HUD even though this is an override
-// composite. Only the swapchain generated-frame present passes true (see
-// vulkan_present_framegen_frame_to_window); every other caller keeps the
-// default and therefore the historical behaviour.
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, bool bForceFramegenHud = false );
+// composite. Only the generated-frame presents pass true: the swapchain one
+// (vulkan_present_framegen_frame_to_window) and the output-space overlay one
+// for frames predicted from HUD-free history; every other caller keeps the
+// default and therefore the historical behaviour. pHudFrameInfo, when set, is
+// the stack the HUD text is built from instead of frameInfo.
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr, bool bForceFramegenHud = false, const struct FrameInfo_t *pHudFrameInfo = nullptr );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 bool vulkan_framegen_is_enabled();
+// Compositor thread, once per main-loop iteration before painting: enters or
+// leaves framegen dormancy (rotation, multiple outputs, ring allocation failure).
+void vulkan_framegen_update_dormancy();
+// Reads a GAMESCOPE_FRAMEGEN_* on/off switch; an invalid value keeps bDefault
+// and is logged once per name.
+bool framegen_bool_setting( const char *pszName, bool bDefault );
 // Presentation-tag lifecycle. begin_present runs on the compositor thread just
 // before entering a backend; the selected framegen path may refine the tag, and
 // the backend takes the completed value at its existing commit/feedback point.
@@ -542,6 +648,10 @@ void vulkan_present_wait_shutdown();
 // profile writer.
 // Must run before the backend is destroyed: framegen textures own backend FBs.
 void vulkan_framegen_shutdown();
+// Persists unsaved online learning (CPU only, no GPU or backend access). For exit
+// paths that bypass vulkan_framegen_shutdown, e.g. the X11 I/O error during a
+// process-group interrupt.
+void vulkan_framegen_flush_profile();
 // Cheap compositor-thread counter hook used by the repeat arbiter. Aggregation
 // and reporting remain in vulkan_framegen_drain_present_feedback().
 void vulkan_framegen_metrics_note_repeat();
@@ -571,9 +681,12 @@ void vulkan_framegen_cancel_vrr_hybrid_slot( const char *reason );
 // prints a table. Used by the gamescope_framegen_microbench executable; needs a
 // headless device (vulkan_init) but no compositor.
 void vulkan_framegen_benchmark();
+bool vulkan_framegen_spatial_guard();
 
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
+bool vulkan_supports_pipewire_dmabuf( uint32_t drmFormat );
+uint32_t vulkan_get_rgb10_capture_format( void );
 
 bool vulkan_present_to_window( void );
 // Vulkan-swapchain backends: composite an already-finished, output-sized framegen
@@ -634,6 +747,8 @@ struct gamescope_color_mgmt_t
 	float flSDROnHDRBrightness = 203.f;
 	float flHDRInputGain = 1.f;
 	float flSDRInputGain = 1.f;
+	// Software backlight dim baked into the LUTs, PQ outputs only.
+	float flBacklightLutGain = 1.f;
 
 	// HDR Display Metadata Override & Tonemapping
 	ETonemapOperator hdrTonemapOperator = ETonemapOperator_None;
@@ -771,6 +886,7 @@ enum ShaderType {
 	SHADER_TYPE_RCAS,
 	SHADER_TYPE_NIS,
 	SHADER_TYPE_RGB_TO_NV12,
+	SHADER_TYPE_SGSR,
 	SHADER_TYPE_FRAMEGEN_BLEND,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE,
 	SHADER_TYPE_FRAMEGEN_EXTRAPOLATE_DIRECT,
@@ -786,6 +902,7 @@ enum ShaderType {
 	SHADER_TYPE_FRAMEGEN_MOTION_MATCH_REFINE,
 	SHADER_TYPE_FRAMEGEN_MOTION_FBCHECK,
 	SHADER_TYPE_FRAMEGEN_MOTION_WARP,
+	SHADER_TYPE_FRAMEGEN_MOTION_WARP_SPATIAL,
 	SHADER_TYPE_FRAMEGEN_MOTION_WARP_ACCEL,
 	SHADER_TYPE_FRAMEGEN_MOTION_BIDIR,
 	SHADER_TYPE_FRAMEGEN_MOTION_BIDIR_TRACE,
@@ -927,9 +1044,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdPushConstants) \
 	VK_FUNC(CmdResetQueryPool) \
 	VK_FUNC(CmdWriteTimestamp) \
-	VK_FUNC(CreateQueryPool) \
 	VK_FUNC(DestroyQueryPool) \
-	VK_FUNC(GetQueryPoolResults) \
 	VK_FUNC(CreateBuffer) \
 	VK_FUNC(CreateCommandPool) \
 	VK_FUNC(CreateComputePipelines) \
@@ -940,6 +1055,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CreateImage) \
 	VK_FUNC(CreateImageView) \
 	VK_FUNC(CreatePipelineLayout) \
+	VK_FUNC(CreateQueryPool) \
 	VK_FUNC(CreateSampler) \
 	VK_FUNC(CreateSamplerYcbcrConversion) \
 	VK_FUNC(CreateSemaphore) \
@@ -968,6 +1084,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(GetImageMemoryRequirements) \
 	VK_FUNC(GetImageSubresourceLayout) \
 	VK_FUNC(GetMemoryFdKHR) \
+	VK_FUNC(GetQueryPoolResults) \
 	VK_FUNC(GetMemoryFdPropertiesKHR) \
 	VK_FUNC(GetSemaphoreCounterValue) \
 	VK_FUNC(GetSwapchainImagesKHR) \
@@ -1043,7 +1160,7 @@ public:
 	// next composite on the in-order realtime queue. When no second queue is
 	// available they transparently forward to the shared composite path.
 	bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
-	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0 );
+	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0, bool bOnlineTraining = false );
 	void addFramegenDependency( CVulkanCmdBuffer *pCmdBuffer, uint64_t ulFramegenSeqNo );
 	bool hasCompletedFramegen( uint64_t sequence );
 	void waitFramegen( uint64_t sequence );
@@ -1068,6 +1185,10 @@ public:
 	}
 	// Raw GPU time (ns) of the most recent framegen batch, for logging only.
 	uint64_t framegenLastGpuTimeNs() const { return m_ulFramegenLastRawGpuTimeNs; }
+	// Conservative complete-batch training bound, never an averaged rung cost.
+	uint64_t framegenTrainingCostNs() const { return m_ulFramegenTrainingCostNs; }
+	uint64_t framegenTrainingSampleSeqNo() const { return m_ulFramegenTrainingSampleSeqNo; }
+	void framegenResetTrainingCost();
 	// Forget all per-rung costs (e.g. on a scene change) so the ladder re-probes
 	// configured pipeline optimistically for the new scene.
 	void framegenResetRungCosts();
@@ -1098,22 +1219,11 @@ public:
 	void garbageCollect();
 	// bFramegen dispatches draw from a separate descriptor-set ring so a
 	// generation batch that is still pending on the framegen queue can never have
-	// its in-use sets host-updated by the realtime composite path (the shared
-	// ring is a bare modulo counter with no completion tracking). The framegen
-	// oversubscription guard admits at most one batch in flight, so this ring
-	// never wraps onto pending work.
-	inline VkDescriptorSet descriptorSet( bool bFramegen = false )
-	{
-		if ( bFramegen && !m_framegenDescriptorSets.empty() )
-		{
-			VkDescriptorSet ret = m_framegenDescriptorSets[m_currentFramegenDescriptorSet];
-			m_currentFramegenDescriptorSet = ( m_currentFramegenDescriptorSet + 1 ) % m_framegenDescriptorSets.size();
-			return ret;
-		}
-		VkDescriptorSet ret = m_descriptorSets[m_currentDescriptorSet];
-		m_currentDescriptorSet = (m_currentDescriptorSet + 1) % m_descriptorSets.size();
-		return ret;
-	}
+	// its in-use sets host-updated by the realtime composite path. That ring is
+	// not stamped (its completion lives on the framegen timeline); the framegen
+	// oversubscription guard admits at most one batch in flight, so it never
+	// wraps onto pending work. The shared ring is stamped per submission.
+	VkDescriptorSet descriptorSet( CVulkanCmdBuffer *pCmdBuffer, bool bFramegen = false );
 	uint32_t framegenDescriptorSetCapacity() const
 	{
 		return static_cast<uint32_t>( m_framegenDescriptorSets.size() );
@@ -1136,6 +1246,7 @@ public:
 	inline VkCommandPool commandPool() {return m_commandPool;}
 	inline VkCommandPool generalCommandPool() {return m_generalCommandPool;}
 	inline uint32_t queueFamily() {return m_queueFamily;}
+	uint64_t completedSeqNo();
 	inline uint32_t generalQueueFamily() {return m_generalQueueFamily;}
 	// Queue family the dedicated frame-generation queue lives on. Equal to
 	// queueFamily() in the common case (queue index 1 of the compositor family);
@@ -1157,6 +1268,7 @@ public:
 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
 	inline bool supportsFp16() {return m_bSupportsFp16;}
 	inline bool supportsShaderFloat16() {return m_bSupportsShaderFloat16;}
+	inline VkSamplerYcbcrConversion ycbcrConversion() const { return m_ycbcrConversion; }
 	inline bool supportsStorageImageExtendedFormats() { return m_bSupportsStorageImageExtendedFormats; }
 	inline bool supportsSync2() { return m_bSupportsSync2; }
 	inline uint32_t maxComputeSharedMemorySize() const { return m_uMaxComputeSharedMemorySize; }
@@ -1229,7 +1341,7 @@ protected:
 	bool createScratchResources();
 	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable);
 	void compileFramegenPipelines();
-	void compileAllPipelines();
+	void compileAllPipelines(std::stop_token st);
 
 	VkDevice m_device = nullptr;
 	VkPhysicalDevice m_physDev = nullptr;
@@ -1238,6 +1350,8 @@ protected:
 	VkQueue m_generalQueue = nullptr;
 	VkSamplerYcbcrConversion m_ycbcrConversion = VK_NULL_HANDLE;
 	VkSampler m_ycbcrSampler = VK_NULL_HANDLE;
+	// Outlives command buffers that reference the immutable YCbCr binding.
+	gamescope::OwningRc<CVulkanTexture> m_ycbcrPlaceholder;
 	VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
 	VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -1255,6 +1369,7 @@ protected:
 	dev_t m_drmPrimaryDevId = 0;
 
 	bool m_bSupportsFp16 = false;
+	uint32_t m_uVendorID = 0;
 	bool m_bSupportsShaderFloat16 = false;
 	bool m_bSupportsStorageImageExtendedFormats = false;
 	bool m_bSupportsSync2 = false;
@@ -1276,10 +1391,9 @@ protected:
 
 	static constexpr uint32_t k_uMaxConcurrentSubmits = 8;
 
-	// currently just one set, no need to double buffer because we
-	// vkQueueWaitIdle after each submit.
-	// should be moved to the output if we are going to support multiple outputs
+	// Round robin, each set stamped with the last submission that reads it.
 	std::array<VkDescriptorSet, k_uMaxConcurrentSubmits * 3> m_descriptorSets;
+	std::array<uint64_t, k_uMaxConcurrentSubmits * 3> m_descriptorSetSeqNos{};
 	uint32_t m_currentDescriptorSet = 0;
 
 	// Separate ring for framegen dispatches (see descriptorSet()). Allocated only
@@ -1288,7 +1402,9 @@ protected:
 	// dispatches: luma pair + 2 pyramid + 2x [match + 2 refines] + 2 FB checks
 	// (forward + bidir reverse) + 5 stats passes (clear + accumulate + finalize +
 	// 2 field applies) + 2 net refinements + 2 net training tiles + up to 2
-	// optimizer steps (init + step on the first online batch) + 3 warps).
+	// optimizer steps (init + step on the first online batch) + 3 warps). The
+	// fine /4 field adds a pyramid step and a refine per direction (+3), but
+	// only below the learned pipelines: at most 19 there.
 	static constexpr uint32_t k_uFramegenMaxDispatchesPerBatch = 25;
 	static constexpr uint32_t k_uFramegenDescriptorSets = 30;
 	static_assert( k_uFramegenDescriptorSets >= k_uFramegenMaxDispatchesPerBatch );
@@ -1340,11 +1456,13 @@ protected:
 	double m_flFramegenTimestampPeriodNs = 0.0;
 	// seqNo -> { query ring slot, ladder rung, generated count } so the readback
 	// can attribute the measured cost to the exact batch shape.
-	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; };
+	struct FramegenQueryAssoc_t { uint32_t nSlot; uint32_t nRung; uint32_t nGeneratedCount; bool bOnlineTraining; };
 	std::vector<std::pair<uint64_t, FramegenQueryAssoc_t>> m_framegenQuerySlotBySeqNo;
 	uint64_t m_aFramegenRungCostNs[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint32_t m_aFramegenRungSamples[ kFramegenLadderSlots ][ kFramegenGeneratedCountSlots ] = {};
 	uint64_t m_ulFramegenLastRawGpuTimeNs = 0;
+	uint64_t m_ulFramegenTrainingCostNs = 0;
+	uint64_t m_ulFramegenTrainingSampleSeqNo = 0;
 
 	// Same ring discipline for the dual-GPU staging copy, always on the composite
 	// queue family. Separate pool + validity because a dedicated framegen queue
@@ -1365,12 +1483,17 @@ protected:
 
 private:
 	std::vector<VkExtensionProperties> m_supportedExts;
+	std::jthread m_pipelineThread;
 };
 
 struct TextureState
 {
 	VkPipelineStageFlags2 lastStage;
 	VkAccessFlags2 lastAccess;
+	// Consumer rectangle actually published after an internal write/transition.
+	// Reader accumulation above remains separate for write-after-read ordering.
+	VkPipelineStageFlags2 visibleReadStage;
+	VkAccessFlags2 visibleReadAccess;
 	bool bLastWasWrite;
 	bool discarded : 1;
 	bool dirty : 1;
@@ -1382,6 +1505,8 @@ struct TextureState
 	{
 		lastStage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
 		lastAccess = 0;
+		visibleReadStage = 0;
+		visibleReadAccess = 0;
 		bLastWasWrite = false;
 		discarded = false;
 		dirty = false;
@@ -1433,6 +1558,7 @@ public:
 	}
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
+	void copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
 
 
@@ -1441,15 +1567,22 @@ public:
 	void discardImage(CVulkanTexture *image);
 	void markDirty(CVulkanTexture *image);
 	void insertBarrier(bool flush = false);
+	// Makes the transfer writes recorded so far visible to host reads of
+	// mapped memory: a fence or semaphore wait covers device accesses only.
+	void hostReadBarrier();
 
 	VkQueue queue() { return m_queue; }
 	uint32_t queueFamily() { return m_queueFamily; }
 
 	void AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 	void AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
+	void AddReleasePoint( std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint );
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }
 	const std::vector<VulkanTimelinePoint_t> &GetExternalSignals() const { return m_ExternalSignals; }
+
+	void AddDescriptorSet( uint32_t uIndex ) { m_usedDescriptorSets.push_back( uIndex ); }
+	const std::vector<uint32_t> &GetUsedDescriptorSets() const { return m_usedDescriptorSets; }
 
 private:
 	struct ImageUse
@@ -1484,6 +1617,8 @@ private:
 
 	// Per Use State
 	std::vector<gamescope::Rc<CVulkanTexture>> m_textureRefs;
+	std::vector<std::shared_ptr<gamescope::CReleaseTimelinePoint>> m_releasePoints;
+	std::vector<uint32_t> m_usedDescriptorSets;
 	std::vector<TrackedTextureState> m_textureState;
 	std::vector<VkImageMemoryBarrier> m_imageBarriers;
 	std::vector<ImageUse> m_imageUses;
@@ -1521,5 +1656,7 @@ void vulkan_wait_idle();
 
 // Whether the driver implements VK_EXT_physical_device_drm
 bool vulkan_has_drm_props();
+
+bool vulkan_format_supports_features(VkFormat format, VkFormatFeatureFlags features);
 
 extern CVulkanDevice g_device;

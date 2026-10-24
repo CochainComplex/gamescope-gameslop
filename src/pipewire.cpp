@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -33,6 +34,58 @@ static uint32_t s_nCaptureWidth;
 static uint32_t s_nCaptureHeight;
 static uint32_t s_nOutputWidth;
 static uint32_t s_nOutputHeight;
+
+static uint32_t capture_buffer_blocks(bool dmabuf, uint32_t format)
+{
+	return dmabuf && format == SPA_VIDEO_FORMAT_NV12 ? 2 : 1;
+}
+
+static bool setup_dmabuf_buffer(struct spa_buffer *spa_buffer, CVulkanTexture *tex,
+	uint32_t format, off_t allocation_size)
+{
+	const auto &dmabuf = tex->dmabuf();
+	const bool nv12 = format == SPA_VIDEO_FORMAT_NV12;
+	const uint32_t blocks = capture_buffer_blocks(true, format);
+	if (allocation_size <= 0 || uint64_t(allocation_size) > std::numeric_limits<uint32_t>::max() ||
+		dmabuf.n_planes != 1 || dmabuf.fd[0] < 0 || spa_buffer->n_datas != blocks)
+		return false;
+
+	const uint32_t offsets[2] = { nv12 ? tex->lumaOffset() : dmabuf.offset[0], tex->chromaOffset() };
+	const uint32_t strides[2] = { nv12 ? tex->lumaRowPitch() : dmabuf.stride[0], tex->chromaRowPitch() };
+	const uint64_t rows[2] = { tex->height(), (uint64_t(tex->height()) + 1) / 2 };
+	const uint64_t row_bytes[2] = { uint64_t(tex->width()) * (nv12 ? 1 : 4),
+		2 * ((uint64_t(tex->width()) + 1) / 2) };
+	uint64_t spans[2] = {};
+	for (uint32_t i = 0; i < blocks; i++) {
+		if (!spa_buffer->datas[i].chunk || !(spa_buffer->datas[i].type & (1u << SPA_DATA_DmaBuf)) ||
+			!rows[i] || !row_bytes[i] || strides[i] < row_bytes[i] ||
+			strides[i] > uint32_t(std::numeric_limits<int32_t>::max()))
+			return false;
+		spans[i] = nv12 ? (rows[i] - 1) * strides[i] + row_bytes[i] : rows[i] * strides[i];
+		if (spans[i] > std::numeric_limits<uint32_t>::max() ||
+			uint64_t(offsets[i]) + spans[i] > uint64_t(allocation_size))
+			return false;
+	}
+	if (nv12 && uint64_t(offsets[0]) < uint64_t(offsets[1]) + spans[1] &&
+		uint64_t(offsets[1]) < uint64_t(offsets[0]) + spans[0])
+		return false;
+
+	for (uint32_t i = 0; i < blocks; i++) {
+		auto &data = spa_buffer->datas[i];
+		data.type = SPA_DATA_DmaBuf;
+		data.flags = SPA_DATA_FLAG_READABLE;
+		// Both plane descriptors borrow the allocation FD owned by the texture.
+		data.fd = dmabuf.fd[0];
+		data.mapoffset = 0;
+		data.maxsize = uint32_t(allocation_size);
+		data.data = nullptr;
+		data.chunk->offset = offsets[i];
+		data.chunk->stride = strides[i];
+		data.chunk->size = uint32_t(spans[i]);
+		data.chunk->flags = 0;
+	}
+	return true;
+}
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
 	assert(buffer->buffer == nullptr);
@@ -87,6 +140,21 @@ static void calculate_capture_size()
 			s_nCaptureHeight = s_nRequestedHeight;
 		}
 	}
+
+	// NV12 is 4:2:0 subsampled and only valid at even dimensions, but the ratio math can round odd.
+	constexpr uint32_t kCaptureAlign = 2;
+	s_nCaptureWidth = SPA_ROUND_UP_N(s_nCaptureWidth, kCaptureAlign);
+	s_nCaptureHeight = SPA_ROUND_UP_N(s_nCaptureHeight, kCaptureAlign);
+}
+
+uint32_t spa_format_to_drm(uint32_t spa_format)
+{
+	switch (spa_format)
+	{
+		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
+		default:
+		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
+	}
 }
 
 static void build_format_params(struct spa_pod_builder *builder, spa_video_format format, std::vector<const struct spa_pod *> &params) {
@@ -124,7 +192,9 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
 	spa_pod_builder_long(builder, modifier); // default
 	spa_pod_builder_long(builder, modifier);
 	spa_pod_builder_pop(builder, &choice_frame);
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
+	const auto *dmabuf_param = (const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame);
+	if ( vulkan_supports_pipewire_dmabuf( spa_format_to_drm( format ) ) )
+		params.push_back(dmabuf_param);
 
 	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
 	spa_pod_builder_add(builder,
@@ -174,6 +244,10 @@ static void request_buffer(struct pipewire_state *state)
 	}
 
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
+	if (buffer == nullptr) {
+		pw_stream_set_error(state->stream, -EINVAL, "incomplete capture buffer");
+		return;
+	}
 	buffer->copying = true;
 
 	// Past this exchange, the PipeWire thread shares the buffer with the
@@ -206,9 +280,9 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 	}
 
 	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
-	chunk->flags = needs_reneg ? SPA_CHUNK_FLAG_CORRUPTED : 0;
+	for (uint32_t i = 0; i < spa_buffer->n_datas; i++)
+		spa_buffer->datas[i].chunk->flags = needs_reneg ? SPA_CHUNK_FLAG_CORRUPTED : 0;
 
-	struct wlr_dmabuf_attributes dmabuf;
 	switch (buffer->type) {
 	case SPA_DATA_MemFd:
 		chunk->offset = 0;
@@ -219,7 +293,8 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 		chunk->stride = buffer->shm.stride;
 
 		if (!needs_reneg) {
-			uint8_t *pMappedData = tex->mappedData();
+			uint8_t *pMappedData = state->video_info.format == SPA_VIDEO_FORMAT_NV12
+				? tex->mappedData() : tex->mappedPixels();
 
 			if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
 				for (uint32_t i = 0; i < tex->height(); i++) {
@@ -250,14 +325,7 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 		}
 		break;
 	case SPA_DATA_DmaBuf:
-		dmabuf = tex->dmabuf();
-		assert(dmabuf.n_planes == 1);
-		chunk->offset = dmabuf.offset[0];
-		chunk->stride = dmabuf.stride[0];
-		chunk->size = dmabuf.height * chunk->stride;
-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
-			chunk->size += ((dmabuf.height + 1)/2 * chunk->stride);
-		}
+		// Per-plane metadata is immutable for this buffer's capture texture.
 		break;
 	default:
 		assert(false); // unreachable
@@ -378,14 +446,25 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	}
 	int data_type = state->dmabuf ? (1 << SPA_DATA_DmaBuf) : (1 << SPA_DATA_MemFd);
 
-	const struct spa_pod *buffers_param =
-		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
-		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+	struct spa_pod_frame buffers_frame;
+	spa_pod_builder_push_object(&builder, &buffers_frame, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
+	spa_pod_builder_add(&builder,
 		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 8),
-		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-		SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
-		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride),
-		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
+		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(capture_buffer_blocks(state->dmabuf, state->video_info.format)),
+		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type), 0);
+	if (state->dmabuf) {
+		// Allocation belongs to the producer; actual plane layout is in each chunk.
+		const int block_size = state->video_info.format == SPA_VIDEO_FORMAT_NV12
+			? state->shm_stride * state->video_info.size.height : shm_size;
+		spa_pod_builder_add(&builder,
+			SPA_PARAM_BUFFERS_size, SPA_POD_CHOICE_RANGE_Int(block_size, 1, std::numeric_limits<int32_t>::max()),
+			SPA_PARAM_BUFFERS_stride, SPA_POD_CHOICE_RANGE_Int(state->shm_stride, 1, std::numeric_limits<int32_t>::max()), 0);
+	} else {
+		spa_pod_builder_add(&builder,
+			SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
+			SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride), 0);
+	}
+	const auto *buffers_param = (const struct spa_pod *) spa_pod_builder_pop(&builder, &buffers_frame);
 	const struct spa_pod *meta_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
@@ -440,21 +519,16 @@ static int anonymous_shm_open(void)
 	return -1;
 }
 
-uint32_t spa_format_to_drm(uint32_t spa_format)
-{
-	switch (spa_format)
-	{
-		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
-		default:
-		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
-	}
-}
-
 static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffer)
 {
 	struct pipewire_state *state = (struct pipewire_state *) user_data;
 
 	struct spa_buffer *spa_buffer = pw_buffer->buffer;
+	pw_buffer->user_data = nullptr;
+	if (spa_buffer->n_datas == 0) {
+		pw_stream_set_error(state->stream, -EINVAL, "capture buffer has no data blocks");
+		return;
+	}
 	struct spa_data *spa_data = &spa_buffer->datas[0];
 
 	struct pipewire_buffer *buffer = new pipewire_buffer();
@@ -498,15 +572,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
 
 	buffer->texture = new CVulkanTexture();
-	CVulkanTexture::createFlags screenshotImageFlags;
-	screenshotImageFlags.bMappable = true;
-	screenshotImageFlags.bTransferDst = true;
-	screenshotImageFlags.bStorage = true;
-	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12)
-	{
-		screenshotImageFlags.bExportable = true;
-		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
-	}
+	auto screenshotImageFlags = CVulkanTexture::createFlags::LinearCapture( is_dmabuf );
 	bool bImageInitSuccess = buffer->texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, screenshotImageFlags );
 	if ( !bImageInitSuccess )
 	{
@@ -528,15 +594,11 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 			pwr_log.errorf_errno("lseek failed");
 			goto error;
 		}
-
+		if (!setup_dmabuf_buffer(spa_buffer, buffer->texture.get(), state->video_info.format, size)) {
+			pwr_log.errorf("Invalid PipeWire DMA-BUF plane layout");
+			goto error;
+		}
 		buffer->type = SPA_DATA_DmaBuf;
-
-		spa_data->type = SPA_DATA_DmaBuf;
-		spa_data->flags = SPA_DATA_FLAG_READABLE;
-		spa_data->fd = dmabuf.fd[0];
-		spa_data->mapoffset = dmabuf.offset[0];
-		spa_data->maxsize = size;
-		spa_data->data = nullptr;
 	} else if (is_memfd) {
 		int fd = anonymous_shm_open();
 		if (fd < 0) {
@@ -584,11 +646,14 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 error:
 	delete buffer;
+	pw_stream_set_error(state->stream, -EINVAL, "failed to allocate capture buffer");
 }
 
 static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 {
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
+	if (buffer == nullptr)
+		return;
 
 	buffer->buffer = nullptr;
 

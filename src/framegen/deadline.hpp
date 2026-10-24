@@ -19,6 +19,12 @@ namespace gamescope::framegen
 
 inline constexpr uint32_t k_uPresentBiasWarmupSamples = 4u;
 inline constexpr uint32_t k_uPresentBiasOutlierVblankIntervals = 1u;
+// Consecutive mature outliers within half a vblank of each other that move the
+// bias to them (update_present_bias), while no sample has confirmed it yet.
+inline constexpr uint32_t k_uPresentBiasRelearnSamples = 8u;
+// A confirmed bias moves only for agreeing outliers that span this long: a
+// display chain that changed, not a GPU contention episode.
+inline constexpr uint64_t k_ulPresentBiasRelearnSpanNs = 2'000'000'000u;
 inline constexpr uint32_t k_uPresentLeadWarmupSamples = 4u;
 inline constexpr uint64_t k_uMinimumViablePresentLeadFloorNs = 500'000u;
 inline constexpr uint64_t k_uMinimumViablePresentLeadRelaxDivisor = 64u;
@@ -136,6 +142,29 @@ struct DisplayGrid_t
 		return W0 + n * T;
 	}
 };
+
+// How far the compositor's wake precedes the vblank it composites for: the
+// vblank timer's draw-time estimate plus its redzone.
+[[nodiscard]] constexpr uint64_t compositor_wake_lead_ns(
+	uint64_t targetVBlankNs, uint64_t wakeNs )
+{
+	return targetVBlankNs > wakeNs ? targetVBlankNs - wakeNs : 0u;
+}
+
+// Capacity reference of a normally planned causal slot, used only to classify
+// a budget shortfall (deadline_shortfall_is_phase_only); admission always uses
+// the decision's remaining time. Native: the KMS commit slot budget. Nested
+// backends have no commit reservation: a generated slot is composited at the
+// compositor's own wake, so the slot right after its real frame offers at most
+// one refresh interval less the wake lead of the raw grid.
+[[nodiscard]] constexpr uint64_t causal_shortfall_slot_budget_ns(
+	bool nativeKmsTiming, uint64_t nativeSlotBudgetNs,
+	const DisplayGrid_t &rawGrid )
+{
+	return nativeKmsTiming ? nativeSlotBudgetNs
+		: fixed_refresh_slot_budget_ns( rawGrid.T,
+			compositor_wake_lead_ns( rawGrid.D0, rawGrid.W0 ), 0u );
+}
 
 [[nodiscard]] constexpr DisplayGrid_t apply_present_bias(
 	const DisplayGrid_t &grid, int64_t biasNs )
@@ -310,6 +339,15 @@ struct PresentBiasState_t
 	int64_t emaNs = 0;
 	uint32_t samples = 0;
 	uint32_t consecutiveGuardExceeds = 0;
+	// A mature sample inside the outlier bound has confirmed the bias.
+	bool confirmed = false;
+	// The current run of consecutive mature outliers: its length, its first
+	// target and the range of its residuals. The EMA is frozen during a run,
+	// so they compare directly.
+	uint32_t outlierRun = 0;
+	uint64_t outlierRunStartNs = 0;
+	int64_t outlierLowNs = 0;
+	int64_t outlierHighNs = 0;
 };
 
 struct PresentLeadState_t
@@ -370,6 +408,15 @@ struct DisplayChainTimingTransition_t
 	DisplayChainTimingState_t state;
 	bool displayChainChanged = false;
 };
+
+// The display time of a raw vblank-clock time on this display chain: raw plus
+// the learned present bias (0 stays 0: no target). Only present tags carry it;
+// planners and presenters compare raw times.
+[[nodiscard]] constexpr uint64_t display_target_ns( uint64_t rawNs,
+	const DisplayChainTimingState_t &timing )
+{
+	return rawNs != 0u ? apply_present_bias_ns( rawNs, timing.presentBias.emaNs ) : 0u;
+}
 
 // Re-observing the same key is also the content-invalidation/re-prime path: the
 // learning survives untouched. Only a genuine display-chain key transition
@@ -433,6 +480,45 @@ struct PresentBiasUpdate_t
 		: biasMagnitudeNs + intervalMarginNs;
 }
 
+// Outliers that keep agreeing are the display chain's offset, further from the
+// learned bias than the outlier bound admits (a warm-up that read the wrong
+// vblank, say), and would be discarded forever. Once
+// k_uPresentBiasRelearnSamples consecutive ones lie within half a vblank of
+// each other, the bias moves to their midpoint: at once while no sample has
+// confirmed it, else only once the run spans k_ulPresentBiasRelearnSpanNs, so
+// a contention episode's consistent lateness is one piece of evidence, not
+// eight. A sample outside the run's range starts a new run, so a stutter's
+// scattered lateness never qualifies.
+[[nodiscard]] constexpr PresentBiasState_t note_present_bias_outlier(
+	PresentBiasState_t state, int64_t residualNs, uint64_t atNs, uint64_t vblankIntervalNs )
+{
+	const int64_t lowNs = std::min( state.outlierLowNs, residualNs );
+	const int64_t highNs = std::max( state.outlierHighNs, residualNs );
+	// highNs >= lowNs, so the unsigned difference is exact.
+	const uint64_t spreadNs = static_cast<uint64_t>( highNs ) - static_cast<uint64_t>( lowNs );
+	if ( state.outlierRun == 0u || spreadNs > vblankIntervalNs / 2u )
+	{
+		state.outlierRun = 1u;
+		state.outlierRunStartNs = atNs;
+		state.outlierLowNs = residualNs;
+		state.outlierHighNs = residualNs;
+	}
+	else
+	{
+		state.outlierRun++;
+		state.outlierLowNs = lowNs;
+		state.outlierHighNs = highNs;
+		const bool sustained = atNs >= saturating_add_ns( state.outlierRunStartNs, k_ulPresentBiasRelearnSpanNs );
+		if ( state.outlierRun >= k_uPresentBiasRelearnSamples && ( !state.confirmed || sustained ) )
+		{
+			state.emaNs = saturating_add_signed_ns( state.emaNs,
+				lowNs + static_cast<int64_t>( spreadNs / 2u ) );
+			state.outlierRun = 0u;
+		}
+	}
+	return state;
+}
+
 // Treat the target error as the residual of the bias already applied to this
 // provisional anchor. Adding 1/8 of that residual is algebraically the same as
 // a 1/8 EMA of (actual flip - raw grid target), while allowing the anchor to
@@ -462,16 +548,21 @@ struct PresentBiasUpdate_t
 		result.state.consecutiveGuardExceeds = 0u;
 	}
 
-	const bool discardEmaSample = mature
-		&& ( hitchEpisode
-			|| ( vblankIntervalNs != 0u
-				&& signed_ns_magnitude( result.residualNs )
-					>= present_bias_outlier_bound_ns(
-						state, vblankIntervalNs ) ) );
-	if ( !discardEmaSample )
+	const bool outlier = mature && !hitchEpisode && vblankIntervalNs != 0u
+		&& signed_ns_magnitude( result.residualNs )
+			>= present_bias_outlier_bound_ns( state, vblankIntervalNs );
+	if ( outlier )
+	{
+		result.state = note_present_bias_outlier(
+			result.state, result.residualNs, provisionalTargetNs, vblankIntervalNs );
+		return result;
+	}
+	result.state.outlierRun = 0u;
+	if ( !( mature && hitchEpisode ) )
 	{
 		result.state = update_present_timing_ema_residual(
 			result.state, result.residualNs );
+		result.state.confirmed = result.state.confirmed || mature;
 	}
 	return result;
 }
@@ -756,8 +847,8 @@ struct BidirQueueShedPlan_t
 // c can only be planned while their slots lie ahead of the opportunity o that
 // plans c, so the pair is fully interpolated iff its pair latency o - r_p is at
 // most D. One envelope E of that sample sets D (bidir_target_delay), bounded by
-// the longest delay whose reals the ring holds (bidir_ring_delay); every
-// establish, admission and drop decision derives from D.
+// the longest delay the output ring holds (BidirRingBound_t); every establish,
+// admission and drop decision derives from D.
 //
 // D for envelope value envelopeNs: E rounded up to the grid plus one vblank (0:
 // no envelope yet).
@@ -767,14 +858,18 @@ struct BidirQueueShedPlan_t
 		: saturating_add_ns( round_up_to_vblanks( envelopeNs, vblankIntervalNs ), vblankIntervalNs );
 }
 
-// Every bidir estimate is a k-th order statistic (k = k_uBidirEnvelopeSamples)
-// over the samples of the last k_ulBidirWindowNs, so fewer than k outliers
+// Every bidir estimate moves on k (k_uBidirEnvelopeSamples) independent pieces
+// of evidence within the last k_ulBidirWindowNs, so fewer than k outliers
 // within a window never move one. The protecting direction of an estimate acts
 // at once (E rises, the ring bound falls); the relaxing one waits
 // k_ulBidirReleaseHoldNs.
 inline constexpr uint32_t k_uBidirEnvelopeSamples = 3u;
 inline constexpr uint64_t k_ulBidirWindowNs = 1'000'000'000u;
 inline constexpr uint64_t k_ulBidirReleaseHoldNs = 2'000'000'000u;
+// A source this many times slower than when the ring bound was set releases
+// its latch. A burst halves the prediction for a while; a game dropping from
+// a menu's cadence to its own changes it several-fold.
+inline constexpr uint64_t k_uBidirRingReleaseFactor = 3u;
 // One sample per plan: the whole window up to 256 plans a second, its newest
 // 256 samples above that.
 inline constexpr size_t k_nBidirWindowSamples = 256u;
@@ -881,44 +976,96 @@ struct BidirSpacings_t
 	return capacity > k_uBidirEnvelopeSamples ? capacity - k_uBidirEnvelopeSamples : 0u;
 }
 
-// The longest D whose reals fit the queue. A real stays queued for about D
-// after its record, so a D no longer than the time n consecutive intervals
-// span (n = bidir_ring_reals) queues at most n + 1 reals. kthSpanNs is the
-// window's k-th lowest such span, by source-ready time and by record time,
-// whichever is longer (0: none yet, so one real per vblank): spans short on
+// The predicted ring bound: the longest D whose reals fit the queue. A real
+// stays queued for about D after its record, so a D no longer than the time n
+// consecutive intervals span (n = bidir_ring_reals) queues at most n + 1 reals.
+// kthSpanNs is the k-th lowest of the window's disjoint such spans, by
+// source-ready time and by record time, whichever is longer: spans short on
 // one clock only come from a change of the hold between the two (a frame
 // limiter settling, catch-up composites), which the spare entries and the
 // forced drain absorb.
-// Whole vblanks, rounded down (0: a ring too small for any delayed timeline).
+// Whole vblanks, rounded down (0: no k spans measured yet, or a ring too small
+// for any delayed timeline).
 [[nodiscard]] constexpr uint64_t bidir_ring_delay( size_t capacity, uint64_t kthSpanNs,
 	uint64_t vblankIntervalNs )
 {
-	const size_t reals = bidir_ring_reals( capacity );
-	if ( reals == 0u || vblankIntervalNs == 0u )
+	if ( bidir_ring_reals( capacity ) == 0u || vblankIntervalNs == 0u )
 		return 0u;
-	const uint64_t spanNs = kthSpanNs != 0u ? kthSpanNs
-		: reals > UINT64_MAX / vblankIntervalNs ? UINT64_MAX : reals * vblankIntervalNs;
-	return spanNs - spanNs % vblankIntervalNs;
+	return kthSpanNs - kthSpanNs % vblankIntervalNs;
 }
 
-// The ring bound in force: it falls to the measured bound at once and rises to
-// it once the measured bound stayed above it for k_ulBidirReleaseHoldNs.
+// The ring bound: the longest D the output ring holds. The predicted bound
+// (bidir_ring_delay) sets it until the first translation; after that only the
+// ring itself moves it. An overflow is a front the ring ceiling forced out
+// ahead of its slot (bidir_front_forced), or a real a plan dropped because the
+// ring, not the display, had no room. While an overflow lies within
+// k_ulBidirWindowNs the bound falls at once to a predicted bound below the D
+// in force; k overflows within that window lower it a vblank when the
+// prediction does not. It rises a vblank once k_ulBidirReleaseHoldNs passed
+// without an overflow or a move and every plan since left two entries free: a
+// vblank more of delay queues at most one more entry, and the ceiling forces a
+// front out only at a full queue. It bounds nothing again once it reaches the
+// envelope's D. A prediction alone never moves an established bound, so a
+// cadence the prediction misjudges cannot make D flap. A queue that came
+// within an entry of the ceiling blocks that rise until the next overflow or
+// move: a vblank more would fill it. Only a source that slowed down releases
+// it without one: a prediction k_uBidirRingReleaseFactor times its value when
+// the bound was last set (first translation or fall) lets the rise go on, a
+// vblank per hold, until D follows the envelope again.
 struct BidirRingBound_t
 {
-	uint64_t delayNs = 0;
-	uint64_t aboveSinceNs = 0;	// since when the measured bound lies above it (0: it does not)
+	uint64_t delayNs = 0;	// 0: none, D follows the envelope
+	std::array<uint64_t, k_uBidirEnvelopeSamples> overflowNs = {};	// the newest k overflows, oldest first (0: none)
+	uint64_t quietSinceNs = 0;	// the newest overflow or move of the bound
+	size_t deepestQueue = 0;	// the deepest queue a plan left since then
+	uint64_t predictedAtSetNs = 0;	// the predicted bound when the bound was last set, not raised (0: unknown)
 };
 
-[[nodiscard]] constexpr BidirRingBound_t hold_bidir_ring_bound( BidirRingBound_t bound,
-	uint64_t measuredNs, uint64_t atNs )
+// An overflow at atNs under the translation's delayNs (0: none, which bounds
+// nothing). The overflows within D of the newest one belong to it: a real
+// stays queued for about D, so one excess keeps the queue at the ceiling that
+// long.
+[[nodiscard]] constexpr BidirRingBound_t observe_bidir_ring_overflow( BidirRingBound_t bound,
+	uint64_t atNs, uint64_t delayNs )
 {
-	if ( measuredNs <= bound.delayNs )
-		return { .delayNs = measuredNs };
-	if ( bound.aboveSinceNs == 0u )
-		return { .delayNs = bound.delayNs, .aboveSinceNs = atNs };
-	if ( atNs >= saturating_add_ns( bound.aboveSinceNs, k_ulBidirReleaseHoldNs ) )
-		return { .delayNs = measuredNs };
+	const uint64_t newestNs = bound.overflowNs.back();
+	if ( delayNs == 0u || ( newestNs != 0u && atNs < saturating_add_ns( newestNs, delayNs ) ) )
+		return bound;
+	std::shift_left( bound.overflowNs.begin(), bound.overflowNs.end(), 1 );
+	bound.overflowNs.back() = atNs;
+	bound.quietSinceNs = atNs;
+	bound.deepestQueue = 0u;
 	return bound;
+}
+
+// The ring bound at a plan at atNs: inForceNs is the D in force (the
+// translation's, else the envelope's), envelopeNs the envelope's D (0: none
+// yet) and predictedNs the predicted bound. A fall spends its overflows.
+[[nodiscard]] constexpr BidirRingBound_t update_bidir_ring_bound( BidirRingBound_t bound,
+	uint64_t inForceNs, uint64_t envelopeNs, uint64_t predictedNs, size_t capacity, uint64_t atNs,
+	uint64_t vblankIntervalNs )
+{
+	if ( envelopeNs == 0u )
+		return { .delayNs = predictedNs, .quietSinceNs = atNs, .predictedAtSetNs = predictedNs };
+	const auto overflowedSince = [&]( uint64_t overflowNs ) {
+		return overflowNs != 0u && atNs < saturating_add_ns( overflowNs, k_ulBidirWindowNs );
+	};
+	const auto set = [&]( uint64_t delayNs ) -> BidirRingBound_t {
+		return { .delayNs = delayNs, .quietSinceNs = atNs, .predictedAtSetNs = predictedNs };
+	};
+	if ( overflowedSince( bound.overflowNs.back() ) && predictedNs != 0u && predictedNs < inForceNs )
+		return set( predictedNs );
+	if ( overflowedSince( bound.overflowNs.front() ) && inForceNs > vblankIntervalNs )
+		return set( inForceNs - vblankIntervalNs );
+	if ( bound.delayNs == 0u || atNs < saturating_add_ns( bound.quietSinceNs, k_ulBidirReleaseHoldNs ) )
+		return bound;
+	const bool slowed = bound.predictedAtSetNs != 0u
+		&& predictedNs / k_uBidirRingReleaseFactor >= bound.predictedAtSetNs;
+	if ( bound.deepestQueue + 2u > capacity && !slowed )
+		return bound;
+	const uint64_t raisedNs = saturating_add_ns( bound.delayNs, vblankIntervalNs );
+	return { .delayNs = raisedNs < envelopeNs ? raisedNs : 0u, .quietSinceNs = atNs,
+		.predictedAtSetNs = bound.predictedAtSetNs };
 }
 
 // E is the window's k-th highest pair latency K, moved by one rule: it rises to
@@ -1190,24 +1337,27 @@ struct BidirPlanStep_t
 		&& opportunityNs > in.previous.recordNs;
 	s.sourceSpacings.push( std::max( T, in.current.sourceReadyNs - in.previous.sourceReadyNs ) );
 	s.recordSpacings.push( std::max( T, in.current.recordNs - in.previous.recordNs ) );
+	// A span sample every ringReals reals, so no interval lies in two samples
+	// and one burst is one piece of evidence.
 	const size_t ringReals = bidir_ring_reals( view.capacity );
+	const bool spanSample = ringReals != 0u && s.sourceSpacings.count % ringReals == 0u;
 	s.window.push( {
 		.atNs = opportunityNs,
 		.latencyNs = latencySample ? opportunityNs - in.previous.recordNs : 0u,
-		.sourceSpanNs = s.sourceSpacings.span( ringReals ),
-		.recordSpanNs = s.recordSpacings.span( ringReals ),
+		.sourceSpanNs = spanSample ? s.sourceSpacings.span( ringReals ) : 0u,
+		.recordSpanNs = spanSample ? s.recordSpacings.span( ringReals ) : 0u,
 	} );
 	s.plannedAtNs = opportunityNs;
 	s.pairLatency = update_bidir_envelope( s.pairLatency, s.window.kth_highest_latency(), opportunityNs, T );
 	const uint64_t envelopeDelayNs = bidir_envelope_delay( s.pairLatency, s.window, opportunityNs, T );
-	const uint64_t ringDelayNs = bidir_ring_delay( view.capacity, s.window.kth_lowest_span(), T );
-	s.ringBound = envelopeDelayNs == 0u ? BidirRingBound_t{ .delayNs = ringDelayNs }
-		: hold_bidir_ring_bound( s.ringBound, ringDelayNs, opportunityNs );
-	const uint64_t delayNs = std::min( envelopeDelayNs, s.ringBound.delayNs );
+	const uint64_t heldNs = s.epoch.valid ? s.epoch.delayNs : 0u;
+	s.ringBound = update_bidir_ring_bound( s.ringBound, heldNs != 0u ? heldNs : envelopeDelayNs, envelopeDelayNs,
+		bidir_ring_delay( view.capacity, s.window.kth_lowest_span(), T ), view.capacity, opportunityNs, T );
+	const uint64_t delayNs = envelopeDelayNs == 0u ? 0u
+		: s.ringBound.delayNs != 0u ? std::min( envelopeDelayNs, s.ringBound.delayNs ) : envelopeDelayNs;
 	if ( delayNs == 0u )
 		return step;
 
-	const uint64_t heldNs = s.epoch.valid ? s.epoch.delayNs : 0u;
 	if ( delayNs != heldNs )
 	{
 		step.reestablish = heldNs == 0u ? BidirReestablish_t::Established
@@ -1252,8 +1402,13 @@ struct BidirPlanStep_t
 	size_t stayingReals = static_cast<size_t>( std::ranges::count_if( queue, isReal ) )
 		- ( leaving != 0u && isReal( queue.front() ) ? 1u : 0u );
 	uint64_t backlogDrops = backlog.undrained ? ( backlogExcessNs + T - 1u ) / T : 0u;
+	// A real dropped while the ring, not the display, bounds the reals is an
+	// overflow of the ring bound.
+	const bool ringBinds = view.capacity < s.epoch.delayNs / T + k_uBidirEnvelopeSamples;
+	bool ringOverflow = false;
 	while ( stayingReals != 0u && ( backlogDrops != 0u || stayingReals + incomingReals > realBound ) )
 	{
+		ringOverflow = ringOverflow || ( backlogDrops == 0u && ringBinds );
 		const auto newest = std::ranges::find_if( queue.rbegin(), queue.rend(), isReal ).base() - 1;
 		step.droppedRealIds.push_back( newest->realFrameId );
 		queue.erase( newest );
@@ -1261,6 +1416,8 @@ struct BidirPlanStep_t
 		backlogDrops -= backlogDrops != 0u ? 1u : 0u;
 		s.backlog = {};
 	}
+	if ( ringOverflow )
+		s.ringBound = observe_bidir_ring_overflow( s.ringBound, opportunityNs, s.epoch.delayNs );
 
 	const size_t committed = queue.size() - leaving + incomingReals;
 	const size_t room = view.capacity > committed ? view.capacity - committed : 0u;
@@ -1305,6 +1462,7 @@ struct BidirPlanStep_t
 		step.admitted.push_back( slot );
 	}
 	step.shedCapacity = view.capacity + leaving;
+	s.ringBound.deepestQueue = std::max( s.ringBound.deepestQueue, queue.size() + step.admitted.size() - leaving );
 	return step;
 }
 
@@ -1318,6 +1476,19 @@ struct BidirPlanStep_t
 	const uint64_t jitterBudgetNs = ( budgetNs / 100u ) * k_uDeadlinePercent
 		+ ( ( budgetNs % 100u ) * k_uDeadlinePercent ) / 100u;
 	return costNs <= jitterBudgetNs;
+}
+
+// Nested correction must have budget for a measured replacement before discarding
+// submitted pixels. The raw wake alone does not cover the biased admission
+// deadline. A cold replacement is not evidence that discarding is safe.
+[[nodiscard]] constexpr bool discard_pending_provisional_slot(
+	const AnchorCorrection_t &correction, uint64_t slotRealFrameId,
+	bool slotProvisional, uint64_t replacementCostNs,
+	uint32_t replacementSamples, uint64_t replacementWakeNs, uint64_t nowNs )
+{
+	return discard_pending_provisional_slot( correction, slotRealFrameId, slotProvisional )
+		&& replacementCostNs != 0u && replacementSamples >= k_uDeadlineMinSamples
+		&& deadline_cost_fits( replacementCostNs, replacementWakeNs, nowNs, 0u );
 }
 
 [[nodiscard]] constexpr bool commit_reservation_only_shortfall(

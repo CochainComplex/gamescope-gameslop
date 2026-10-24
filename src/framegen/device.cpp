@@ -28,14 +28,14 @@ namespace
 // composite on the realtime queue. Without a second queue it forwards to the
 // normal shared-queue submit, where in-order execution provides the same
 // ordering (at the cost of the head-of-line blocking this feature removes).
-uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount )
+uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount, bool bOnlineTraining )
 {
 	if ( !m_bHasFramegenQueue )
 	{
 		const uint64_t ulSeqNo = submit( std::move( cmdBuffer ) );
 		if ( nQuerySlot >= 0 )
 			m_framegenQuerySlotBySeqNo.emplace_back( ulSeqNo,
-				FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
+				FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount, bOnlineTraining } );
 		return ulSeqNo;
 	}
 
@@ -86,7 +86,7 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 	// with its seqNo, so readback can attribute measured cost to the exact batch
 	// shape. A rung's cost is not stable across x2-like and x4-like gaps.
 	if ( nQuerySlot >= 0 )
-		m_framegenQuerySlotBySeqNo.emplace_back( nextSeqNo, FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount } );
+		m_framegenQuerySlotBySeqNo.emplace_back( nextSeqNo, FramegenQueryAssoc_t{ (uint32_t)nQuerySlot, nLadderRung, nGeneratedCount, bOnlineTraining } );
 	return nextSeqNo;
 }
 
@@ -254,12 +254,21 @@ bool CVulkanDevice::drainStagingCopyTiming( uint64_t &ulSumNs, uint64_t &ulSampl
 	return true;
 }
 
+void CVulkanDevice::framegenResetTrainingCost()
+{
+	m_ulFramegenTrainingCostNs = 0;
+	m_ulFramegenTrainingSampleSeqNo = 0;
+	for ( auto &entry : m_framegenQuerySlotBySeqNo )
+		entry.second.bOnlineTraining = false;
+}
+
 void CVulkanDevice::framegenResetRungCosts()
 {
 	// A scene reset may race logically with an already-submitted batch on the
 	// dedicated queue. Its command buffer still completes and is recycled, but
 	// its timing belongs to the old scene and must not re-seed the fresh ladder.
 	m_framegenQuerySlotBySeqNo.clear();
+	framegenResetTrainingCost();
 	m_ulFramegenLastRawGpuTimeNs = 0;
 	for ( uint32_t r = 0; r < kFramegenLadderSlots; r++ )
 		for ( uint32_t c = 0; c < kFramegenGeneratedCountSlots; c++ )
@@ -350,6 +359,17 @@ void CVulkanDevice::framegenGarbageCollect()
 			// than 64 even though GetQueryPoolResults returns uint64_t values.
 			// Modular subtraction above keeps a wrap-crossing batch valid.
 			const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flFramegenTimestampPeriodNs );
+			if ( completedQueriesEnd->second.bOnlineTraining )
+			{
+				m_ulFramegenTrainingCostNs = std::max( m_ulFramegenTrainingCostNs, ulGpuNs );
+				m_ulFramegenTrainingSampleSeqNo = completedQueriesEnd->first;
+			}
+			// Training-only batches own the same ring, but are not serving costs.
+			if ( nGeneratedCount == 0u )
+			{
+				++completedQueriesEnd;
+				continue;
+			}
 			m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
 			// Fold into this exact batch shape with a symmetric slow EMA (7/8).
 			// A single anomalous batch must not shed pipeline passes for the whole scene,

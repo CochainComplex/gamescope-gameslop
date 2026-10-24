@@ -312,6 +312,26 @@ struct BidirFrontInputs_t
 	return in.beforeWake ? BidirFrontAction_t::Discard : BidirFrontAction_t::TooSlow;
 }
 
+// A front the ring ceiling forced out of the queue ahead of its slot: a real
+// shown early, or an interpolation discarded before it was due
+// (bidir_front_action). Every other front leaves on or after its slot.
+[[nodiscard]] constexpr bool bidir_front_forced( uint64_t targetNs, uint64_t opportunityNs,
+	uint64_t vblankIntervalNs )
+{
+	return !slot_due_at( targetNs, opportunityNs, vblankIntervalNs );
+}
+
+// A delayed real shown at the opportunity it was planned for. Its flip measures
+// only the display chain, so it is present-bias evidence; a real the queue
+// shows early (the ring ceiling) or late (catching up) is off its slot by
+// design.
+[[nodiscard]] constexpr bool bidir_real_on_slot( uint64_t targetNs, uint64_t opportunityNs,
+	uint64_t vblankIntervalNs )
+{
+	return slot_due_at( targetNs, opportunityNs, vblankIntervalNs )
+		&& !slot_missed_opportunity( targetNs, opportunityNs, vblankIntervalNs );
+}
+
 // Preconditions: currentPresentNs >= previousPresentNs and vblankIntervalNs is
 // non-zero. The renderer satisfies both with a monotonic clock and a validated
 // output refresh interval.
@@ -570,6 +590,36 @@ struct DeadlineMissEvaluation_t
 {
 	return costNs != 0u && samples >= k_uDeadlineMinSamples
 		&& costNs > remainingBudgetNs && costNs <= slotBudgetNs;
+}
+
+enum class CausalShortfallAction_t : uint8_t
+{
+	// The mature rung fits a normally planned slot: skip this decision
+	// without degrading or touching recovery evidence.
+	SkipPhaseOnly,
+	// Post-degradation hold: skip and count the hold down.
+	SkipHeld,
+	// Capacity evidence: select a cheaper rung.
+	Degrade,
+};
+
+// What a causal decision whose current rung missed its remaining budget may
+// teach the ladder. slotBudgetNs is the capacity reference of a normally
+// planned slot (0 = none, which disables the phase-only classification).
+// A deadline miss that the miss hysteresis has already judged to degrade
+// bypasses both skips.
+[[nodiscard]] constexpr CausalShortfallAction_t causal_shortfall_action(
+	bool degradeForPriorMiss, uint64_t costNs, uint32_t samples,
+	uint64_t remainingBudgetNs, uint64_t slotBudgetNs, uint32_t holdFrames )
+{
+	if ( degradeForPriorMiss )
+		return CausalShortfallAction_t::Degrade;
+	if ( slotBudgetNs != 0u && deadline_shortfall_is_phase_only(
+			costNs, samples, remainingBudgetNs, slotBudgetNs ) )
+		return CausalShortfallAction_t::SkipPhaseOnly;
+	if ( holdFrames > 0u )
+		return CausalShortfallAction_t::SkipHeld;
+	return CausalShortfallAction_t::Degrade;
 }
 
 [[nodiscard]] constexpr uint32_t deadline_miss_count( uint32_t misses )

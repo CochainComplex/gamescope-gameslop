@@ -1,19 +1,11 @@
 #pragma once
 
 #include <optional>
+#include "Utils/VBlankSchedule.h"
 #include "waitable.h"
 
 namespace gamescope
 {
-    struct VBlankScheduleTime
-    {
-        // The expected time for the vblank we want to target.
-        uint64_t ulTargetVBlank = 0;
-        // The vblank offset by the redzone/scheduling calculation.
-        // This is when we want to wake-up by to meet that vblank time above.
-        uint64_t ulScheduledWakeupPoint = 0;
-    };
-
     struct VBlankTime
     {
         VBlankScheduleTime schedule;
@@ -54,7 +46,10 @@ namespace gamescope
 
         int GetRefresh() const;
         uint64_t GetLastVBlank() const;
-        uint64_t GetNextVBlank( uint64_t ulOffset ) const;
+        // Schedule of the armed vblank pass that has not run yet, if any.
+        std::optional<VBlankScheduleTime> GetArmedSchedule();
+        uint64_t VRRWakeupOffset( uint64_t *pulDrawTime = nullptr, uint64_t *pulRedZone = nullptr ) const;
+        bool IsVRRFlipReady() const;
 
         VBlankScheduleTime CalcNextWakeupTime( bool bPreemptive );
         void Reschedule();
@@ -78,6 +73,7 @@ namespace gamescope
         void OnPollIn() final;
     private:
         void VBlankDebugSpew( uint64_t ulOffset, uint64_t ulDrawTime, uint64_t ulRedZone );
+        VBlankScheduleTime CalcNextWakeupTimeLocked( bool bPreemptive );
 
         uint64_t m_ulTargetVBlank = 0;
         std::atomic<uint64_t> m_ulLastVBlank = { 0 };
@@ -94,8 +90,13 @@ namespace gamescope
         // Does not cover m_ulLastVBlank, this is just atomic.
         std::mutex m_ScheduleMutex;
         VBlankScheduleTime m_TimerFDSchedule{};
-        // The vblank the timerfd last woke for; no later wake targets it.
-        std::atomic<uint64_t> m_ulLastWokenVBlank = { 0 };
+        VBlankScheduleTime m_LastVBlankSchedule{};
+        // The timerfd is armed for the pre-wake ahead of m_TimerFDSchedule.
+        bool m_bPreWake = false;
+        // When the timerfd is armed to fire.
+        uint64_t m_ulTimerFDArmedPoint = 0;
+        // How far ahead of a fixed refresh wakeup to leave deep idle.
+        uint64_t m_ulPreWakeLead = 0;
 
         std::thread m_NudgeThread;
         int m_nNudgePipe[2] = { -1, -1 };
@@ -112,6 +113,10 @@ namespace gamescope
         // 3ms by default to get the ball rolling.
         // This is calculated by steamcompmgr/drm and fed-back to the vblank timer.
         std::atomic<uint64_t> m_ulLastDrawTime = { kStartingVBlankDrawTime };
+        // When the steamcompmgr loop last woke up.
+        uint64_t m_ulLastWakeupTime = 0;
+        // Rolling max of wakeup -> flip queued, feeding the VRR wakeup offset.
+        std::atomic<uint64_t> m_ulVRRRollingMaxSubmitTime = { kStartingVBlankDrawTime };
 
         //////////////////////////////////
         // VBlank timing tuneables below!

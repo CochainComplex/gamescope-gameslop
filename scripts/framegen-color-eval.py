@@ -23,257 +23,28 @@ Usage:
 """
 
 import argparse
-import math
-import struct
 import sys
 from pathlib import Path
 
 import numpy as np
 
 
-MAGIC = 0x46435347  # 'GSCF'
-VERSION = 3
-SUPPORTED_VERSIONS = (1, 2, VERSION)
-HEADER = struct.Struct("<12I8Q4f")
-CANDIDATE_KINDS = {
-    0: "occlusion",
-    1: "endpoint-trace",
-}
+# Preserve direct execution and absolute-path imports from analysis consumers.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from framegen_color_capture import (
+    MAGIC, VERSION, SUPPORTED_VERSIONS, HEADER, CANDIDATE_KINDS,
+    ARGB8888, XRGB8888, ABGR8888, XBGR8888,
+    ARGB2101010, XRGB2101010, ABGR2101010, XBGR2101010,
+    ABGR16161616, XBGR16161616, ABGR16161616F, XBGR16161616F,
+    ABGR32323232F, FORMAT_BPP, fourcc, fourcc_name, decode_plane, load_sample,
+)
 
 
-def fourcc(text):
-    return sum(ord(ch) << (8 * i) for i, ch in enumerate(text))
-
-
-ARGB8888 = fourcc("AR24")
-XRGB8888 = fourcc("XR24")
-ABGR8888 = fourcc("AB24")
-XBGR8888 = fourcc("XB24")
-ARGB2101010 = fourcc("AR30")
-XRGB2101010 = fourcc("XR30")
-ABGR2101010 = fourcc("AB30")
-XBGR2101010 = fourcc("XB30")
-ABGR16161616 = fourcc("AB48")
-XBGR16161616 = fourcc("XB48")
-ABGR16161616F = fourcc("AB4H")
-XBGR16161616F = fourcc("XB4H")
-ABGR32323232F = fourcc("AB8F")
-
-FORMAT_BPP = {
-    ARGB8888: 4,
-    XRGB8888: 4,
-    ABGR8888: 4,
-    XBGR8888: 4,
-    ARGB2101010: 4,
-    XRGB2101010: 4,
-    ABGR2101010: 4,
-    XBGR2101010: 4,
-    ABGR16161616: 8,
-    XBGR16161616: 8,
-    ABGR16161616F: 8,
-    XBGR16161616F: 8,
-    ABGR32323232F: 16,
-}
-
-
-def fourcc_name(value):
-    return "".join(chr((value >> (8 * i)) & 0xFF) for i in range(4))
-
-
-def decode_plane(raw, width, height, drm_format, bpp):
-    expected = width * height * bpp
-    if len(raw) != expected:
-        raise ValueError(f"plane is {len(raw)} bytes, expected {expected}")
-
-    if drm_format in (ABGR8888, XBGR8888):
-        rgba = np.frombuffer(raw, np.uint8).reshape(height, width, 4)
-        return np.ascontiguousarray(rgba[..., :3], dtype=np.float32) / 255.0
-    if drm_format in (ARGB8888, XRGB8888):
-        bgra = np.frombuffer(raw, np.uint8).reshape(height, width, 4)
-        return np.ascontiguousarray(bgra[..., 2::-1], dtype=np.float32) / 255.0
-
-    if drm_format in (ABGR2101010, XBGR2101010, ARGB2101010, XRGB2101010):
-        word = np.frombuffer(raw, "<u4").reshape(height, width)
-        lo = (word & 0x3FF).astype(np.float32) / 1023.0
-        mid = ((word >> 10) & 0x3FF).astype(np.float32) / 1023.0
-        hi = ((word >> 20) & 0x3FF).astype(np.float32) / 1023.0
-        if drm_format in (ABGR2101010, XBGR2101010):
-            return np.stack((lo, mid, hi), axis=-1)
-        return np.stack((hi, mid, lo), axis=-1)
-
-    if drm_format in (ABGR16161616, XBGR16161616):
-        rgba = np.frombuffer(raw, "<u2").reshape(height, width, 4)
-        return np.ascontiguousarray(rgba[..., :3], dtype=np.float32) / 65535.0
-    if drm_format in (ABGR16161616F, XBGR16161616F):
-        rgba = np.frombuffer(raw, "<f2").reshape(height, width, 4)
-        return np.ascontiguousarray(rgba[..., :3], dtype=np.float32)
-    if drm_format == ABGR32323232F:
-        rgba = np.frombuffer(raw, "<f4").reshape(height, width, 4)
-        return np.ascontiguousarray(rgba[..., :3], dtype=np.float32)
-
-    raise ValueError(f"unsupported DRM format {fourcc_name(drm_format)!r} (0x{drm_format:08x})")
-
-
-def load_sample(path):
-    raw = path.read_bytes()
-    if len(raw) < HEADER.size:
-        raise ValueError("truncated GSCF header")
-    values = HEADER.unpack_from(raw)
-    header = values[:12]
-    meta = values[12:20]
-    phase = values[20]
-    magic, version, width, height, drm_format, bpp, eotf, flags, planes = header[:9]
-    if magic != MAGIC or version not in SUPPORTED_VERSIONS:
-        raise ValueError("not a supported GSCF v1/v2/v3 capture")
-    expected_planes = 2 if version == 1 else 4
-    expected_flags = 1 if version == 1 else 3
-    if (flags & expected_flags) != expected_flags or planes != expected_planes:
-        raise ValueError("capture has no supported exact held-out reference layout")
-    if width == 0 or height == 0 or bpp != FORMAT_BPP.get(drm_format):
-        raise ValueError("capture has invalid dimensions, format, or bytes-per-pixel")
-    if not math.isfinite(phase) or not 0.0 < phase < 1.0:
-        raise ValueError("capture has an invalid held-out phase")
-    if not (meta[1] < meta[2] < meta[3] and meta[4] < meta[5] < meta[6]):
-        raise ValueError("capture has non-monotonic frame IDs or timestamps")
-    timestamp_phase = (meta[5] - meta[4]) / (meta[6] - meta[4])
-    if not math.isclose(phase, timestamp_phase, rel_tol=1e-5, abs_tol=1e-6):
-        raise ValueError("capture phase disagrees with its timestamps")
-    if version >= 2:
-        strengths = values[21:24]
-        if (not all(math.isfinite(value) and 0.0 <= value <= 1.0
-                    for value in strengths)
-                or not strengths[0] < strengths[1] < strengths[2]):
-            raise ValueError("capture has invalid paired candidate strengths")
-    if version == 1:
-        candidate_kind = None
-    elif version == 2:
-        candidate_kind = "occlusion"
-    else:
-        candidate_kind = CANDIDATE_KINDS.get(header[9])
-        if candidate_kind is None:
-            raise ValueError(f"capture has unknown paired candidate kind {header[9]}")
-    plane_bytes = width * height * bpp
-    expected = HEADER.size + planes * plane_bytes
-    if len(raw) != expected:
-        raise ValueError(f"file is {len(raw)} bytes, expected {expected}")
-    decoded = []
-    for i in range(planes):
-        begin = HEADER.size + i * plane_bytes
-        decoded.append(decode_plane(raw[begin:begin + plane_bytes],
-                                    width, height, drm_format, bpp))
-    if version == 1:
-        candidates = [(None, decoded[0])]
-    else:
-        candidates = list(zip(values[21:24], decoded[:3]))
-    reference = decoded[-1]
-    return {
-        "path": path,
-        "width": width,
-        "height": height,
-        "format": drm_format,
-        "eotf": eotf,
-        "phase": phase,
-        "sequence": meta[0],
-        "anchor_id": meta[1],
-        "reference_id": meta[2],
-        "endpoint_id": meta[3],
-        "anchor_ns": meta[4],
-        "reference_ns": meta[5],
-        "endpoint_ns": meta[6],
-        "candidate_kind": candidate_kind,
-        "candidates": candidates,
-        "reference": reference,
-    }
-
-
-def box_mean(image, radius):
-    """Edge-padded box mean using an integral image, with bounded memory."""
-    padded = np.pad(image, radius, mode="edge")
-    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant")
-    integral = integral.cumsum(axis=0, dtype=np.float64).cumsum(axis=1, dtype=np.float64)
-    size = 2 * radius + 1
-    total = (integral[size:, size:] - integral[:-size, size:]
-             - integral[size:, :-size] + integral[:-size, :-size])
-    return (total / float(size * size)).astype(np.float32)
-
-
-def ssim(a, b, radius=3):
-    dynamic_range = max(float(np.percentile(b, 99.9) - np.percentile(b, 0.1)), 1e-3)
-    c1 = (0.01 * dynamic_range) ** 2
-    c2 = (0.03 * dynamic_range) ** 2
-    ma, mb = box_mean(a, radius), box_mean(b, radius)
-    va = np.maximum(box_mean(a * a, radius) - ma * ma, 0.0)
-    vb = np.maximum(box_mean(b * b, radius) - mb * mb, 0.0)
-    vab = box_mean(a * b, radius) - ma * mb
-    score = ((2.0 * ma * mb + c1) * (2.0 * vab + c2)) / (
-        (ma * ma + mb * mb + c1) * (va + vb + c2))
-    return float(np.clip(score, -1.0, 1.0).mean())
-
-
-def luma(rgb):
-    return rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722
-
-
-def grade(sample, generated):
-    reference = sample["reference"]
-    finite = np.isfinite(generated).all(axis=-1) & np.isfinite(reference).all(axis=-1)
-    if not finite.all():
-        generated = np.where(np.isfinite(generated), generated, 0.0)
-        reference = np.where(np.isfinite(reference), reference, 0.0)
-
-    # scRGB can exceed one or go slightly negative. A robust reference scale
-    # keeps thresholds meaningful without clipping HDR highlights before grading.
-    scale = max(float(np.percentile(np.abs(reference), 99.9)), 1.0)
-    delta = np.abs(generated - reference) / scale
-    pixel_error = delta.max(axis=-1)
-    mse = float(np.mean(((generated - reference) / scale) ** 2))
-    psnr = float("inf") if mse == 0.0 else -10.0 * math.log10(mse)
-
-    gen_luma = luma(generated) / scale
-    ref_luma = luma(reference) / scale
-    grad_g = np.hypot(*np.gradient(gen_luma))
-    grad_r = np.hypot(*np.gradient(ref_luma))
-    edge = float(np.mean(np.abs(grad_g - grad_r)) / max(float(grad_r.mean()), 1e-4))
-    return {
-        "mae": float(delta.mean()),
-        "bad%": float((pixel_error > 0.05).mean() * 100.0),
-        "p95": float(np.percentile(pixel_error, 95.0)),
-        "psnr": psnr,
-        "ssim": ssim(gen_luma, ref_luma),
-        "edge": edge,
-        "nonfinite%": float((~finite).mean() * 100.0),
-    }
-
-
-def temporal_residual_change(samples, candidate_index, block_rows=128):
-    """Mean screen-space change in prediction error over contiguous probes."""
-    total = 0.0
-    values = 0
-    transitions = 0
-    for previous, current in zip(samples, samples[1:]):
-        # A successful continuous sequence closes A/B/C, then reuses C as the
-        # next A. Do not call a skipped/discontinuous capture temporal data.
-        if (current["anchor_id"] != previous["endpoint_id"]
-                or current["reference_ns"] <= previous["reference_ns"]):
-            continue
-        previous_reference = previous["reference"]
-        current_reference = current["reference"]
-        scale = max(
-            float(np.percentile(np.abs(previous_reference), 99.9)),
-            float(np.percentile(np.abs(current_reference), 99.9)),
-            1.0,
-        )
-        previous_generated = previous["candidates"][candidate_index][1]
-        current_generated = current["candidates"][candidate_index][1]
-        for first_row in range(0, current["height"], block_rows):
-            rows = slice(first_row, min(first_row + block_rows, current["height"]))
-            previous_error = (previous_generated[rows] - previous_reference[rows]) / scale
-            current_error = (current_generated[rows] - current_reference[rows]) / scale
-            delta = np.abs(current_error - previous_error)
-            total += float(delta.sum(dtype=np.float64))
-            values += delta.size
-        transitions += 1
-    return (total / values if values else None), transitions
+from framegen_color_metrics import (
+    box_mean, ssim, luma, grade, temporal_residual_change,
+)
 
 
 def lpips_scores(samples, candidate_index):

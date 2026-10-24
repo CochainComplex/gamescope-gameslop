@@ -47,6 +47,76 @@ parse_color_probe_sweep_setting( const char *value )
 	return value != nullptr && *value != '\0' ? value : nullptr;
 }
 
+// On/off switches accept exactly 1/0, true/false, yes/no and on/off. Anything
+// else, including an empty value, is rejected so the caller keeps its default.
+[[nodiscard]] inline std::optional<bool> parse_bool_setting( const char *value )
+{
+	if ( value == nullptr )
+		return std::nullopt;
+
+	const std::string_view setting{ value };
+	if ( setting == "1" || setting == "true" || setting == "yes" || setting == "on" )
+		return true;
+	if ( setting == "0" || setting == "false" || setting == "no" || setting == "off" )
+		return false;
+	return std::nullopt;
+}
+
+enum class FramegenHudStyle : uint32_t
+{
+	Quiet = 0,
+	Mallsoft = 1,
+	Cga = 2,
+};
+
+// GAMESCOPE_FRAMEGEN_HUD_STYLE: quiet, mallsoft or cga, compared ASCII
+// case-insensitively. Anything else, including an empty value, is rejected so
+// the caller keeps its default and logs the value once.
+[[nodiscard]] inline std::optional<FramegenHudStyle> parse_hud_style_setting( const char *value )
+{
+	if ( value == nullptr )
+		return std::nullopt;
+
+	const std::string_view setting{ value };
+	const auto equals = [setting]( std::string_view name )
+	{
+		if ( setting.size() != name.size() )
+			return false;
+		for ( size_t i = 0; i < name.size(); i++ )
+		{
+			const char c = setting[i];
+			if ( ( c >= 'A' && c <= 'Z' ? char( c - 'A' + 'a' ) : c ) != name[i] )
+				return false;
+		}
+		return true;
+	};
+	if ( equals( "quiet" ) )
+		return FramegenHudStyle::Quiet;
+	if ( equals( "mallsoft" ) )
+		return FramegenHudStyle::Mallsoft;
+	if ( equals( "cga" ) )
+		return FramegenHudStyle::Cga;
+	return std::nullopt;
+}
+
+// GAMESCOPE_FRAMEGEN_HUD_STYLE when unset or invalid, and how the log names it.
+inline constexpr FramegenHudStyle k_eFramegenHudStyleDefault = FramegenHudStyle::Quiet;
+inline constexpr const char *k_pszFramegenHudStyleDefault = "quiet";
+
+// The style a raw GAMESCOPE_FRAMEGEN_HUD_STYLE value (getenv's result) selects,
+// as framegen_setting resolves it with parse_hud_style_setting: unset or
+// invalid keeps the default (framegen_setting logs an invalid value once).
+[[nodiscard]] inline FramegenHudStyle resolve_hud_style_setting( const char *value )
+{
+	return parse_hud_style_setting( value ).value_or( k_eFramegenHudStyleDefault );
+}
+
+// Quiet and Mallsoft share the shader's muted palette; only CGA differs.
+[[nodiscard]] constexpr bool framegen_hud_style_cga( FramegenHudStyle style )
+{
+	return style == FramegenHudStyle::Cga;
+}
+
 // Parse the complete string and reject non-finite values explicitly. Keeping
 // range policy at the call site makes clamp-vs-fallback behavior reviewable for
 // each setting while sharing one strict lexical contract.

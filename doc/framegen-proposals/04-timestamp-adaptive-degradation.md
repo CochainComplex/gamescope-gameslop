@@ -192,7 +192,7 @@ critical path.
 
 The vblank estimator and all gamescope timing use **`CLOCK_MONOTONIC`**
 (`get_time_in_nanos`, `src/steamcompmgr.cpp:1291`; the kernel reports page flips
-on `CLOCK_MONOTONIC`, and `CVBlankTimer::GetNextVBlank`,
+on `CLOCK_MONOTONIC`, and `framegen_next_vblank_ns()` (src/framegen/vblank.hpp; upstream removed `CVBlankTimer::GetNextVBlank`),
 `src/vblankmanager.cpp:83`, is built on it). The timestamp query gives a *device
 timeline* value, not a `CLOCK_MONOTONIC` value.
 

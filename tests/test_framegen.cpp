@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +27,9 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <span>
+#include <vector>
+#include <optional>
 
 using gamescope::framegen::EffectiveConfig;
 using gamescope::framegen::effective_config;
@@ -62,6 +66,34 @@ static void test_fps_limit_policy()
 	CHECK( ResolveFPSLimit( 30, -1, true ) == 30 );
 }
 
+static void test_dormancy_policy()
+{
+	using gamescope::framegen::FramegenDormantReason;
+	using gamescope::framegen::framegen_dormant_reason;
+	using gamescope::framegen::framegen_dormant_reason_name;
+	using enum FramegenDormantReason;
+
+	// Columns: single/no failure, single/failure, multi/no failure, multi/failure.
+	constexpr FramegenDormantReason expected[4][4] = {
+		{ NotDormant, RingAllocation, MultiOutput, MultiOutput },
+		{ OutputRotation, OutputRotation, OutputRotation, OutputRotation },
+		{ OutputRotation, OutputRotation, OutputRotation, OutputRotation },
+		{ OutputRotation, OutputRotation, OutputRotation, OutputRotation },
+	};
+	for ( uint32_t rotation = 0; rotation < 4; rotation++ )
+	{
+		for ( uint32_t flags = 0; flags < 4; flags++ )
+			CHECK( framegen_dormant_reason( rotation, !( flags & 2u ), flags & 1u )
+				== expected[rotation][flags] );
+	}
+	static_assert( framegen_dormant_reason( 0u, true, false ) == NotDormant );
+	static_assert( framegen_dormant_reason( 1u, false, true ) == OutputRotation );
+	CHECK( std::string_view( framegen_dormant_reason_name( NotDormant ) ) == "none" );
+	CHECK( std::string_view( framegen_dormant_reason_name( OutputRotation ) ) == "output_rotation" );
+	CHECK( std::string_view( framegen_dormant_reason_name( MultiOutput ) ) == "multi_output" );
+	CHECK( std::string_view( framegen_dormant_reason_name( RingAllocation ) ) == "ring_allocation" );
+}
+
 static void test_degradation_policy()
 {
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 1 ) == 8u );
@@ -69,6 +101,20 @@ static void test_degradation_policy()
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 3 ) == 10u );
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 4 ) == 12u );
 	CHECK( gamescope::framegen::output_ring_size_for_multiplier( 5 ) == 12u );
+
+	// The fine field: only on request and below the learned pipelines; the
+	// coarse search stays at /32; pixel-meaning constants keep their pixels.
+	using gamescope::framegen::motion_field_scale;
+	static_assert( motion_field_scale( false, GamescopeFramegenPipeline::Checked ) == 8u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Warp ) == 4u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Checked ) == 4u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Learned ) == 8u );
+	static_assert( motion_field_scale( true, GamescopeFramegenPipeline::Predict ) == 8u );
+	static_assert( gamescope::framegen::motion_coarse_levels( 8u ) == 2u );
+	static_assert( gamescope::framegen::motion_coarse_levels( 4u ) == 3u );
+	static_assert( gamescope::framegen::k_uMotionMaxCoarseLevels == 3u );
+	static_assert( gamescope::framegen::motion_reference_texels( 0.75f, 8u ) == 0.75f );
+	static_assert( gamescope::framegen::motion_reference_texels( 0.75f, 4u ) == 1.5f );
 
 	constexpr std::array modes = {
 		GamescopeFramegenMode::Extrapolate,
@@ -102,6 +148,75 @@ static void test_degradation_policy()
 						std::max( 2, multiplier - static_cast<int>( multiplierSteps ) ) ) );
 				}
 			}
+		}
+	}
+}
+
+static void test_spatial_profile_isolation()
+{
+	using namespace gamescope::framegen;
+	const uint32_t originalKey = net_input_key( false, 0u, 0u );
+	const uint32_t spatialKey = net_input_key( false, 0u, 0u, true );
+	CHECK( originalKey == 0xf0u && spatialKey == 0x100f0u );
+	std::vector<NetProfileSet> sets = {
+		{ originalKey, std::vector<float>( k_uFramegenNetFloats, 0.125f ) },
+		{ spatialKey, std::vector<float>( k_uFramegenNetFloats, 0.25f ) },
+	};
+	for ( uint32_t cs = 0; cs < 5u; cs++ )
+		for ( uint32_t tf = 0; tf < 3u; tf++ )
+			CHECK( net_input_key( true, cs, tf, true ) != net_input_key( true, cs, tf ) );
+	char name[64];
+	net_input_key_name( spatialKey, name, sizeof( name ) );
+	CHECK( std::string_view( name ) == "spatial output tf=gamma22" );
+	net_input_key_name( net_input_key( true, 2u, 2u, true ), name, sizeof( name ) );
+	CHECK( std::string_view( name ) == "spatial base cs=scrgb tf=none" );
+	// Updating Spatial and encoding the shared file preserves the original set.
+	sets[1].weights[17] = -0.75f;
+	const auto bytes = encode_net_profile( sets );
+	CHECK( bytes.has_value() );
+	const auto decoded = bytes ? decode_net_profile( *bytes ) : std::nullopt;
+	CHECK( decoded && decoded->size() == 2u );
+	if ( !decoded || decoded->size() != 2u )
+		return;
+	CHECK( (*decoded)[0].weights == sets[0].weights );
+	CHECK( (*decoded)[1].weights == sets[1].weights );
+	CHECK( net_profile_prior( spatialKey, *decoded, {}, {} )[17] == -0.75f );
+	CHECK( net_profile_prior( originalKey, *decoded, {}, {} )[17] == 0.125f );
+	CHECK( net_profile_prior( net_input_key( false, 0u, 1u, true ), *decoded, {}, {} ).empty() );
+}
+
+static void test_spatial_pipeline_policy()
+{
+	using P = GamescopeFramegenPipeline;
+	using M = GamescopeFramegenMode;
+	using gamescope::framegen::pipeline_uses_motion_history;
+	static_assert( static_cast<uint32_t>( P::Predict ) == 3u );
+	static_assert( static_cast<uint32_t>( P::Guided ) == 4u );
+	CHECK( std::string_view( gamescope::framegen::pipeline_name( P::Spatial ) ) == "spatial" );
+	CHECK( !pipeline_uses_motion_history( P::Spatial ) );
+	CHECK( !pipeline_uses_motion_history( P::Learned ) );
+	CHECK( pipeline_uses_motion_history( P::Predict ) );
+	CHECK( pipeline_uses_motion_history( P::Guided ) );
+	CHECK( gamescope::framegen::motion_field_scale( true, P::Spatial ) == 8u );
+	const std::array expected = { P::Spatial, P::Learned, P::Checked, P::Warp };
+	for ( int multiplier = 2; multiplier <= 4; multiplier++ )
+	{
+		const uint32_t last = max_degrade_steps( M::Motion, P::Spatial, multiplier );
+		CHECK( last == 4u + static_cast<uint32_t>( multiplier - 2 ) );
+		CHECK( last < 8u ); // The existing GPU cost/recovery rings have eight rungs.
+		for ( uint32_t i = 0; i < expected.size(); i++ )
+		{
+			const auto config = effective_config( M::Motion, P::Spatial, multiplier, i );
+			CHECK( config.mode == M::Motion && config.pipeline == expected[i] );
+			CHECK( config.multiplier == static_cast<uint32_t>( multiplier ) );
+		}
+		CHECK( effective_config( M::Motion, P::Spatial, multiplier, 4u ).mode == M::Extrapolate );
+		CHECK( effective_config( M::Motion, P::Spatial, multiplier, last ).multiplier == 2u );
+		for ( const M mode : { M::Blend, M::Extrapolate } )
+		{
+			CHECK( max_degrade_steps( mode, P::Spatial, multiplier ) == static_cast<uint32_t>( multiplier - 2 ) );
+			const auto config = effective_config( mode, P::Spatial, multiplier, 20u );
+			CHECK( config.mode == mode && config.multiplier == 2u );
 		}
 	}
 }
@@ -213,6 +328,130 @@ static void test_net_profile_contract()
 	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetVersion + 1u, weights ) );
 	CHECK( !validate_and_migrate_net_profile_weights( k_uFramegenNetShadingVersion,
 		std::span<float>( weights.data(), weights.size() - 1u ) ) );
+}
+
+static void test_net_profile_sets()
+{
+	using namespace gamescope::framegen;
+
+	// Every producer path gets its own key; output-space keys ignore the
+	// colourspace argument, base-layer keys keep the output transfer.
+	std::vector<uint32_t> keys;
+	for ( uint32_t tf = 0u; tf < 3u; tf++ )
+	{
+		keys.push_back( net_input_key( false, 0u, tf ) );
+		CHECK( net_input_key( false, 3u, tf ) == net_input_key( false, 0u, tf ) );
+		for ( uint32_t cs = 0u; cs < 5u; cs++ )
+			keys.push_back( net_input_key( true, cs, tf ) );
+	}
+	std::vector<uint32_t> sorted = keys;
+	std::sort( sorted.begin(), sorted.end() );
+	CHECK( std::adjacent_find( sorted.begin(), sorted.end() ) == sorted.end() );
+	char szName[ 48 ];
+	net_input_key_name( net_input_key( false, 0u, 1u ), szName, sizeof( szName ) );
+	CHECK( std::string_view( szName ) == "output tf=pq" );
+	net_input_key_name( net_input_key( true, 2u, 0u ), szName, sizeof( szName ) );
+	CHECK( std::string_view( szName ) == "base cs=scrgb tf=gamma22" );
+	net_input_key_name( net_input_key( false, 0u, 2u ), szName, sizeof( szName ) );
+	CHECK( std::string_view( szName ) == "output tf=none" );
+
+	const auto weightsFor = []( uint32_t seed )
+	{
+		std::vector<float> weights( k_uFramegenNetFloats );
+		for ( size_t i = 0; i < weights.size(); i++ )
+			weights[ i ] = static_cast<float>( seed ) * 0.5f - static_cast<float>( i ) * 1e-3f;
+		weights[ 7 ] = -0.0f;
+		return weights;
+	};
+	const auto setsOf = [&]( uint32_t count )
+	{
+		std::vector<NetProfileSet> sets;
+		for ( uint32_t i = 0u; i < count; i++ )
+			sets.push_back( { keys[ i ], weightsFor( i + 1u ) } );
+		return sets;
+	};
+	const auto sameBits = []( const std::vector<NetProfileSet> &a, const std::vector<NetProfileSet> &b )
+	{
+		if ( a.size() != b.size() )
+			return false;
+		for ( size_t i = 0; i < a.size(); i++ )
+		{
+			if ( a[ i ].key != b[ i ].key || a[ i ].weights.size() != b[ i ].weights.size() )
+				return false;
+			for ( size_t j = 0; j < a[ i ].weights.size(); j++ )
+			{
+				if ( std::bit_cast<uint32_t>( a[ i ].weights[ j ] ) != std::bit_cast<uint32_t>( b[ i ].weights[ j ] ) )
+					return false;
+			}
+		}
+		return true;
+	};
+
+	for ( const uint32_t count : { 1u, 2u, 8u } )
+	{
+		const std::vector<NetProfileSet> sets = setsOf( count );
+		const std::optional<std::vector<uint8_t>> bytes = encode_net_profile( sets );
+		CHECK( bytes.has_value() );
+		CHECK( bytes->size() == 12u + count * ( 4u + k_uFramegenNetBlobBytes ) );
+		const std::optional<std::vector<NetProfileSet>> decoded = decode_net_profile( *bytes );
+		CHECK( decoded.has_value() && sameBits( *decoded, sets ) );
+	}
+
+	// Encoder refuses anything the decoder would reject.
+	CHECK( !encode_net_profile( std::vector<NetProfileSet>{} ) );
+	CHECK( !encode_net_profile( setsOf( 9u ) ) );
+	std::vector<NetProfileSet> bad = setsOf( 2u );
+	bad[ 1 ].key = bad[ 0 ].key;
+	CHECK( !encode_net_profile( bad ) );
+	bad = setsOf( 1u );
+	bad[ 0 ].weights[ 3 ] = std::numeric_limits<float>::quiet_NaN();
+	CHECK( !encode_net_profile( bad ) );
+	bad = setsOf( 1u );
+	bad[ 0 ].weights.pop_back();
+	CHECK( !encode_net_profile( bad ) );
+
+	// Decoder: only a well-formed current profile. No legacy path.
+	const std::vector<uint8_t> good = *encode_net_profile( setsOf( 2u ) );
+	const auto setWord = []( std::vector<uint8_t> bytes, size_t offset, uint32_t word )
+	{
+		for ( uint32_t b = 0u; b < 4u; b++ )
+			bytes[ offset + b ] = uint8_t( word >> ( 8u * b ) );
+		return bytes;
+	};
+	const size_t firstBlob = 16u; // container header + first key
+	const size_t secondKey = 12u + 4u + k_uFramegenNetBlobBytes;
+	CHECK( !decode_net_profile( std::vector<uint8_t>{} ) );
+	CHECK( !decode_net_profile( setWord( good, 0u, k_uFramegenNetMagic ) ) );
+	CHECK( !decode_net_profile( setWord( good, 4u, k_uFramegenNetProfileVersion + 1u ) ) );
+	CHECK( !decode_net_profile( setWord( good, 8u, 0u ) ) );
+	CHECK( !decode_net_profile( setWord( good, 8u, 9u ) ) );
+	CHECK( !decode_net_profile( setWord( good, 8u, 3u ) ) );
+	CHECK( !decode_net_profile( setWord( good, secondKey, keys[ 0 ] ) ) );
+	CHECK( !decode_net_profile( setWord( good, firstBlob + 4u, k_uFramegenNetVersion - 1u ) ) );
+	CHECK( !decode_net_profile( setWord( good, firstBlob + 12u, 13u ) ) );
+	CHECK( !decode_net_profile( setWord( good, firstBlob + 48u + 8u,
+		std::bit_cast<uint32_t>( std::numeric_limits<float>::infinity() ) ) ) );
+	CHECK( !decode_net_profile( std::span<const uint8_t>( good.data(), good.size() - 1u ) ) );
+	std::vector<uint8_t> trailing = good;
+	trailing.push_back( 0u );
+	CHECK( !decode_net_profile( trailing ) );
+	// A bare GSFR blob (the trainer's format, or an old profile) is not a profile.
+	const std::vector<uint8_t> bareBlob( good.begin() + firstBlob, good.begin() + firstBlob + k_uFramegenNetBlobBytes );
+	CHECK( !decode_net_profile( bareBlob ) );
+
+	// Prior order: own set, then the explicit blob, then neutral (or nothing).
+	const std::vector<NetProfileSet> sets = setsOf( 2u );
+	const std::vector<float> blob = weightsFor( 40u );
+	const std::vector<float> neutral = weightsFor( 50u );
+	CHECK( net_profile_prior( keys[ 1 ], sets, blob, neutral ).data() == sets[ 1 ].weights.data() );
+	CHECK( net_profile_prior( keys[ 5 ], sets, blob, neutral ).data() == blob.data() );
+	CHECK( net_profile_prior( keys[ 5 ], sets, {}, neutral ).data() == neutral.data() );
+	CHECK( net_profile_prior( keys[ 5 ], sets, {}, {} ).empty() );
+
+	// Save gate: a retired set or new training, never "weights are live".
+	CHECK( !net_profile_needs_save( 4u, 4u, 100u, 100u ) );
+	CHECK( net_profile_needs_save( 5u, 4u, 100u, 100u ) );
+	CHECK( net_profile_needs_save( 4u, 4u, 101u, 100u ) );
 }
 
 static std::string read_test_file( const std::string &path )
@@ -330,6 +569,16 @@ static void test_numeric_settings_contract()
 	CHECK( !parse_uint32_setting( "12suffix", false ).has_value() );
 	CHECK( parse_uint32_setting( "12", false ).value_or( 0u ) == 12u );
 
+	CHECK( !parse_bool_setting( nullptr ).has_value() );
+	CHECK( !parse_bool_setting( "" ).has_value() );
+	for ( const char *pszOn : { "1", "true", "yes", "on" } )
+		CHECK( parse_bool_setting( pszOn ) == true );
+	for ( const char *pszOff : { "0", "false", "no", "off" } )
+		CHECK( parse_bool_setting( pszOff ) == false );
+	for ( const char *pszInvalid : { "2", "01", "-1", "+1", " 1", "1 ", "TRUE", "True", "On",
+		"y", "n", "truex", "enable", "0x1" } )
+		CHECK( !parse_bool_setting( pszInvalid ).has_value() );
+
 	static_assert( static_cast<uint32_t>( FramegenColorProbeSweep::Occlusion ) == 0u );
 	static_assert( static_cast<uint32_t>( FramegenColorProbeSweep::EndpointTrace ) == 1u );
 	CHECK( !parse_color_probe_sweep_setting( nullptr ).has_value() );
@@ -340,6 +589,41 @@ static void test_numeric_settings_contract()
 	CHECK( parse_color_probe_sweep_setting( "endpoint-trace" ) == FramegenColorProbeSweep::EndpointTrace );
 	CHECK( std::string_view{ color_probe_sweep_name( FramegenColorProbeSweep::Occlusion ) } == "occlusion" );
 	CHECK( std::string_view{ color_probe_sweep_name( FramegenColorProbeSweep::EndpointTrace ) } == "endpoint-trace" );
+
+	// HUD style: the three launcher values, case-insensitive; typos are
+	// rejected so the renderer keeps Quiet and logs the value once.
+	CHECK( !parse_hud_style_setting( nullptr ).has_value() );
+	CHECK( !parse_hud_style_setting( "" ).has_value() );
+	CHECK( parse_hud_style_setting( "quiet" ) == FramegenHudStyle::Quiet );
+	CHECK( parse_hud_style_setting( "mallsoft" ) == FramegenHudStyle::Mallsoft );
+	CHECK( parse_hud_style_setting( "cga" ) == FramegenHudStyle::Cga );
+	CHECK( parse_hud_style_setting( "CGA" ) == FramegenHudStyle::Cga );
+	CHECK( parse_hud_style_setting( "Cga" ) == FramegenHudStyle::Cga );
+	CHECK( parse_hud_style_setting( "QUIET" ) == FramegenHudStyle::Quiet );
+	CHECK( parse_hud_style_setting( "MallSoft" ) == FramegenHudStyle::Mallsoft );
+	for ( const char *pszInvalid : { "cg", "cgaa", " cga", "cga ", "ega", "1", "quiet\n", "mall soft" } )
+		CHECK( !parse_hud_style_setting( pszInvalid ).has_value() );
+
+	// What framegen_hud_cga() ends up with for a raw environment value: unset
+	// and invalid keep Quiet, and only CGA selects the CGA palette.
+	CHECK( k_eFramegenHudStyleDefault == FramegenHudStyle::Quiet );
+	CHECK( std::string_view{ k_pszFramegenHudStyleDefault } == "quiet" );
+	CHECK( parse_hud_style_setting( k_pszFramegenHudStyleDefault ) == k_eFramegenHudStyleDefault );
+	CHECK( resolve_hud_style_setting( nullptr ) == FramegenHudStyle::Quiet );
+	CHECK( resolve_hud_style_setting( "" ) == FramegenHudStyle::Quiet );
+	CHECK( resolve_hud_style_setting( "quiet" ) == FramegenHudStyle::Quiet );
+	CHECK( resolve_hud_style_setting( "MALLSOFT" ) == FramegenHudStyle::Mallsoft );
+	CHECK( resolve_hud_style_setting( "cga" ) == FramegenHudStyle::Cga );
+	CHECK( resolve_hud_style_setting( "cGa" ) == FramegenHudStyle::Cga );
+	for ( const char *pszInvalid : { "cg", "cgaa", " cga", "ega", "2", "on" } )
+		CHECK( resolve_hud_style_setting( pszInvalid ) == FramegenHudStyle::Quiet );
+	CHECK( framegen_hud_style_cga( FramegenHudStyle::Cga ) );
+	CHECK( !framegen_hud_style_cga( FramegenHudStyle::Quiet ) );
+	CHECK( !framegen_hud_style_cga( FramegenHudStyle::Mallsoft ) );
+	CHECK( framegen_hud_style_cga( resolve_hud_style_setting( "CGA" ) ) );
+	CHECK( !framegen_hud_style_cga( resolve_hud_style_setting( "mallsoft" ) ) );
+	CHECK( !framegen_hud_style_cga( resolve_hud_style_setting( nullptr ) ) );
+	CHECK( !framegen_hud_style_cga( resolve_hud_style_setting( "cga-ish" ) ) );
 }
 
 static void test_adaptation_policy()
@@ -459,6 +743,81 @@ static void test_adaptation_policy()
 	const auto incompleteHistogram = decode_adaptation_stats( stats );
 	CHECK( incompleteHistogram.has_value() );
 	CHECK( incompleteHistogram->fbP75 == -1.0f );
+}
+
+static void test_quality_meter()
+{
+	using namespace gamescope::framegen;
+
+	// Decode: the changed counters become one sample; the established
+	// adaptation fields ignore them.
+	std::array<uint32_t, k_uAdaptationStatsCount> stats = {};
+	stats[ 0 ] = 100u;
+	stats[ 1 ] = 10u * 1024u;
+	stats[ 2 ] = 20u;
+	stats[ 3 ] = 20u;
+	stats[ k_uAdaptationStatChanged ] = 40u;
+	stats[ k_uAdaptationStatChangedKilled ] = 10u;
+	stats[ k_uAdaptationStatChangedBad ] = 6u;
+	stats[ k_uAdaptationStatChangedKilledMatch ] = 7u;
+	stats[ k_uAdaptationStatChangedResidual ] = 2048u;
+	const auto measurement = decode_adaptation_stats( stats );
+	CHECK( measurement.has_value() );
+	CHECK_NEAR( measurement->residual, 0.10f, 1e-7f );
+	CHECK_NEAR( measurement->badFraction, 0.25f, 1e-7f );
+	CHECK_NEAR( measurement->killedFraction, 0.20f, 1e-7f );
+	const MotionQualityCounts &q = measurement->quality;
+	CHECK( q.samples == 1u );
+	CHECK( q.changed == 40u );
+	CHECK_NEAR( q.residual(), 0.05, 1e-12 );
+	CHECK_NEAR( q.badFraction(), 0.20, 1e-12 );
+	CHECK_NEAR( q.killedFraction(), 0.25, 1e-12 );
+	CHECK_NEAR( q.killedMatchFraction(), 0.175, 1e-12 );
+	CHECK_NEAR( q.killedFbFraction(), 0.075, 1e-12 );
+
+	// The matcher's kills are a subset of all kills, so the two parts always
+	// add up to the killed fraction.
+	stats[ k_uAdaptationStatChangedKilledMatch ] = 15u;
+	const auto overMatched = decode_adaptation_stats( stats );
+	CHECK( overMatched.has_value() );
+	CHECK( overMatched->quality.changedKilledMatch == 10u );
+	CHECK( overMatched->quality.killedFbFraction() == 0.0 );
+	CHECK_NEAR( overMatched->quality.killedMatchFraction() + overMatched->quality.killedFbFraction(),
+		overMatched->quality.killedFraction(), 1e-12 );
+
+	// Counters past their parent set are clamped, never wrapped.
+	stats[ k_uAdaptationStatChanged ] = 200u;
+	stats[ k_uAdaptationStatChangedKilled ] = 150u;
+	stats[ k_uAdaptationStatChangedBad ] = 50u;
+	const auto clamped = decode_adaptation_stats( stats );
+	CHECK( clamped.has_value() );
+	CHECK( clamped->quality.changed == 100u );
+	CHECK( clamped->quality.changedKilled == 100u );
+	CHECK( clamped->quality.changedBad == 0u );
+	CHECK( clamped->quality.badFraction() == 0.0 );
+	CHECK_NEAR( clamped->quality.killedMatchFraction() + clamped->quality.killedFbFraction(),
+		clamped->quality.killedFraction(), 1e-12 );
+
+	// A window is a ratio of sums, and an empty one reports zeros.
+	MotionQualityCounts window;
+	CHECK( window.samples == 0u );
+	CHECK( window.residual() == 0.0 && window.badFraction() == 0.0
+		&& window.killedFraction() == 0.0 && window.killedMatchFraction() == 0.0
+		&& window.killedFbFraction() == 0.0 );
+	MotionQualityCounts a;
+	a.samples = 1u;
+	a.changed = 10u;
+	a.changedResidualQ10 = 1024u;
+	MotionQualityCounts b;
+	b.samples = 1u;
+	b.changed = 30u;
+	b.changedKilled = 30u;
+	b.changedResidualQ10 = 614u;
+	window += a;
+	window += b;
+	CHECK( window.samples == 2u );
+	CHECK_NEAR( window.residual(), 1638.0 / 1024.0 / 40.0, 1e-12 );
+	CHECK_NEAR( window.killedFraction(), 0.75, 1e-12 );
 }
 
 static void test_temporal_policy()
@@ -1081,16 +1440,73 @@ static void test_fault_injection_grammar()
 	CHECK( !finite.Consume() && finite.Exhausted() );
 }
 
+static void test_net_learning_metrics()
+{
+	using gamescope::framegen::NetLearningPair;
+	using gamescope::framegen::NetLearningSkip;
+	using gamescope::framegen::NetLearningSkips;
+	using gamescope::framegen::net_learning_skip_name;
+	using enum NetLearningSkip;
+	NetLearningPair pair;
+	NetLearningSkips window, total;
+	window.add( NoSkip );
+	CHECK( window.counts[ static_cast<size_t>( NoSkip ) ] == 0 );
+	CHECK( window.dominant() == NoSkip );
+	CHECK( pair.finish() == NoSkip );
+	CHECK( pair.begin( 0 ) == NoSkip );
+	CHECK( pair.begin( 1 ) == NoSkip );
+	// Repeated polls neither double-count nor hide the pipeline gate.
+	pair.skip( Pipeline );
+	for ( int i = 0; i < 8; i++ )
+	{
+		CHECK( pair.begin( 1 ) == NoSkip );
+		pair.skip( NoSlot );
+		pair.skip( Busy );
+	}
+	window.add( pair.begin( 2 ) );
+	CHECK( window.counts[ static_cast<size_t>( Pipeline ) ] == 1 );
+	// A successful step wins over x3 cached refills and later failures.
+	pair.skip( Budget );
+	pair.step();
+	pair.skip( Reuse );
+	pair.skip( Resources );
+	CHECK( pair.begin( 3 ) == NoSkip );
+	pair.skip( Resources );
+	pair.skip( Every );
+	window.add( pair.begin( 4 ) );
+	CHECK( window.counts[ static_cast<size_t>( Every ) ] == 1 );
+	// Shutdown counts the final unstepped pair exactly once.
+	window.add( pair.finish() );
+	CHECK( pair.finish() == NoSkip );
+	CHECK( window.counts[ static_cast<size_t>( NoBatch ) ] == 1 );
+	CHECK( window.dominant() == NoBatch ); // Deterministic tie.
+	window.add( Pipeline );
+	CHECK( window.dominant() == Pipeline );
+	total += window;
+	window = {};
+	CHECK( window.dominant() == NoSkip );
+	CHECK( total.counts[ static_cast<size_t>( Pipeline ) ] == 2 );
+	CHECK( total.dominant() == Pipeline );
+	CHECK( std::string_view( net_learning_skip_name( total.dominant() ) ) == "pipeline" );
+	for ( size_t i = 0; i < static_cast<size_t>( Count ); i++ )
+		CHECK( std::string_view( net_learning_skip_name( static_cast<NetLearningSkip>( i ) ) ) != "unknown" );
+}
+
 int main()
 {
 	test_fps_limit_policy();
+	test_dormancy_policy();
 	test_degradation_policy();
+	test_spatial_pipeline_policy();
+	test_spatial_profile_isolation();
 	test_learned_net_layout();
 	test_names();
 	test_net_profile_contract();
+	test_net_profile_sets();
 	test_atomic_output_file();
 	test_numeric_settings_contract();
 	test_adaptation_policy();
+	test_quality_meter();
 	test_temporal_policy();
 	test_scheduling_policy();
 	test_provisional_nested_slot_keep();
@@ -1100,6 +1516,7 @@ int main()
 	test_query_ring_selection();
 	test_metrics_distribution();
 	test_metrics_source_latency_distribution();
+	test_net_learning_metrics();
 	test_fault_injection_grammar();
 	return g_bPassed ? 0 : 1;
 }

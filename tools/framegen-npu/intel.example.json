@@ -1,0 +1,8 @@
+{
+  "backend": "intel-openvino",
+  "python": "/REPLACE/openvino-venv/bin/python",
+  "runtime_tag": "REPLACE-with-OpenVINO-NPU-driver-firmware-versions",
+  "environment": {},
+  "provider_options": {},
+  "config_files": []
+}

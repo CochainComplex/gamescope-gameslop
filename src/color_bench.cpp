@@ -39,6 +39,7 @@ static void CalcColorTransform(EOTF inputEOTF)
 
     calcColorTransform<nLutEdgeSize3d>( &lut1d_float, nLutSize1d, &lut3d_float, inputColorimetry, inputEOTF,
         outputEncodingColorimetry, EOTF_Gamma22,
+        outputEncodingColorimetry,
         destVirtualWhite, k_EChromaticAdapatationMethod_XYZ,
         colorMapping, nightmode, tonemapping, nullptr, flGain );
     for ( size_t i=0, end = lut1d_float.dataR.size(); i<end; ++i )

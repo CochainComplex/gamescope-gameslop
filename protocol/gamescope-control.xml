@@ -29,7 +29,7 @@
     it.
   </description>
 
-  <interface name="gamescope_control" version="6">
+  <interface name="gamescope_control" version="7">
     <request name="destroy" type="destructor"></request>
 
     <enum name="feature">
@@ -44,6 +44,8 @@
       <entry name="mura_correction" value="5"/>
       <entry name="look" value="6"/>
       <entry name="perf_query" value="7"/>
+      <entry name="keyboard_layout" value="8"/>
+      <entry name="sgsr_filter" value="9"/>
     </enum>
 
     <event name="feature_support">
@@ -143,5 +145,47 @@
       <arg name="frametime_ns_hi" type="uint" summary="frametime_ns high bits"></arg>
     </event>
 
+    <request name="set_keyboard_layout" since="7">
+      <description summary="Sets the XKB layout used for physical keyboards">
+        An empty layout goes back to the layout from the XKB_DEFAULT_*
+        environment, and a variant without a layout is ignored. A layout
+        that fails to compile is ignored and the current keymap is kept.
+      </description>
+      <arg name="layout" type="string" summary="XKB layout name, eg. fr"></arg>
+      <arg name="variant" type="string" summary="XKB layout variant, eg. bepo. Empty for the default variant"></arg>
+    </request>
+
+  </interface>
+  <!-- Optional read-only diagnostics, separate from the stable control ABI. -->
+  <interface name="gamescope_gpu_diagnostics_v1" version="1">
+    <description summary="on-demand GPU identity snapshot">
+      Inventory describes this Gamescope instance's visible Vulkan devices.
+      Renderer identity is inferred from the last composited base buffer, not
+      a verified client device UUID. A nested outer presenter's GPU is unknown.
+      No unsolicited updates are sent. Each get_snapshot ends with done.
+      Opt-in: the global is advertised only when the compositor runs with
+      GAMESCOPE_GPU_DIAGNOSTICS=1, since every client can bind it.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_snapshot"/>
+    <event name="device">
+      <arg name="index" type="uint"/>
+      <arg name="vendor" type="uint"/>
+      <arg name="device" type="uint"/>
+      <arg name="software" type="uint"/>
+      <arg name="name" type="string"/>
+      <arg name="pci" type="string"/>
+      <arg name="node" type="string"/>
+      <arg name="driver" type="string"/>
+    </event>
+    <event name="route">
+      <arg name="presenter" type="uint" summary="inventory index or 0xffffffff if unknown"/>
+      <arg name="renderer" type="uint" summary="inferred inventory index or 0xffffffff if unknown"/>
+      <arg name="evidence" type="string"/>
+      <arg name="transport" type="string"/>
+      <arg name="scope" type="string"/>
+      <arg name="build" type="string"/>
+    </event>
+    <event name="done"/>
   </interface>
 </protocol>

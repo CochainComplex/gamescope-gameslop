@@ -163,6 +163,11 @@ namespace gamescope
             return m_pChild->ImportDmabufToBackend( pDmaBuf );
 		}
 
+		virtual bool UsesDmabufForPresentation() const override
+		{
+            return m_pChild->UsesDmabufForPresentation();
+		}
+
 		virtual bool UsesModifiers() const override
 		{
             return true;
@@ -311,6 +316,11 @@ namespace gamescope
             return false;
         }
 
+        virtual bool SupportsIndependentRefresh() const override
+        {
+            return m_pChild->SupportsIndependentRefresh();
+        }
+
         virtual TouchClickMode GetTouchClickMode() override
         {
             // Doesn't need to be 'initted' for this check.
@@ -375,11 +385,6 @@ namespace gamescope
         bool NewlyInitted() override
         {
             return m_bJustInittedClient.exchange( false );
-        }
-
-        bool ShouldFitWindows() override
-        {
-            return m_pChild->ShouldFitWindows();
         }
 
         void OnEndFrame() override
