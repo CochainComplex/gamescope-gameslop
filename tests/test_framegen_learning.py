@@ -30,6 +30,7 @@ def main():
         'busy': 'static bool framegen_work_completed()',
         'drop': 'static void framegen_net_drop_profile_readback()',
         'train': 'static bool framegen_record_net_train(',
+        'upload': 'static void framegen_record_net_upload_barrier(',
         'pair': 'static bool framegen_record_net_train_pair(',
         'transaction': 'struct FramegenLearningRecording\n',
         'idle': 'void vulkan_framegen_train_idle()',
@@ -56,7 +57,7 @@ def main():
         for variant, flags in (('normal', []), ('fastmath', ['-O3', '-ffast-math'])):
             binary = directory / variant
             subprocess.run(shlex.split(os.environ.get('CXX', 'c++')) + [
-                '-std=c++20', '-Wall', '-Wextra', '-Werror', '-pthread', *flags,
+                '-std=c++20', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers', '-pthread', *flags,
                 '-DFRAMEGEN_PRODUCTION_FIXTURE', '-I', str(root / 'src'),
                 '-I', str(directory), str(root / 'tests/framegen_learning.cpp'),
                 str(root / 'src/framegen/atomic_file.cpp'), '-o', str(binary)], check=True, timeout=60)

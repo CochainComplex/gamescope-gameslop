@@ -37,6 +37,7 @@ static void policy_contracts()
 }
 
 #ifdef FRAMEGEN_PRODUCTION_FIXTURE
+#include <vulkan/vulkan.h>
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
 #include "framegen/metrics.hpp"
@@ -65,26 +66,32 @@ struct FramegenMotionNetTrainPush_t {};
 constexpr int SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT = 1, SHADER_TYPE_FRAMEGEN_MOTION_NET_TRAIN = 2;
 #include "learning_constants.inc"
 struct CVulkanTexture {
+	VkImage image = VK_NULL_HANDLE;
 	std::vector<uint8_t> bytes;
 	uint32_t pitch = 0;
 	uint32_t width() const { return 800; }
 	uint32_t height() const { return 600; }
 	uint8_t *mappedPixels() { return bytes.empty() ? nullptr : bytes.data()+37; }
 	uint32_t rowPitch() const { return pitch; }
+	VkImage vkImage() const { return image; }
 };
 struct CVulkanCmdBuffer {
 	unsigned dispatches = 0, copies = 0, barriers = 0;
+	int pipeline = 0;
+	std::vector<std::pair<int, CVulkanTexture*>> slot_zero;
 	void markFramegen() {}
-	void bindPipeline(int) {}
+	void bindPipeline(int next) { pipeline = next; }
 	void bindTarget(CVulkanTexture*) {}
 	void bindTarget2(CVulkanTexture*) {}
 	template<class T, class... A> void pushConstants(A...) {}
 	void dispatch(uint32_t, uint32_t) { ++dispatches; }
 	void copyImage(CVulkanTexture*, CVulkanTexture*) { ++copies; }
 	void hostReadBarrier() { ++barriers; }
+	VkCommandBuffer rawBuffer() const { return reinterpret_cast<VkCommandBuffer>(uintptr_t{44}); }
 };
 struct FramegenMotionResources_t {
 	bool bNetWeightsUploaded = false, bNetStatePending = false, bNetActive = false, bUncheckedFieldValid = false;
+	bool bNetUploadInitialized = false;
 	uint32_t uNetTrainStep = 0, width = 0, height = 0;
 	uint64_t uMotionFieldFrameId = 0, uMotionFieldIntervalNs = 0;
 	uint64_t uMotionHistoryFrameId = 0, uMotionHistoryIntervalNs = 0, uLumaReservoirFrameId[2]{};
@@ -93,7 +100,7 @@ struct FramegenMotionResources_t {
 		uint64_t warmedSeqNo = 0, pendingRecordSeqNo = 0, pendingRecordNs = 0, recordCostNs = 0, lastAttemptNs = 0;
 	} learning;
 	CVulkanTexture *netState = nullptr, *netGradSlices = nullptr, *netWeightsPrior = nullptr, *statsAccum = nullptr;
-	CVulkanTexture *netWeightsGpu = nullptr, *netProfileReadback = nullptr, *statsReadback = nullptr;
+	CVulkanTexture *netWeightsGpu = nullptr, *netWeightsUpload = nullptr, *netProfileReadback = nullptr, *statsReadback = nullptr;
 	CVulkanTexture *mvFieldRevChk = nullptr, *mvField = nullptr, *mvFieldHistory = nullptr;
 	CVulkanTexture *lumaPrev = nullptr, *lumaCur = nullptr, *lumaReservoir[2]{};
 };
@@ -142,6 +149,23 @@ static FramegenNetStore_t &framegen_net_store() { return store; }
 struct Log { template<class... A> void infof(const char*, A...) {} template<class... A> void errorf(const char*, A...) {} } vk_log;
 static std::vector<std::string> events;
 struct Device {
+	struct Barrier {
+		VkCommandBuffer command;
+		VkPipelineStageFlags source, destination;
+		VkDependencyFlags dependencies;
+		VkImageMemoryBarrier image;
+	};
+	struct Calls {
+		std::vector<Barrier> barriers;
+		void CmdPipelineBarrier(VkCommandBuffer command, VkPipelineStageFlags source,
+			VkPipelineStageFlags destination, VkDependencyFlags dependencies,
+			uint32_t memoryCount, const VkMemoryBarrier *memory, uint32_t bufferCount,
+			const VkBufferMemoryBarrier *buffers, uint32_t imageCount, const VkImageMemoryBarrier *images) {
+			assert(memoryCount == 0 && memory == nullptr && bufferCount == 0 && buffers == nullptr);
+			assert(imageCount == 1 && images);
+			barriers.push_back({command, source, destination, dependencies, images[0]});
+		}
+	} vk;
 	uint64_t completed = 100, baseCompleted = 100, nextSeq = 101, trainingCost = 1'000'000, trainingSample = 0;
 	unsigned commands = 0, submitted = 0;
 	bool split = false, commandOK = true;
@@ -172,6 +196,7 @@ struct Device {
 		++submitted; return nextSeq++;
 	}
 } g_device;
+#include "learning_upload.inc"
 static uint32_t every = 1;
 static bool prepare_ok = true, resources_ready = true, online_enabled = true, bidir_active = false;
 static uint64_t clock_start = 1'000'000'000, clock_end = 1'000'500'000, deadline = 1'020'000'000;
@@ -197,7 +222,9 @@ static auto framegen_effective_config(uint32_t) { return effective; }
 static GamescopeFramegenPipeline g_eFramegenPipeline = GamescopeFramegenPipeline::Spatial;
 static bool framegen_learning_resources_ready(const FramegenDispatch_t&) { return resources_ready; }
 static void framegen_adapt_consume(GamescopeFramegenPipeline) {}
-static void framegen_motion_bind_sampler(CVulkanCmdBuffer*, uint32_t, CVulkanTexture*, bool) {}
+static void framegen_motion_bind_sampler(CVulkanCmdBuffer *cmd, uint32_t slot, CVulkanTexture *texture, bool) {
+	if (slot == 0) cmd->slot_zero.emplace_back(cmd->pipeline, texture);
+}
 static bool framegen_shading_enabled(GamescopeFramegenPipeline) { return false; }
 static bool framegen_motion_history_valid(GamescopeFramegenPipeline) { return false; }
 static int framegen_luma_reservoir_read_index() { return -1; }
@@ -207,7 +234,8 @@ static bool framegen_prepare_motion(CVulkanCmdBuffer*, uint32_t, uint32_t, const
 	++prepares; g_framegenMotion.uMotionFieldFrameId = 0; g_framegenMotion.uMotionFieldIntervalNs = 0;
 	g_framegenMotion.bNetActive = false; g_framegenMotion.bUncheckedFieldValid = true; return prepare_ok;
 }
-static void framegen_record_net(CVulkanCmdBuffer*, uint32_t, uint32_t, bool) {
+static void framegen_record_net(CVulkanCmdBuffer *cmd, uint32_t, uint32_t, bool) {
+	framegen_record_net_upload_barrier(cmd);
 	g_framegenMotion.bNetActive = true; g_framegenMotion.bNetWeightsUploaded = false;
 	g_bFramegenNetStagingStale = true; g_framegenMotion.bNetStatePending = true;
 }
@@ -241,12 +269,13 @@ static void framegen_net_profile_consume();
 #include "learning_scene.inc"
 #include "learning_reset.inc"
 
-static CVulkanTexture texture, previous_texture, current_texture, weights, stats;
+static CVulkanTexture texture, previous_texture, current_texture, prior_texture, gradient_texture, upload_texture, weights, stats;
 static void setup()
 {
 	assert(!g_framegenNetWriteThread.joinable());
 	g_framegenMotion = {}; g_framegenHistory = {}; g_device = {}; effective = {};
 	g_framegenMotion.bNetWeightsUploaded = true; g_framegenMotion.uNetTrainStep = 7;
+	g_framegenMotion.bNetUploadInitialized = true;
 	g_framegenMotion.width = 100; g_framegenMotion.height = 75;
 	g_framegenMotion.uMotionFieldFrameId = 20; g_framegenMotion.uMotionFieldIntervalNs = 30;
 	g_framegenMotion.learning.warmedSeqNo = 1; g_framegenMotion.learning.recordCostNs = 500'000;
@@ -254,7 +283,10 @@ static void setup()
 	g_framegenHistory.lastCompositeSeqNo = 3; g_framegenHistory.currentFrameId = 20;
 	g_framegenHistory.valid = g_framegenHistory.bHudFreePrevious = g_framegenHistory.bHudFreeCurrent = true;
 	g_framegenHistory.nDegradeSteps = 1;
-	g_framegenMotion.netState = g_framegenMotion.netGradSlices = g_framegenMotion.netWeightsPrior = &texture;
+	g_framegenMotion.netState = &texture;
+	g_framegenMotion.netGradSlices = &gradient_texture; g_framegenMotion.netWeightsPrior = &prior_texture;
+	g_framegenMotion.netWeightsUpload = &upload_texture;
+	upload_texture.image = reinterpret_cast<VkImage>(uintptr_t{71});
 	g_framegenMotion.statsAccum = g_framegenMotion.netWeightsGpu = g_framegenMotion.mvFieldRevChk = &texture;
 	g_framegenMotion.lumaPrev = g_framegenMotion.lumaCur = g_framegenMotion.mvField = &texture;
 	g_framegenMotion.netProfileReadback = &weights; g_framegenMotion.statsReadback = &stats;
@@ -280,9 +312,67 @@ static auto recording_state()
 {
 	const auto &m = g_framegenMotion; const auto &p = g_framegenNetLearningPair;
 	return std::tuple(m.bNetWeightsUploaded, g_bFramegenNetStagingStale, m.bNetStatePending,
-		m.bNetActive, m.bUncheckedFieldValid, m.uNetTrainStep, m.netTrainingCadence.consideredPair,
+		m.bNetUploadInitialized, m.bNetActive, m.bUncheckedFieldValid, m.uNetTrainStep, m.netTrainingCadence.consideredPair,
 		m.netTrainingCadence.counter, m.uMotionFieldFrameId, m.uMotionFieldIntervalNs,
 		g_ulFramegenNetProgress, g_framegenMetricsPendingEvents.trainedSteps, p.realId, p.stepped, p.reason);
+}
+static void upload_contracts()
+{
+	setup(); g_framegenMotion.bNetUploadInitialized = false;
+	CVulkanCmdBuffer command;
+	const auto before = recording_state();
+	{
+		FramegenLearningRecording cancelled;
+		framegen_record_net_upload_barrier(&command);
+		assert(g_framegenMotion.bNetUploadInitialized);
+	}
+	assert(recording_state() == before);
+	{
+		FramegenLearningRecording accepted;
+		framegen_record_net_upload_barrier(&command);
+		accepted.committed = true;
+	}
+	framegen_record_net_upload_barrier(&command);
+	assert(g_framegenMotion.bNetUploadInitialized && g_device.vk.barriers.size() == 3);
+	assert(command.dispatches == 0 && command.copies == 0 && command.barriers == 0 && events.empty());
+	for (size_t index = 0; index < g_device.vk.barriers.size(); ++index)
+	{
+		const auto &observed = g_device.vk.barriers[index];
+		const auto &image = observed.image;
+		assert(observed.command == command.rawBuffer());
+		assert(observed.source == VK_PIPELINE_STAGE_HOST_BIT && observed.destination == VK_PIPELINE_STAGE_TRANSFER_BIT);
+		assert(observed.dependencies == 0 && image.sType == VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER && image.pNext == nullptr);
+		assert(image.srcAccessMask == VK_ACCESS_HOST_WRITE_BIT && image.dstAccessMask == VK_ACCESS_TRANSFER_READ_BIT);
+		assert(image.oldLayout == (index < 2 ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_GENERAL));
+		assert(image.newLayout == VK_IMAGE_LAYOUT_GENERAL && image.image == upload_texture.vkImage());
+		assert(image.srcQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED && image.dstQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED);
+		const auto &range = image.subresourceRange;
+		assert(range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && range.baseMipLevel == 0 && range.levelCount == 1);
+		assert(range.baseArrayLayer == 0 && range.layerCount == 1);
+	}
+	// Key/scene changes reuse the same staging image; a full resource reset
+	// creates a different image and must start from PREINITIALIZED again.
+	framegen_net_activate_key(0x100f0);
+	assert(g_framegenMotion.bNetUploadInitialized);
+	vulkan_framegen_invalidate_history("net_input_key_change");
+	assert(g_framegenMotion.bNetUploadInitialized);
+	vulkan_framegen_reset("upload-resource-reset");
+	assert(!g_framegenMotion.bNetUploadInitialized);
+
+	setup(); g_framegenMotion.bNetStatePending = true;
+	CVulkanCmdBuffer initial;
+	assert(framegen_record_net_train(&initial, GamescopeFramegenPipeline::Learned, true));
+	std::vector<CVulkanTexture*> optimizer_inputs;
+	for (const auto &[pipeline, texture] : initial.slot_zero)
+		if (pipeline == SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT) optimizer_inputs.push_back(texture);
+	assert((optimizer_inputs == std::vector<CVulkanTexture*>{&prior_texture, &gradient_texture}));
+	CVulkanCmdBuffer subsequent;
+	assert(framegen_record_net_train(&subsequent, GamescopeFramegenPipeline::Learned, true));
+	optimizer_inputs.clear();
+	for (const auto &[pipeline, texture] : subsequent.slot_zero)
+		if (pipeline == SHADER_TYPE_FRAMEGEN_MOTION_NET_OPT) optimizer_inputs.push_back(texture);
+	assert((optimizer_inputs == std::vector<CVulkanTexture*>{&gradient_texture}));
+	assert(g_framegenMotion.netTrainingCadence.counter == 0); // GPU recorder has no scheduling policy.
 }
 static void recording_contracts()
 {
@@ -469,7 +559,7 @@ int main(int argc, char **argv)
 	policy_contracts();
 #ifdef FRAMEGEN_PRODUCTION_FIXTURE
 	assert(argc == 2);
-	recording_contracts(); admission_contracts(); denied_learning_recovery_contract();
+	upload_contracts(); recording_contracts(); admission_contracts(); denied_learning_recovery_contract();
 	warmth_contracts(); readback_contracts(argv[1]); transition_contracts();
 #else
 	(void)argc; (void)argv;

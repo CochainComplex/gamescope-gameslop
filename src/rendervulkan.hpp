@@ -138,6 +138,7 @@ public:
 		{
 			bFlippable = false;
 			bMappable = false;
+			bHostUpload = false;
 			bSampled = false;
 			bStorage = false;
 			bTransferSrc = false;
@@ -152,6 +153,8 @@ public:
 
 		bool bFlippable : 1;
 		bool bMappable : 1;
+		// Owned linear staging populated by the host before its first GPU read.
+		bool bHostUpload : 1;
 		bool bSampled : 1;
 		bool bStorage : 1;
 		bool bTransferSrc : 1;
