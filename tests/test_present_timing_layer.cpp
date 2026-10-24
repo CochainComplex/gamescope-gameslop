@@ -496,12 +496,29 @@ struct SurfaceDriver {
   VkAcquireNextImageInfoKHR acquire{};
   uint32_t capabilityQueries = 0;
   std::vector<VkStructureType> capabilityChain;
+  std::optional<VkSurfaceCapabilitiesKHR> mailboxCapabilities;
+  std::vector<VkPresentModeKHR> supportedModes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR};
+  std::vector<VkPresentModeKHR> queriedModes;
+  VkResult modeResult = VK_SUCCESS;
+  VkResult mailboxResult = VK_SUCCESS;
+  VkSurfaceKHR fallbackSurface = fakeHandle<VkSurfaceKHR>(1308);
+  std::optional<VkSurfaceCapabilitiesKHR> fallbackCapabilities;
+  bool fallbackSupported = true;
+  bool fallbackObservedSupported = false;
+  bool fallbackQueriedBeforeSupport = false;
+  VkResult supportResult = VK_SUCCESS;
+  std::vector<VkSurfaceKHR> supportQueries;
+  std::vector<VkSurfaceKHR> legacyQueries;
 } surfaceDriver;
 
 VkResult VKAPI_CALL surfaceCapabilities(VkPhysicalDevice, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *caps) {
   surfaceDriver.surface = surface;
+  surfaceDriver.legacyQueries.push_back(surface);
+  if (surface == surfaceDriver.fallbackSurface && !surfaceDriver.fallbackObservedSupported)
+    surfaceDriver.fallbackQueriedBeforeSupport = true;
   if (surfaceDriver.result == VK_SUCCESS)
-    *caps = surfaceDriver.capabilities;
+    *caps = surface == surfaceDriver.fallbackSurface && surfaceDriver.fallbackCapabilities ?
+      *surfaceDriver.fallbackCapabilities : surfaceDriver.capabilities;
   return surfaceDriver.result;
 }
 
@@ -512,7 +529,34 @@ VkResult VKAPI_CALL surfaceCapabilities2(VkPhysicalDevice, const VkPhysicalDevic
     surfaceDriver.capabilityChain.push_back(node->sType);
   if (auto *protectedCaps = vkroots::FindInChainMutable<VkSurfaceProtectedCapabilitiesKHR>(caps))
     protectedCaps->supportsProtected = VK_TRUE;
-  return surfaceCapabilities(VK_NULL_HANDLE, info->surface, &caps->surfaceCapabilities);
+  const auto result = surfaceCapabilities(VK_NULL_HANDLE, info->surface, &caps->surfaceCapabilities);
+  if (const auto *mode = vkroots::FindInChain<VkSurfacePresentModeEXT>(info)) {
+    surfaceDriver.queriedModes.push_back(mode->presentMode);
+    if (mode->presentMode == VK_PRESENT_MODE_MAILBOX_KHR && surfaceDriver.mailboxResult != VK_SUCCESS)
+      return surfaceDriver.mailboxResult;
+    if (result == VK_SUCCESS && mode->presentMode == VK_PRESENT_MODE_MAILBOX_KHR && surfaceDriver.mailboxCapabilities)
+      caps->surfaceCapabilities = *surfaceDriver.mailboxCapabilities;
+  }
+  return result;
+}
+
+void VKAPI_CALL surfaceQueueFamilies(VkPhysicalDevice, uint32_t *count, VkQueueFamilyProperties *) {
+  *count = 2;
+}
+
+VkResult VKAPI_CALL surfaceSupport(VkPhysicalDevice, uint32_t family, VkSurfaceKHR surface, VkBool32 *supported) {
+  surfaceDriver.supportQueries.push_back(surface);
+  if (surfaceDriver.supportResult != VK_SUCCESS)
+    return surfaceDriver.supportResult;
+  *supported = surfaceDriver.fallbackSupported && family == 1;
+  surfaceDriver.fallbackObservedSupported |= *supported == VK_TRUE;
+  return VK_SUCCESS;
+}
+
+VkResult VKAPI_CALL surfaceModes(VkPhysicalDevice, VkSurfaceKHR, uint32_t *count, VkPresentModeKHR *modes) {
+  if (surfaceDriver.modeResult != VK_SUCCESS)
+    return surfaceDriver.modeResult;
+  return vkroots::array(surfaceDriver.supportedModes, count, modes);
 }
 
 VkResult VKAPI_CALL surfaceFormats(VkPhysicalDevice, VkSurfaceKHR, uint32_t *count, VkSurfaceFormatKHR *formats) {
@@ -527,6 +571,12 @@ PFN_vkVoidFunction VKAPI_CALL surfaceContractProc(VkInstance instance, const cha
     return reinterpret_cast<PFN_vkVoidFunction>(surfaceCapabilities2);
   if (std::strcmp(name, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
     return reinterpret_cast<PFN_vkVoidFunction>(surfaceFormats);
+  if (std::strcmp(name, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(surfaceModes);
+  if (std::strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(surfaceQueueFamilies);
+  if (std::strcmp(name, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(surfaceSupport);
   return maintenanceProc(instance, name);
 }
 
@@ -673,7 +723,9 @@ TEST_CASE("Forced FIFO capability queries restore caller chains on success and f
 
   CHECK(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
     fixture.physical, VK_NULL_HANDLE, &input, &output) == result);
-  CHECK(surfaceDriver.capabilityQueries == 1);
+  // The payload query still runs once; the second, core-only query obtains
+  // the canonical MAILBOX count bounds without touching the caller's chain.
+  CHECK(surfaceDriver.capabilityQueries == (result == VK_SUCCESS ? 2 : 1));
   CHECK(surfaceDriver.surface == fixture.surface);
   CHECK(surfaceDriver.capabilityChain == std::vector<VkStructureType>{protectedCaps.sType, scaling.sType});
   CHECK(output.pNext == outputNext);
@@ -760,6 +812,225 @@ TEST_CASE("Acquire aliases forward active requests and reject retired swapchains
     CHECK(surfaceDriver.acquire.deviceMask == info.deviceMask);
   }
   GamescopeWSILayer::gamescopeSwapchains.erase(handle);
+}
+
+TEST_CASE("Public image counts retain downstream bounds and a bounded preference", "[present_timing_layer][image_count_contract]") {
+  const auto bounds = GENERATE(std::pair{2u, 0u}, std::pair{4u, 0u}, std::pair{2u, 2u}, std::pair{4u, 5u});
+  const bool caps2 = GENERATE(false, true);
+  SurfaceContract fixture;
+  surfaceDriver.capabilities.minImageCount = bounds.first;
+  surfaceDriver.capabilities.maxImageCount = bounds.second;
+  VkSurfaceCapabilitiesKHR caps{};
+  if (caps2) {
+    const VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,
+      .presentMode = VK_PRESENT_MODE_FIFO_KHR};
+    const VkPhysicalDeviceSurfaceInfo2KHR info{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+      .pNext = &mode, .surface = fixture.surface};
+    VkSurfaceCapabilities2KHR output{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+    REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
+      fixture.physical, VK_NULL_HANDLE, &info, &output) == VK_SUCCESS);
+    caps = output.surfaceCapabilities;
+    CHECK(mode.presentMode == VK_PRESENT_MODE_FIFO_KHR);
+    CHECK(mode.pNext == nullptr);
+  } else {
+    REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilitiesKHR(
+      fixture.physical, VK_NULL_HANDLE, fixture.surface, &caps) == VK_SUCCESS);
+  }
+  const auto expected = bounds.second ? std::min(std::max(3u, bounds.first), bounds.second) : std::max(3u, bounds.first);
+  CHECK(caps.minImageCount == expected);
+  CHECK(caps.maxImageCount == bounds.second);
+  // Same actual image count above and below the layer: the public allowance
+  // must be no larger than the driver's, independently of the requested count.
+  for (uint32_t images = expected; images <= expected + 2; ++images)
+    CHECK(images - caps.minImageCount <= images - bounds.first);
+}
+
+TEST_CASE("Ordinary capability queries account for supported MAILBOX limits", "[present_timing_layer][image_count_contract]") {
+  const bool caps2 = GENERATE(false, true);
+  const bool enabled = GENERATE(false, true);
+  const bool supported = GENERATE(false, true);
+  SurfaceContract fixture;
+  GamescopeWSILayer::gamescopeInstances.find(fixture.instance)->surfaceMaintenance1 = enabled;
+  surfaceDriver.mailboxCapabilities = surfaceDriver.capabilities;
+  surfaceDriver.mailboxCapabilities->minImageCount = 4;
+  surfaceDriver.mailboxCapabilities->maxImageCount = 5;
+  if (!supported)
+    surfaceDriver.supportedModes = {VK_PRESENT_MODE_FIFO_KHR};
+  VkSurfaceCapabilitiesKHR caps{};
+  if (caps2) {
+    const VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,
+      .presentMode = VK_PRESENT_MODE_FIFO_KHR};
+    const VkPhysicalDeviceSurfaceInfo2KHR info{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+      .pNext = enabled ? &mode : nullptr, .surface = fixture.surface};
+    VkSurfaceCapabilities2KHR output{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+    REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
+      fixture.physical, VK_NULL_HANDLE, &info, &output) == VK_SUCCESS);
+    caps = output.surfaceCapabilities;
+  } else {
+    REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilitiesKHR(
+      fixture.physical, VK_NULL_HANDLE, fixture.surface, &caps) == VK_SUCCESS);
+  }
+  CHECK(caps.minImageCount == (enabled && supported ? 4u : 3u));
+  CHECK(caps.maxImageCount == (enabled && supported ? 5u : 0u));
+  CHECK(std::ranges::count(surfaceDriver.queriedModes, VK_PRESENT_MODE_MAILBOX_KHR) == (enabled && supported ? 1 : 0));
+}
+
+TEST_CASE("Creation refuses incompatible image counts before calling the driver", "[present_timing_layer][image_count_contract]") {
+  const auto variant = GENERATE(0, 1, 2, 3, 4, 5);
+  SurfaceContract fixture;
+  surfaceDriver.capabilities.minImageCount = 4;
+  surfaceDriver.capabilities.maxImageCount = 5;
+  maintenance.extension = true;
+  const uint32_t requested = variant == 0 ? 3 : variant == 2 ? 5 : variant == 3 ? 6 : 4;
+  if (variant == 4)
+    surfaceDriver.supportedModes = {VK_PRESENT_MODE_FIFO_KHR};
+  if (variant == 5) {
+    surfaceDriver.mailboxCapabilities = surfaceDriver.capabilities;
+    surfaceDriver.mailboxCapabilities->minImageCount = 6;
+    surfaceDriver.mailboxCapabilities->maxImageCount = 7;
+  }
+  const VkSwapchainCreateInfoKHR info{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+    .surface = fixture.surface, .minImageCount = requested,
+    .imageFormat = VK_FORMAT_B8G8R8A8_UNORM, .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+    .imageExtent = {640, 480}, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+    .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+    .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE};
+  VkSwapchainKHR swapchain{};
+  CHECK(GamescopeWSILayer::VkDeviceOverrides::CreateSwapchainKHR(
+    fixture.device, VK_NULL_HANDLE, &info, nullptr, &swapchain) == VK_ERROR_INITIALIZATION_FAILED);
+  const bool forwarded = variant == 1 || variant == 2;
+  CHECK(surfaceDriver.creates == (forwarded ? 1 : 0));
+  if (forwarded)
+    CHECK(surfaceDriver.creation.minImageCount == requested);
+}
+
+TEST_CASE("Fallback count validation preserves the public acquisition allowance", "[present_timing_layer][image_count_contract]") {
+  const auto variant = GENERATE(0, 1, 2, 3);
+  SurfaceContract fixture;
+  surfaceDriver.fallbackCapabilities = surfaceDriver.capabilities;
+  surfaceDriver.fallbackCapabilities->minImageCount = variant == 0 ? 4 : 2;
+  surfaceDriver.fallbackCapabilities->maxImageCount = variant == 1 ? 4 : 0;
+  surfaceDriver.fallbackSupported = variant != 2;
+  // Request5 already exceeds both minima: it must not conceal public3 < M4.
+  const auto result = GamescopeWSILayer::validateSwapchainImageCounts(fixture.physical,
+    VK_NULL_HANDLE, fixture.surface, surfaceDriver.fallbackSurface, 5, false);
+  CHECK(result == (variant == 3 ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED));
+  CHECK(surfaceDriver.supportQueries == std::vector<VkSurfaceKHR>{surfaceDriver.fallbackSurface, surfaceDriver.fallbackSurface});
+  CHECK(std::ranges::count(surfaceDriver.legacyQueries, surfaceDriver.fallbackSurface) == (variant == 2 ? 0 : 1));
+  CHECK_FALSE(surfaceDriver.fallbackQueriedBeforeSupport);
+}
+
+TEST_CASE("Fallback support errors propagate before querying fallback capabilities", "[present_timing_layer][image_count_contract]") {
+  SurfaceContract fixture;
+  surfaceDriver.supportResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+  CHECK(GamescopeWSILayer::validateSwapchainImageCounts(fixture.physical, VK_NULL_HANDLE,
+    fixture.surface, surfaceDriver.fallbackSurface, 5, false) == VK_ERROR_OUT_OF_HOST_MEMORY);
+  CHECK(surfaceDriver.supportQueries == std::vector<VkSurfaceKHR>{surfaceDriver.fallbackSurface});
+  CHECK(std::ranges::count(surfaceDriver.legacyQueries, surfaceDriver.fallbackSurface) == 0);
+}
+
+TEST_CASE("An empty primary count interval stays valid in queries and refuses creation", "[present_timing_layer][image_count_contract]") {
+  SurfaceContract fixture;
+  surfaceDriver.capabilities.minImageCount = 2;
+  surfaceDriver.capabilities.maxImageCount = 3;
+  surfaceDriver.mailboxCapabilities = surfaceDriver.capabilities;
+  surfaceDriver.mailboxCapabilities->minImageCount = 4;
+  surfaceDriver.mailboxCapabilities->maxImageCount = 0;
+  VkSurfaceCapabilitiesKHR caps{};
+  REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilitiesKHR(
+    fixture.physical, VK_NULL_HANDLE, fixture.surface, &caps) == VK_SUCCESS);
+  CHECK(caps.minImageCount == 3);
+  CHECK(caps.maxImageCount == 3);
+  CHECK(GamescopeWSILayer::validateSwapchainImageCounts(fixture.physical, VK_NULL_HANDLE,
+    fixture.surface, fixture.surface, 3, false) == VK_ERROR_INITIALIZATION_FAILED);
+}
+
+TEST_CASE("MAILBOX query errors preserve caller links and the exact result", "[present_timing_layer][image_count_contract]") {
+  const auto result = GENERATE(VK_ERROR_SURFACE_LOST_KHR, VK_ERROR_OUT_OF_HOST_MEMORY);
+  SurfaceContract fixture;
+  surfaceDriver.mailboxResult = result;
+  VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,
+    .presentMode = VK_PRESENT_MODE_FIFO_KHR};
+  const VkPhysicalDeviceSurfaceInfo2KHR info{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+    .pNext = &mode, .surface = fixture.surface};
+  VkSurfaceProtectedCapabilitiesKHR tail{.sType = VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR};
+  VkSurfaceCapabilities2KHR output{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, .pNext = &tail};
+  CHECK(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
+    fixture.physical, VK_NULL_HANDLE, &info, &output) == result);
+  CHECK(info.pNext == &mode);
+  CHECK(mode.pNext == nullptr);
+  CHECK(output.pNext == &tail);
+  CHECK(tail.pNext == nullptr);
+}
+
+TEST_CASE("Rejected new swapchains still retire the old swapchain", "[present_timing_layer][image_count_contract]") {
+  const auto variant = GENERATE(0, 1, 2, 3);
+  SurfaceContract fixture;
+  const auto old = fakeHandle<VkSwapchainKHR>(1310);
+  auto *state = GamescopeWSILayer::gamescopeSwapchains.create(old, GamescopeWSILayer::GamescopeSwapchainData{
+    .isBypassingXWayland = true});
+  REQUIRE(state);
+  struct Cleanup {
+    VkSwapchainKHR swapchain;
+    ~Cleanup() { GamescopeWSILayer::gamescopeSwapchains.erase(swapchain); }
+  } cleanup{old};
+  surfaceDriver.capabilities.minImageCount = 4;
+  if (variant == 1)
+    surfaceDriver.modeResult = VK_ERROR_SURFACE_LOST_KHR;
+  if (variant == 2)
+    surfaceDriver.supportedModes = {VK_PRESENT_MODE_FIFO_KHR};
+  const VkSwapchainCreateInfoKHR info{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+    .surface = fixture.surface, .minImageCount = variant == 3 ? 1u : 3u, .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+    .presentMode = variant == 3 ? VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR : VK_PRESENT_MODE_FIFO_KHR,
+    .oldSwapchain = old};
+  VkSwapchainKHR swapchain{};
+  CHECK(GamescopeWSILayer::VkDeviceOverrides::CreateSwapchainKHR(
+    fixture.device, VK_NULL_HANDLE, &info, nullptr, &swapchain) ==
+    (variant == 1 ? VK_ERROR_SURFACE_LOST_KHR : VK_ERROR_INITIALIZATION_FAILED));
+  CHECK(*state->retired);
+  CHECK(surfaceDriver.creates == 0);
+}
+
+TEST_CASE("Shared-present query counts are not replaced by an ordinary preference", "[present_timing_layer][image_count_contract]") {
+  const auto presentMode = GENERATE(VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR, VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR);
+  SurfaceContract fixture;
+  surfaceDriver.supportedModes.push_back(presentMode);
+  surfaceDriver.capabilities.minImageCount = surfaceDriver.capabilities.maxImageCount = 1;
+  const VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT, .presentMode = presentMode};
+  const VkPhysicalDeviceSurfaceInfo2KHR info{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+    .pNext = &mode, .surface = fixture.surface};
+  VkSurfaceCapabilities2KHR caps{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+  REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
+    fixture.physical, VK_NULL_HANDLE, &info, &caps) == VK_SUCCESS);
+  CHECK(caps.surfaceCapabilities.minImageCount == 1);
+  CHECK(caps.surfaceCapabilities.maxImageCount == 1);
+  CHECK(surfaceDriver.queriedModes == std::vector<VkPresentModeKHR>{presentMode});
+}
+
+TEST_CASE("Image preference is capped by the common finite maximum", "[present_timing_layer][image_preference]") {
+  SurfaceContract fixture;
+  surfaceDriver.capabilities.minImageCount = 2;
+  surfaceDriver.mailboxCapabilities = surfaceDriver.capabilities;
+  surfaceDriver.mailboxCapabilities->minImageCount = 4;
+  surfaceDriver.mailboxCapabilities->maxImageCount = 5;
+  VkSurfaceCapabilitiesKHR caps{};
+  REQUIRE(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilitiesKHR(
+    fixture.physical, VK_NULL_HANDLE, fixture.surface, &caps) == VK_SUCCESS);
+  CHECK(caps.minImageCount == std::clamp(GamescopeWSILayer::getMinImageCount(), 4u, 5u));
+  CHECK(caps.maxImageCount == 5);
+}
+
+TEST_CASE("An ensured count above the finite maximum is refused", "[.image_ensure_preference]") {
+  SurfaceContract fixture;
+  REQUIRE(GamescopeWSILayer::getEnsureMinImageCount());
+  REQUIRE(GamescopeWSILayer::getMinImageCount() == 8);
+  surfaceDriver.capabilities.maxImageCount = 5;
+  const VkSwapchainCreateInfoKHR info{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+    .surface = fixture.surface, .minImageCount = 5, .presentMode = VK_PRESENT_MODE_FIFO_KHR};
+  VkSwapchainKHR swapchain{};
+  CHECK(GamescopeWSILayer::VkDeviceOverrides::CreateSwapchainKHR(
+    fixture.device, VK_NULL_HANDLE, &info, nullptr, &swapchain) == VK_ERROR_INITIALIZATION_FAILED);
+  CHECK(surfaceDriver.creates == 0);
 }
 
 TEST_CASE("Features2 aliases retain their driver entry point", "[present_timing_layer]") {

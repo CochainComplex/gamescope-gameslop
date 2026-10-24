@@ -141,17 +141,26 @@ driver error before allocating Wayland protocol objects. These CPU tests do not
 establish GPU synchronization, XCB fallback behavior or frame pacing.
 
 The `[forced_fifo_capabilities]` cases cover forced-FIFO queries with a
-compatibility node at the head, middle, tail or absent. They verify one driver
-call, an unchanged driver result and restoration of caller-owned chain links on
-both success and failure. Only structure types and links are checked for failed
-output queries; their payloads are undefined after a driver error.
+compatibility node at the head, middle, tail or absent. They verify one payload
+query, an unchanged driver error and restoration of caller-owned chain links on
+both success and failure. Successful queries also obtain core-only MAILBOX count
+bounds without passing the caller's output chain. Only structure types and links
+are checked for failed output queries; their payloads are undefined after an error.
 
-The known image-count mismatch remains open: the layer can advertise three
-images although the downstream surface requires four. A correction must account
-for forced MAILBOX limits, capability-query modes and bypass/fallback surfaces;
-raising only the creation count leaves application acquisition guarantees
-inconsistent. The characterization tests do not certify that mismatch as valid
-behavior or imply that it has been fixed.
+The `[image_count_contract]` cases protect the ordinary image-count policy:
+legacy and supported MAILBOX bounds, enabled optional dependencies, finite maxima,
+empty intervals, query errors, shared-present refusal, and old-swapchain retirement.
+Keyed-surface fakes exercise fallback support-before-capabilities and refusal when
+its stricter minimum would weaken the public acquisition allowance, even with a
+large requested count. They do not exercise real XCB/HDR routing or GPU progress.
+
+The public minimum is conservative for the primary legacy/MAILBOX interval; a
+selected fallback must fit that contract. An empty interval leaves valid legacy
+capability output but refuses creation. A stricter fallback can also be refused,
+rather than silently changing acquisition guarantees. Shared-mode queries retain
+their one-image bounds, but shared-present creation is unsupported by the ordinary
+MAILBOX emulation. Capability/create queries add cold-path driver calls; unchanged
+acquire/present forwarding alone does not establish unchanged runtime latency.
 
 From the repository root, use the checked-in settings (tested with Vulkan
 Validation Layers 1.4.304) and retain loader output proving which library was
