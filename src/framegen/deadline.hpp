@@ -1297,6 +1297,40 @@ struct BidirPlanStep_t
 	size_t shedCapacity = 0;			// the queue's depth bound once this plan is queued
 };
 
+// Observe a valid pair after any invalidation, without changing the translation
+// or queue. A zero delay still retains the pair's timing evidence.
+[[nodiscard]] inline uint64_t observe_bidir_pair_delay( BidirTimelineState_t &state,
+	const BidirPlanInputs_t &in, uint64_t backlogExcessNs, uint64_t heldNs )
+{
+	const BidirPresenterView_t &view = in.presenter;
+	const uint64_t T = view.vblankIntervalNs;
+	const uint64_t opportunityNs = view.opportunityNs;
+	// The pair latency is sampled only at the first plan of an opportunity
+	// (later ones are catch-up composites) and while no real waits behind a real
+	// (that wait is queueing).
+	const bool latencySample = opportunityNs != state.plannedAtNs && backlogExcessNs == 0u
+		&& opportunityNs > in.previous.recordNs;
+	state.sourceSpacings.push( std::max( T, in.current.sourceReadyNs - in.previous.sourceReadyNs ) );
+	state.recordSpacings.push( std::max( T, in.current.recordNs - in.previous.recordNs ) );
+	// A span sample every ringReals reals, so no interval lies in two samples
+	// and one burst is one piece of evidence.
+	const size_t ringReals = bidir_ring_reals( view.capacity );
+	const bool spanSample = ringReals != 0u && state.sourceSpacings.count % ringReals == 0u;
+	state.window.push( {
+		.atNs = opportunityNs,
+		.latencyNs = latencySample ? opportunityNs - in.previous.recordNs : 0u,
+		.sourceSpanNs = spanSample ? state.sourceSpacings.span( ringReals ) : 0u,
+		.recordSpanNs = spanSample ? state.recordSpacings.span( ringReals ) : 0u,
+	} );
+	state.plannedAtNs = opportunityNs;
+	state.pairLatency = update_bidir_envelope( state.pairLatency, state.window.kth_highest_latency(), opportunityNs, T );
+	const uint64_t envelopeDelayNs = bidir_envelope_delay( state.pairLatency, state.window, opportunityNs, T );
+	state.ringBound = update_bidir_ring_bound( state.ringBound, heldNs != 0u ? heldNs : envelopeDelayNs, envelopeDelayNs,
+		bidir_ring_delay( view.capacity, state.window.kth_lowest_span(), T ), view.capacity, opportunityNs, T );
+	return envelopeDelayNs == 0u ? 0u
+		: state.ringBound.delayNs != 0u ? std::min( envelopeDelayNs, state.ringBound.delayNs ) : envelopeDelayNs;
+}
+
 // One bidir plan for the real pair previous -> current, as a pure function of
 // the queue, the timeline state and the presenter's view of this opportunity.
 //
@@ -1329,32 +1363,9 @@ struct BidirPlanStep_t
 	if ( in.invalidate || s.gridEpoch == 0u )
 		s = { .gridEpoch = s.gridEpoch + 1u == 0u ? 1u : s.gridEpoch + 1u };
 
-	// The pair latency is sampled only at the first plan of an opportunity
-	// (later ones are catch-up composites) and while no real waits behind a real
-	// (that wait is queueing).
 	const uint64_t backlogExcessNs = bidir_backlog_excess( in.queue, view );
-	const bool latencySample = opportunityNs != s.plannedAtNs && backlogExcessNs == 0u
-		&& opportunityNs > in.previous.recordNs;
-	s.sourceSpacings.push( std::max( T, in.current.sourceReadyNs - in.previous.sourceReadyNs ) );
-	s.recordSpacings.push( std::max( T, in.current.recordNs - in.previous.recordNs ) );
-	// A span sample every ringReals reals, so no interval lies in two samples
-	// and one burst is one piece of evidence.
-	const size_t ringReals = bidir_ring_reals( view.capacity );
-	const bool spanSample = ringReals != 0u && s.sourceSpacings.count % ringReals == 0u;
-	s.window.push( {
-		.atNs = opportunityNs,
-		.latencyNs = latencySample ? opportunityNs - in.previous.recordNs : 0u,
-		.sourceSpanNs = spanSample ? s.sourceSpacings.span( ringReals ) : 0u,
-		.recordSpanNs = spanSample ? s.recordSpacings.span( ringReals ) : 0u,
-	} );
-	s.plannedAtNs = opportunityNs;
-	s.pairLatency = update_bidir_envelope( s.pairLatency, s.window.kth_highest_latency(), opportunityNs, T );
-	const uint64_t envelopeDelayNs = bidir_envelope_delay( s.pairLatency, s.window, opportunityNs, T );
 	const uint64_t heldNs = s.epoch.valid ? s.epoch.delayNs : 0u;
-	s.ringBound = update_bidir_ring_bound( s.ringBound, heldNs != 0u ? heldNs : envelopeDelayNs, envelopeDelayNs,
-		bidir_ring_delay( view.capacity, s.window.kth_lowest_span(), T ), view.capacity, opportunityNs, T );
-	const uint64_t delayNs = envelopeDelayNs == 0u ? 0u
-		: s.ringBound.delayNs != 0u ? std::min( envelopeDelayNs, s.ringBound.delayNs ) : envelopeDelayNs;
+	const uint64_t delayNs = observe_bidir_pair_delay( s, in, backlogExcessNs, heldNs );
 	if ( delayNs == 0u )
 		return step;
 
