@@ -868,30 +868,30 @@ namespace gamescope
 				// Zero is a timeout only with one pending; otherwise an error,
 				// which may not have set a message. Only this wait's error counts.
 				const char *pszError = SDL_GetError();
-				if ( pszError[0] || !bTimedWait )
+				if ( !pszError[0] && bTimedWait )
+					continue;
+
+				if ( !pszError[0] )
+					pszError = "unknown";
+				// The back-off below bounds this to ten lines a second;
+				// a repeated error is logged at most once a second.
+				const uint64_t ulNow = get_time_in_nanos();
+				if ( sLastWaitError != pszError || ulNow - ulLastWaitErrorLog >= 1'000'000'000ul )
 				{
-					if ( !pszError[0] )
-						pszError = "unknown";
-					// The back-off below bounds this to ten lines a second;
-					// a repeated error is logged at most once a second.
-					const uint64_t ulNow = get_time_in_nanos();
-					if ( sLastWaitError != pszError || ulNow - ulLastWaitErrorLog >= 1'000'000'000ul )
-					{
-						sdl_log.errorf( "SDL_WaitEventTimeout failed: %s", pszError );
-						sLastWaitError = pszError;
-						ulLastWaitErrorLog = ulNow;
-					}
-					if ( SDL_WasInit( SDL_INIT_EVENTS ) == 0 )
-					{
-						sdl_log.errorf( "SDL event loop: event subsystem gone, exiting" );
-						break;
-					}
-					if ( stopToken.stop_requested() )
-						break;
-					// Persistent errors can return immediately. Back off, which
-					// delays shutdown by at most one retry interval.
-					SDL_Delay( k_nSDLRetryMs );
+					sdl_log.errorf( "SDL_WaitEventTimeout failed: %s", pszError );
+					sLastWaitError = pszError;
+					ulLastWaitErrorLog = ulNow;
 				}
+				if ( SDL_WasInit( SDL_INIT_EVENTS ) == 0 )
+				{
+					sdl_log.errorf( "SDL event loop: event subsystem gone, exiting" );
+					break;
+				}
+				if ( stopToken.stop_requested() )
+					break;
+				// Persistent errors can return immediately. Back off, which
+				// delays shutdown by at most one retry interval.
+				SDL_Delay( k_nSDLRetryMs );
 				continue;
 			}
 			if ( stopToken.stop_requested() )
