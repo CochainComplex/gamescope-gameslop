@@ -324,6 +324,15 @@ order, dtypes and half-image boundaries, including both sampler gradients used
 in training. The selected model remains empirical: unchanged numerical output
 does not qualify another GPU or turn a failed parity gate into a pass.
 
+`scripts/framegen_net_formats.py` owns the offline GSFR/GSFP layout constants,
+weight decoding and export. Trainer/evaluator aliases preserve existing callers;
+GSFD dataset parsing, training, scoring and CLI argument handling remain in the
+tools. This format leaf imports neither a driver nor the numerical reference.
+Preserve Python's existing admission behavior independently of the C++ runtime:
+bare shape-compatible versions warn without legacy shading migration, bare
+trailing bytes are rejected, and profile sets require the current version.
+Format refactors need exact bytes, array layout and error/stream comparisons.
+
 ## Validation by change class
 
 **Documentation, launchers, comments:**

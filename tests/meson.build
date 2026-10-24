@@ -143,5 +143,8 @@ test('vblank_grid', test_vblank_grid)
 test('framegen_field_model', find_program('python3'),
 	args: files('test_framegen_field_model.py'), timeout: 30)
 
+test('framegen_net_formats', find_program('python3'),
+	args: files('test_framegen_net_formats.py'), timeout: 30)
+
 test('framegen_nested_smoke', find_program('python3'),
 	args: files('test_framegen_nested_smoke.py'), timeout: 30)
