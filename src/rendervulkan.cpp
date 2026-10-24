@@ -2343,12 +2343,11 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pWaitSemaphores[i] = externalWaits[i].pTimelineSemaphore->pVkSemaphore;
 		pWaitPoints[i] = externalWaits[i].ulPoint;
-		// TRANSFER is required as well as the shading stages: a non-device-local
-		// client import is first read by vkCmdCopyImage in the dual-gpu staging
-		// path (and in the ReShade pre-stage submission), so without it the
-		// transfer read may legally run before the client's acquire point is
-		// signalled and copy a stale or partially written image.
-		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+		// Dependencies are first consumed by compute or an import/staging copy.
+		// ReShade inherits client waits on its pre-stage copy, before its raster
+		// pass. Keep TRANSFER covered without adding a graphics-only stage to
+		// generated-frame waits that also reach this owner on compute-only queues.
+		pWaitStageFlags[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
