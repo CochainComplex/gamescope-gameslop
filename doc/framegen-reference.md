@@ -549,10 +549,17 @@ legacy logs retain explicitly reported receipt-time comparison.
 | `gen_late` | Generated frames that flipped more than half a refresh late. |
 | `real_wait` | Times a real frame had to wait while a generated frame was being produced. |
 | `src_flip_ms_p50`, `_p90`, `_p95`, `_fs` | Latency of live real frames from source-ready to the actual flip, in ms. `_fs` is the histogram full scale (256 ms); a percentile at full scale only says the value is beyond it. |
-| `src_rec_ms_p50`, `src_rec_ms_p95`, `rec_flip_ms_p50`, `rec_flip_ms_p95` | The two parts of the `src_flip_ms_*` latency of live real frames, in ms. `src_rec_ms_*` runs from source-ready to the first paint (latch) of that frame; `rec_flip_ms_*` runs from the latch to the actual flip. Same full-scale rule as `src_flip_ms_*`. Recorded with framegen off too (with `GAMESCOPE_FRAMEGEN_METRICS=1`). |
+| `src_rec_ms_p50`, `src_rec_ms_p95`, `rec_flip_ms_p50`, `rec_flip_ms_p95` | The two parts of the `src_flip_ms_*` interval of live real frames, in ms. `src_rec_ms_*` runs from software-observed source readiness to the first compositor present attempt for that real-frame identity; `rec_flip_ms_*` runs from that attempt to the backend-reported flip/completion timestamp. This record boundary precedes backend `Present` and differs from commit admission (`commit_t::latch_time`). Same full-scale rule as `src_flip_ms_*`. Recorded with framegen off too (with `GAMESCOPE_FRAMEGEN_METRICS=1`). |
 | `dreal_flip_ms_p50`, `_p90`, `_p95`, `_fs` | Latency of delayed real frames from their record to the actual flip, in ms (bidirectional mode only). Same full-scale rule. |
 | `bidir_delay_ms` | Largest target delay D in force during the window, in bidirectional mode: how late real frames are shown relative to live. 0 outside bidirectional mode. How D is chosen: [Bidirectional delay controller](framegen-architecture.md#bidirectional-delay-controller). |
 | `ring_ovf` | Bidirectional queue fronts that the output-ring ceiling forced out ahead of their planned slot in the window. Each is an overflow the ring bound learns from. 0 outside bidirectional mode. |
+
+Source-to-record includes ready-commit queue residence before admission. Repeated
+attempts for the same real-frame identity retain its first record timestamp.
+The SDL/Vulkan-swapchain endpoint is host-observed present-wait completion,
+not physical scanout. The latency histograms require valid correlated feedback;
+separate stage percentiles cannot be added to recover a total percentile. See
+[measurement boundaries](framegen-testing.md#measuring-it).
 
 ### Resets
 
