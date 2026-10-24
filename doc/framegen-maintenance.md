@@ -75,6 +75,15 @@ owner with a proven lifetime. Splitting tightly coupled dispatch helpers merely
 to reduce line count is not an architectural improvement and can hide ordering
 or ownership bugs.
 
+Repaint request policy in `deadline.hpp` has two temporal stages within
+`step_repaint_requests`: fold the previous iteration's requests and carriers,
+then plan from the current inputs. Fold even when no paint ended: deferred
+work can leave carriers outstanding. Carrier identities come from the previous
+iteration's log, while yield age advances at
+most once per vblank target. Retire an acknowledged force before comparing the
+current counter snapshot; a force re-raised to the same value must get its own
+commit. Keep GPU completion and presentation ownership in the consumers.
+
 ## Non-negotiable runtime contracts
 
 1. **Real content has priority.** In causal modes, a newly latched game frame

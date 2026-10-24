@@ -85,6 +85,107 @@ TEST_CASE( "bidir quantization retains the larger endpoint ID for a shared targe
 	CHECK( plan.slots[ 0 ].phase == 1.0 );
 }
 
+TEST_CASE( "bidir slot validation requires a grid, matching epoch and endpoint pair", "[framegen][deadline]" )
+{
+	const DisplayGrid_t grid = { .D0 = 1'000u, .W0 = 900u, .T = 100u };
+	const BidirEpoch_t epoch = establish_bidir_epoch( 100u, 1u );
+	const std::array endpoints = { BidirEndpoint_t{ 1u, 1u, 1'000u },
+		BidirEndpoint_t{ 2u, 2u, 1'400u } };
+	const struct
+	{
+		DisplayGrid_t grid;
+		BidirEpoch_t epoch;
+		uint64_t gridEpoch;
+		size_t endpoints;
+		bool valid;
+	} cases[] = {
+		{ { 1'000u, 900u, 0u }, epoch, 1u, 2u, false },
+		{ { 0u, 900u, 100u }, epoch, 1u, 2u, false },
+		{ { 1'000u, 0u, 100u }, epoch, 1u, 2u, false },
+		{ grid, { 100u, 1u, false }, 1u, 2u, false },
+		{ grid, { 100u, 0u, true }, 0u, 2u, false },
+		{ grid, epoch, 2u, 2u, false },
+		{ grid, epoch, 1u, 0u, false },
+		{ grid, epoch, 1u, 1u, false },
+		{ grid, epoch, 1u, 2u, true },
+	};
+	for ( const auto &c : cases )
+	{
+		CAPTURE( c.grid.T, c.grid.D0, c.grid.W0, c.epoch.valid, c.epoch.epoch, c.gridEpoch, c.endpoints );
+		const BidirPlan_t plan = plan_bidir_slots( c.grid, c.epoch,
+			std::span( endpoints ).first( c.endpoints ), 2u, c.gridEpoch );
+		CHECK( plan.validEpoch == c.valid );
+		if ( !c.valid )
+		{
+			CHECK( plan.slots.empty() );
+			continue;
+		}
+		REQUIRE( plan.slots.size() == 3u );
+		CHECK( plan.slots[ 0 ].targetNs == 1'100u );
+		CHECK( plan.slots[ 1 ].targetNs == 1'300u );
+		CHECK( plan.slots[ 1 ].wakeNs == 1'200u );
+		CHECK( plan.slots[ 1 ].phase == 0.5 );
+		CHECK( plan.slots[ 1 ].kind == BidirSlotKind_t::Generated );
+		CHECK( plan.slots[ 1 ].referenceFrameId == 1u );
+		CHECK( plan.slots[ 1 ].endpointFrameId == 2u );
+		CHECK( plan.slots[ 2 ].targetNs == 1'500u );
+	}
+}
+
+TEST_CASE( "a deferred iteration preserves repaint age and its outstanding carriers", "[framegen][deadline][repaint]" )
+{
+	RepaintRequestState_t state = {
+		.yields = 2u, .yieldVBlankNs = 100u, .heldForcedRequests = 3u,
+		.overlayCarrierSeq = 11u, .forcedCarrierSeq = 12u,
+	};
+	RepaintIteration_t prev = {
+		.in = { .forcedRequests = 3u, .targetVBlankNs = 100u, .bidirActive = true },
+		.state = state,
+	};
+	prev.add_paint( PaintOutput_t::Held, PaintOutcome_t::Deferred, true,
+		{ .composited = 20u, .presented = 20u } );
+	REQUIRE_FALSE( prev.ended );
+	// The iteration's carrier log is authoritative, even without an ended paint.
+	state.overlayCarrierSeq = 90u;
+	state.forcedCarrierSeq = 91u;
+	const RepaintStep_t step = step_repaint_requests( state, prev,
+		{ .forcedRequests = 3u, .targetVBlankNs = 200u, .vblank = true, .bidirActive = true } );
+	CHECK( step.state.yields == 2u );
+	CHECK( step.state.yieldVBlankNs == 100u );
+	CHECK( step.state.heldForcedRequests == 3u );
+	CHECK( step.state.overlayCarrierSeq == 11u );
+	CHECK( step.state.forcedCarrierSeq == 12u );
+	CHECK( step.iteration.overlay_carrier() == 11u );
+	CHECK( step.iteration.forced_carrier() == 12u );
+	CHECK_FALSE( step.plan.overlayDrivesPaint );
+	CHECK_FALSE( step.plan.forcedDrivesPaint );
+	CHECK( step.iteration.request_remains() );
+}
+
+TEST_CASE( "retiring a force before a newer overlay lets a reused snapshot paint", "[framegen][deadline][repaint]" )
+{
+	const RepaintRequestState_t state = {
+		.yields = 1u, .yieldVBlankNs = 100u, .heldForcedRequests = 3u,
+		.overlayCarrierSeq = 70u, .forcedCarrierSeq = 50u,
+	};
+	RepaintIteration_t prev = {
+		.in = { .forcedRequests = 3u, .targetVBlankNs = 100u, .bidirActive = true },
+		.state = state,
+	};
+	prev.add_paint( PaintOutput_t::Held, PaintOutcome_t::Presented, false,
+		{ .presented = 50u } );
+	REQUIRE( prev.retiredForced );
+	REQUIRE( prev.request_remains() );
+	const RepaintStep_t step = step_repaint_requests( state, prev,
+		{ .forcedRequests = 3u, .targetVBlankNs = 200u, .vblank = true, .bidirActive = true } );
+	CHECK( step.state.yields == 1u ); // an outstanding overlay keeps the request's age
+	CHECK( step.state.overlayCarrierSeq == 70u );
+	CHECK( step.state.heldForcedRequests == 0u );
+	CHECK( step.state.forcedCarrierSeq == 0u );
+	CHECK( step.plan.forcedDrivesPaint );
+	CHECK_FALSE( step.iteration.retiredForced );
+}
+
 TEST_CASE( "a capped repaint refresh spares an already retired overlay and a new force", "[framegen][deadline][repaint]" )
 {
 	const RepaintRequestState_t state = {
