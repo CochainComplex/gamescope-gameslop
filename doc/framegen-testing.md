@@ -160,6 +160,40 @@ available. Verify even NV12 allocation extents for odd content dimensions,
 separate logical content dimensions, and clamping of padded edges during
 conversion. Driver-reported plane offsets, pitches and allocation size
 remain authoritative. An allocation-wide raw dump is not a packed NV12 file.
+For NV12 DMA-BUF delivery, verify both plane descriptors against the Vulkan
+layout, including unequal pitches and interplane gaps. A single Y stride does
+not describe the UV plane. Consumers may concatenate separately described
+blocks, so their logical UV offset need not equal the physical FD offset.
+Require non-overlapping active plane ranges and checked buffer bounds; compare
+known color patches after decoding, not just buffer counts or alternating hashes.
+The `ycbcr_samplers` contract inspects the compositor's six compiled SPIR-V
+modules: converted descriptors use literal layer indices, feed local explicit-LOD
+sampling, and never cross function calls as opaque sampler arguments. Filtering
+and color helpers exchange ordinary coordinates and texel values. This catches
+resource-selection regressions that can pass validation yet render differently
+across drivers. Also check actual normal/scaled/blur pixels and moving content on
+each available GPU, including an RGB replacement frame; compiled contracts alone
+do not prove conversion, resource retirement, native presentation or performance.
+The `pipewire_buffers` CPU contract exercises descriptor layout and invalid
+geometry when PipeWire support is built.
+SDL and headless presentation do not require DMA-BUF exports for internal
+textures. `backend_exports` checks that their allocation policy preserves
+explicit capture exports and that completed software uploads use known-ready
+handling after explicit event/timeline precedence. Native DRM, Wayland and
+OpenVR retain their existing backend handoff requirements and need separate
+hardware validation.
+Capture checks using software clients must also establish scene progress:
+reused software buffers need fresh per-commit uploads, while live DMA-BUF
+imports retain memoization. The `buffer_import` contract checks both paths,
+retained snapshot pixels and failed-import retries.
+PipeWire advertises its linear DMA-BUF option only when Vulkan reports support
+for the actual capture format, usage and image flags; otherwise its mapped
+MemFd option remains available. A consumer requiring unsupported DMA-BUF caps
+should fail negotiation rather than receive an invalid export or a mislabeled
+MemFd buffer.
+Mapped capture allocations check this support before image creation. Legacy
+flippable allocations, including nested cursor exports, need separate backend
+validation; a capture pass does not certify those paths.
 
 Run the existing nested SDL smoke cases as well as nested Wayland captures:
 they exercise different device-extension and presentation paths. Native DRM,
