@@ -40,7 +40,8 @@ jobs:
               scripts/framegen-net-eval.py scripts/framegen-color-eval.py \
               scripts/framegen-nested-smoke.py scripts/framegen-showcase-report.py \
               scripts/framegen-hindsight-eval.py scripts/framegen-headless-host.py \
-              scripts/framegen-field-gate.py scripts/framegen-temporal-gate.py
+              scripts/framegen-field-gate.py scripts/framegen-temporal-gate.py \
+              scripts/framegen_field_reference.py
           c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
             tests/test_framegen.cpp src/framegen/atomic_file.cpp \
             -o /tmp/gamescope-framegen-contracts

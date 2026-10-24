@@ -307,6 +307,23 @@ the only data eligible for persistence after optimizer divergence. During tests,
 point `GAMESCOPE_FRAMEGEN_NET_PROFILE` at a disposable copy. Never use a known-good
 profile as the writable test destination.
 
+## Offline numerical reference
+
+`scripts/framegen_field_reference.py` owns the shared CPU field/reconstruction
+operators, empirical `Numerics` model and bilinear sampler with analytic
+gradients. It depends only on NumPy and the standard library. The trainer
+re-exports the same sampler; the field gate retains its existing operator
+aliases for temporal analysis and other consumers. File-based script imports
+bootstrap the resolved sibling directory and use the canonical module name.
+Compare different source trees in separate processes to avoid Python's module
+cache mixing their implementations.
+
+Keep CLI parsing, GSFD decoding, scoring, parity thresholds and applicability
+reporting with their existing tools. Moving an operator must preserve expression
+order, dtypes and half-image boundaries, including both sampler gradients used
+in training. The selected model remains empirical: unchanged numerical output
+does not qualify another GPU or turn a failed parity gate into a pass.
+
 ## Validation by change class
 
 **Documentation, launchers, comments:**
