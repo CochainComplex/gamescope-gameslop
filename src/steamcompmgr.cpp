@@ -140,6 +140,7 @@ bool g_bWasPartialComposite = false;
 
 bool ShouldDrawCursor();
 void vulkan_framegen_causal_tick();
+void vulkan_framegen_train_idle();
 uint64_t vulkan_framegen_fixed_refresh_commit_deadline_ns();
 
 std::atomic<uint32_t> g_unCurrentVRSceneAppId;
@@ -1847,16 +1848,20 @@ import_commit (
 		commit->fifo = false;
 	}
 
-	if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+	struct wlr_dmabuf_attributes dmabuf = {0};
+	const bool is_dmabuf = wlr_buffer_get_dmabuf( buf, &dmabuf );
+	if ( is_dmabuf )
 	{
-		// Going from OwningRc -> Rc now.
-		commit->vulkanTex = pTexture;
-		return commit;
+		if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
+		{
+			// Going from OwningRc -> Rc now.
+			commit->vulkanTex = pTexture;
+			return commit;
+		}
 	}
 
-	struct wlr_dmabuf_attributes dmabuf = {0};
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
-	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+	if ( is_dmabuf )
 	{
 		if ( g_bDebugDualGpuRoute )
 		{
@@ -1884,7 +1889,9 @@ import_commit (
 
 	commit->vulkanTex = pOwnedTexture;
 
-	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
+	// DMA-BUF imports share live storage. CPU uploads are per-commit snapshots.
+	if ( is_dmabuf )
+		s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
 
 	return commit;
 }
@@ -8712,7 +8719,10 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 	}
 
 	bool bValidPreemptiveScale = newCommit->pAcquirePoint && pUpscaleFocus && cv_upscale_preemptive;
-	bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale( pUpscaleFocus->eUpscaleFilter, pUpscaleFocus->eUpscaleScaler );
+	// An effect can replace layer 0 with a differently-sized render target.
+	// Its actual dimensions are known only in the ordinary composite path.
+	bool bPreemptiveUpscale = bValidPreemptiveScale && g_reshade_effect.empty()
+		&& newCommit->ShouldPreemptivelyUpscale( pUpscaleFocus->eUpscaleFilter, pUpscaleFocus->eUpscaleScaler );
 
 	bool bKnownReady = false;
 
@@ -8744,7 +8754,10 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		zoomScaleRatio = flOldZoomScale;
 		overscanScaleRatio = flOldOverscanScale;
 
-		PooledImage_t *pTempImage = GetTempUpscaleImage( pUpscaleFocus, g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat );
+		// Reject optional work before reserving a release point. The ordinary
+		// acquire/composite path below still presents this client commit.
+		PooledImage_t *pTempImage = vulkan_prepare_composite_intermediate( &upscaledFrameInfo )
+			? GetTempUpscaleImage( pUpscaleFocus, g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat ) : nullptr;
 		if ( pTempImage )
 		{
 			const uint64_t ulNextReleasePoint = ++pTempImage->ulLastPoint;
@@ -8831,7 +8844,8 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		}
 		else
 		{
-			fence = pClientTexture->memoryFence();
+			// The software-buffer upload completed synchronously during import.
+			bKnownReady = true;
 		}
 	}
 
@@ -11324,6 +11338,7 @@ steamcompmgr_main(int argc, char **argv)
 		publish_mangoapp_snapshot();
 		publish_mangoapp_connector_snapshots();
 		relay_mangoapp_control();
+		vulkan_framegen_train_idle();
 
 		// The VRR timer path is independent of the fixed-refresh deadline: a
 		// zero fixed deadline never reaches clock sampling, timer arming or the

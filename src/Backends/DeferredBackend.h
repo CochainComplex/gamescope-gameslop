@@ -163,6 +163,11 @@ namespace gamescope
             return m_pChild->ImportDmabufToBackend( pDmaBuf );
 		}
 
+		virtual bool UsesDmabufForPresentation() const override
+		{
+            return m_pChild->UsesDmabufForPresentation();
+		}
+
 		virtual bool UsesModifiers() const override
 		{
             return true;

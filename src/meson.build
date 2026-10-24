@@ -236,7 +236,7 @@ gamescope_version = vcs_tag(
   output : 'GamescopeVersion.h',
 )
 
-  executable(
+gamescope_exe = executable(
     'gamescope',
     src, reshade_src, gamescope_version,
     include_directories : [reshade_include, sol2_include],
