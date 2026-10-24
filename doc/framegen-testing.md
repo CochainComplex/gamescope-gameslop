@@ -573,6 +573,17 @@ distribution prints 0.000. `src_rec_ms_*` and `rec_flip_ms_*` split
 
 Learning fields (`train_recorded`, `train_published`, their `_total` watermarks, `train_saved_total`, `train_online`, `train_skip`, `train_skip_n`, `train_rb_dropped`, `train_rb_rejected`) are documented in [Metrics log fields](framegen-reference.md#metrics-log-fields); these harness gates ignore them.
 
+An online-learning check must also inspect those fields and the saved finite GSFP
+set. Use a private per-run profile, verify the Spatial role/encoding key, and
+compare recorded, published and saved totals after orderly shutdown. Reopen the
+same profile with online learning off and verify its bytes remain unchanged.
+Ordinary foreground progress does not exercise idle training below Learned: that
+requires an actual `idle training submitted` log with the serving pipeline below
+Learned, followed by completed finite publication and clean resource retirement.
+An injected degradation rung can check that execution path, but cannot establish
+natural recovery, physical-display behavior, performance or visual quality.
+Keep the existing OFF-inclusive visual and native evidence gates.
+
 `ring_ovf` counts the bidir queue fronts that the output-ring ceiling forced
 out ahead of their planned slot in the window. Each one is an overflow that
 the bidir ring bound (`D_ring`) learns from; it stays 0 outside bidir.

@@ -55,6 +55,7 @@
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
 #include "framegen/hud_history.hpp"
+#include "framegen/learning.hpp"
 #include "framegen/gpu_diagnostics.hpp"
 #include "framegen/metrics.hpp"
 #include "framegen/net_layout.hpp"
@@ -6848,6 +6849,18 @@ struct FramegenMotionResources_t
 	gamescope::OwningRc<CVulkanTexture> netProfileReadback;
 	bool bNetStatePending = false;
 	uint32_t uNetTrainStep = 0;
+	gamescope::framegen::NetTrainingCadence netTrainingCadence;
+	// Optional work is cold after every scene/key/resource change. A completed,
+	// finite non-cut foreground batch first warms the exact pipelines; a later
+	// such batch measures their warm CPU recording cost. No guessed bootstrap.
+	struct LearningCost_t
+	{
+		uint64_t warmedSeqNo = 0;
+		uint64_t pendingRecordSeqNo = 0;
+		uint64_t pendingRecordNs = 0;
+		uint64_t recordCostNs = 0;
+		uint64_t lastAttemptNs = 0;
+	} learning;
 	// True while the last recorded batch routed the warps/probe through the
 	// refined fields; the accessor below keys off it. Batches are strictly
 	// one-in-flight, so a single flag is race-free.
@@ -8256,6 +8269,8 @@ struct FramegenHistory_t
 	// the oversubscription guard: skip new generation while the previous batch
 	// is still running rather than queue work in front of real frames.
 	uint64_t lastGeneratedSeqNo = 0;
+	// Training shares mutable scratch/descriptor resources, not presentation tags.
+	uint64_t lastLearningSeqNo = 0;
 	// Slot planning relative to the current real frame. Real-frame submission
 	// fills the first multiplier-1 slots; the dedicated-queue idle refill can
 	// continue from this counter if the game stalls before the next real frame.
@@ -8352,6 +8367,12 @@ struct FramegenHistory_t
 };
 
 static FramegenHistory_t g_framegenHistory;
+
+static bool framegen_work_completed()
+{
+	return g_device.hasCompletedFramegen( std::max(
+		g_framegenHistory.lastGeneratedSeqNo, g_framegenHistory.lastLearningSeqNo ) );
+}
 
 static void framegen_net_drop_profile_readback()
 {
@@ -9163,6 +9184,7 @@ void vulkan_framegen_invalidate_history( const char *reason )
 	// Forget learned per-rung costs so the new scene is measured afresh rather than
 	// inheriting the old scene's "this rung overruns" verdicts.
 	g_device.framegenResetRungCosts();
+	g_framegenMotion.learning = {};
 	// The adaptation EMAs describe the old scene's content (noise floor,
 	// round-trip ambiguity); a new scene re-calibrates from the defaults.
 	g_framegenHistory.adaptation = {};
@@ -9238,6 +9260,7 @@ void vulkan_framegen_reset( const char *reason )
 	// new workload from the configured pipeline instead of stepping on the old scene's stale
 	// over-deadline measurements.
 	g_device.framegenResetRungCosts();
+	g_framegenMotion.learning = {};
 	g_output.framegenOutputImages.clear();
 	g_output.framegenPresentImages.clear();
 	g_output.framegenCursorHistoryImages.clear();
@@ -11091,6 +11114,8 @@ static void framegen_net_activate_key( uint32_t uKey )
 	g_bFramegenNetStagingStale = true;
 	g_framegenMotion.bNetWeightsUploaded = false;
 	g_framegenMotion.bNetStatePending = true;
+	g_framegenMotion.learning = {};
+	g_device.framegenResetTrainingCost();
 	vk_log.infof( "framegen: net set '%s' active: %s", szName, pszSource );
 }
 
@@ -12315,15 +12340,6 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 		m.uNetTrainStep = 0;
 	}
 
-	// GAMESCOPE_FRAMEGEN_NET_EVERY=N trains on every Nth real frame — the
-	// pressure valve for weak present GPUs (learning just converges slower).
-	static uint32_t s_uFrameCounter = 0;
-	if ( ( s_uFrameCounter++ % framegen_net_online_every() ) != 0 )
-	{
-		framegen_net_note_skip( NetLearningSkip::Every );
-		return false;
-	}
-
 	m.uNetTrainStep++;
 	g_ulFramegenNetProgress++;
 	g_framegenMetricsPendingEvents.trainedSteps++;
@@ -12390,6 +12406,26 @@ static bool framegen_record_net_train( CVulkanCmdBuffer *pCmdBuffer, GamescopeFr
 		return true;
 	}
 	return false;
+}
+
+// Scheduling is outside the GPU recorder so the microbenchmark still measures
+// actual training. Foreground/refill/idle callers share the same per-real decision.
+static bool framegen_record_net_train_pair( CVulkanCmdBuffer *pCmdBuffer,
+	GamescopeFramegenPipeline ePipeline, bool bSceneCutGuard )
+{
+	auto &cadence = g_framegenMotion.netTrainingCadence;
+	const uint64_t pair = g_framegenHistory.currentFrameId;
+	if ( pair == cadence.consideredPair )
+	{
+		framegen_net_note_skip( NetLearningSkip::Reuse );
+		return false;
+	}
+	if ( !cadence.consider( pair, framegen_net_online_every() ) )
+	{
+		framegen_net_note_skip( NetLearningSkip::Every );
+		return false;
+	}
+	return framegen_record_net_train( pCmdBuffer, ePipeline, bSceneCutGuard );
 }
 
 // The actual file write uses a unique same-directory staging file, so a process
@@ -12532,6 +12568,24 @@ static void framegen_net_profile_consume()
 			return;
 		}
 	}
+	if ( h.ulAdaptStatsSeqNo == h.ulNetProfileSeqNo
+		&& g_device.framegenTrainingSampleSeqNo() == h.ulNetProfileSeqNo
+		&& g_device.framegenTrainingCostNs() != 0u
+		&& g_framegenMotion.statsReadback != nullptr
+		&& g_framegenMotion.statsReadback->mappedPixels() != nullptr )
+	{
+		std::array<uint32_t, gamescope::framegen::k_uAdaptationStatsCount> stats;
+		memcpy( stats.data(), g_framegenMotion.statsReadback->mappedPixels(), sizeof( stats ) );
+		const auto measurement = gamescope::framegen::decode_adaptation_stats( stats );
+		if ( measurement && measurement->sceneCut == 0u )
+		{
+			auto &learning = g_framegenMotion.learning;
+			if ( learning.pendingRecordSeqNo == h.ulNetProfileSeqNo )
+				learning.recordCostNs = std::max( learning.recordCostNs, learning.pendingRecordNs );
+			learning.warmedSeqNo = h.ulNetProfileSeqNo;
+		}
+	}
+
 	// Publish only after the full snapshot passes the health check. Swapping keeps
 	// the preceding live allocation as next frame's scratch storage, so a bad
 	// candidate cannot poison persistence and steady-state readback allocates none.
@@ -12623,6 +12677,8 @@ static bool framegen_prepare_motion( CVulkanCmdBuffer *pCmdBuffer, uint32_t widt
 		|| ( bBidir && framegen_net_requested( ePipeline ) && g_framegenMotion.mvFieldRevNet == nullptr )
 		|| ( bCaptureNeedsReverse && !g_framegenMotion.bRecAllocTried ) )
 	{
+		g_framegenMotion.learning = {};
+		g_device.framegenResetTrainingCost();
 		// Full-resolution history is keyed to the same reset as these field
 		// resources. Drop it before rebuilding a different-sized pyramid.
 		g_framegenMotion.lumaReservoir[0] = nullptr;
@@ -13278,7 +13334,8 @@ static void framegen_bidir_drop_queued_real( uint64_t ulRealFrameId )
 
 static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false, uint64_t ulAnchorRealFrameId = 0, bool bExplicitProvisional = false )
 {
-	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0 )
+	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0
+		|| !framegen_work_completed() )
 		return false;
 
 	// Fold the previous batch's adaptation readback into the adaptation state
@@ -13293,6 +13350,9 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 
 	if ( bClearPending )
 		g_framegenHistory.pending.clear();
+
+	const uint64_t ulRecordStartNs = get_time_in_nanos();
+	const bool bLearningPipelinesWarm = g_framegenMotion.learning.warmedSeqNo != 0u;
 
 	// Reserve this interval's output slots up front so an empty batch never
 	// records/submits a command buffer.
@@ -13467,7 +13527,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// explicitly disabled, training retains its previous unguarded behavior.
 	const bool bNetStateReadback = pColorProbe == nullptr
 		&& !bReuseMotion && g_framegenMotion.bNetActive && framegen_net_online_enabled()
-		&& framegen_record_net_train( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
+		&& framegen_record_net_train_pair( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
 	// Mirrors bNetStateReadback above and framegen_net_requested's pipeline gate.
 	if ( pColorProbe != nullptr )
 		framegen_net_note_skip( NetLearningSkip::ColorProbe );
@@ -13571,9 +13631,10 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		}
 	}
 
-	g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
-	// After the end timestamp, like the readback copies below: the meter is
-	// not generation work, so gpu= and the rung costs are meant to exclude it.
+	if ( !bNetStateReadback || !bAdaptProbe )
+		g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
+	// Non-training batches exclude the meter/readback overhead from rung costs.
+	// Trained batches retain the complete cost as their optional-learning bound.
 	// The exclusion is only approximate: under synchronization2 the meter's
 	// dispatches can start while the last warps are still executing, so part of
 	// its cost can land before the end timestamp.
@@ -13589,6 +13650,8 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->copyImage( pColorProbe->reference, g_framegenColorProbe.referenceReadback );
 		pCmdBuffer->hostReadBarrier();
 	}
+	if ( bNetStateReadback && bAdaptProbe )
+		g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
 	// Causal pacing reuses the existing small timestamp table, but causal one-slot work
 	// is keyed by preparation shape instead of the now-constant output count.
 	const uint32_t nCostKey = bDeadlineCostKeying
@@ -13602,9 +13665,15 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	const uint64_t ulWaitCompositeSeqNo =
 		std::max( ulCompositeSeqNo, g_framegenHistory.lastBaseIngestSeqNo );
 	const uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ),
-		ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey );
+		ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey,
+		bNetStateReadback && bAdaptProbe );
 	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
 	const uint64_t ulSubmitNs = get_time_in_nanos();
+	if ( bNetStateReadback && bAdaptProbe && bLearningPipelinesWarm )
+	{
+		g_framegenMotion.learning.pendingRecordSeqNo = ulSeqNo;
+		g_framegenMotion.learning.pendingRecordNs = ulSubmitNs - ulRecordStartNs;
+	}
 
 	for ( const SlotPlan_t &slot : slots )
 	{
@@ -14062,7 +14131,7 @@ static bool framegen_causal_submit( uint64_t ulCompositeSeqNo, bool bCorrectionR
 
 	// One batch in flight, always: the lockless descriptor/timestamp rings and
 	// the cross-queue read pins all depend on it.
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 	{
 		framegen_net_note_skip( NetLearningSkip::Busy );
 		return false;
@@ -14304,7 +14373,7 @@ static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback
 				// prevents replacement while the framegen GPU is busy. Keep the
 				// submitted pixels in that case; this query never waits.
 				const bool bCanReplace = bDiscard
-					&& g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
+					&& framegen_work_completed();
 				if ( !bCanReplace && g_bFramegenDebug )
 					vk_log.infof( "LADDER_RETAIN real_id=%" PRIu64 " raw_target_ns=%" PRIu64
 						" raw_wake_ns=%" PRIu64 " wake_ns=%" PRIu64 " decision_ns=%" PRIu64
@@ -14359,7 +14428,7 @@ static bool framegen_vrr_hybrid_submit( uint64_t ulCompositeSeqNo, uint32_t nMax
 		return false;
 
 	// One batch in flight, always (same invariant as every other submit path).
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 		return false;
 
 	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
@@ -14454,7 +14523,7 @@ static void framegen_apply_vrr_flip_feedback( const DisplayFeedback_t &feedback 
 		return;
 	}
 
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 	{
 		vulkan_framegen_cancel_vrr_hybrid_slot( "generation_in_flight" );
 		return;
@@ -14770,7 +14839,7 @@ static bool framegen_refill_idle()
 		|| g_framegenHistory.lastCompositeSeqNo == 0 || g_framegenHistory.nLastGenerationGapVblanks == 0 )
 		return false;
 
-	if ( !g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo ) )
+	if ( !framegen_work_completed() )
 		return false;
 
 	const uint64_t ulVblankIntervalNs = framegen_display_interval_ns();
@@ -14795,6 +14864,176 @@ static bool framegen_refill_idle()
 	const FramegenEffective_t eff = framegen_effective_config( g_framegenHistory.nDegradeSteps );
 	return framegen_submit_batch( nNextSlot, g_framegenHistory.nLastGenerationGapVblanks, 1,
 		eff, g_framegenHistory.lastCompositeSeqNo, framegen_max_degrade_steps(), false );
+}
+
+// ---------------------------------------------------------------------------
+// Idle learning uses the existing Learned batch through training, without warps.
+// It never creates a generated entry, client commit or presentation-feedback tag.
+static bool framegen_learning_resources_ready( const FramegenDispatch_t &dispatch )
+{
+	const auto &m = g_framegenMotion;
+	const uint32_t scale = framegen_motion_scale();
+	const uint32_t levels = gamescope::framegen::motion_coarse_levels( scale );
+	if ( !dispatch.motionSupported || levels == 0u
+		|| m.width != std::max( 1u, div_roundup( g_framegenHistory.currentReal->width(), scale ) )
+		|| m.height != std::max( 1u, div_roundup( g_framegenHistory.currentReal->height(), scale ) )
+		|| m.lumaFormat != dispatch.motionLumaFormat || m.width < 16u || m.height < 16u
+		|| !m.lumaPrev || !m.lumaCur || !m.mvField || !m.mvFieldFwd || !m.mvFieldRev || !m.mvFieldRevChk
+		|| !m.bNetAllocTried || !m.bStatsAllocTried || !m.netState || !m.netWeightsUpload
+		|| !m.netWeightsGpu || !m.netWeightsPrior || !m.netGradSlices || !m.netProfileReadback
+		|| !m.mvFieldNet || !m.netShadingFocus || !m.statsAccum || !m.statsReadback
+		|| !m.bNetWeightsUploaded || g_bFramegenNetStagingStale || m.bNetStatePending
+		|| ( vulkan_framegen_bidir_active() && !m.mvFieldRevNet ) )
+		return false;
+	for ( uint32_t i = 0; i < levels; i++ )
+		if ( !m.mvFieldCoarse[i] || !m.lumaPrevCoarse[i] || !m.lumaCurCoarse[i] )
+			return false;
+	return true;
+}
+
+static uint64_t framegen_learning_deadline()
+{
+	const auto &h = g_framegenHistory;
+	const uint64_t period = framegen_predicted_interval_ns();
+	if ( period == 0u || h.currentPresentTimeNs == 0u )
+		return 0u;
+	uint64_t deadline = std::min(
+		GetVBlankTimer().CalcNextWakeupTime( true ).ulScheduledWakeupPoint,
+		gamescope::framegen::saturating_add_ns( h.currentPresentTimeNs, period - period / 4u ) );
+	for ( const auto &pending : h.pending )
+		if ( pending.ulWakeDeadlineNs != 0u )
+			deadline = std::min( deadline, pending.ulWakeDeadlineNs );
+	return deadline;
+}
+
+// All images/pipelines are already warm, so recording cannot replace live
+// resources. Abandoning a command restores every CPU publication made by the
+// existing prepare/inference/training helpers; their image tracking is CB-local.
+struct FramegenLearningRecording
+{
+	bool uploaded = g_framegenMotion.bNetWeightsUploaded;
+	bool stagingStale = g_bFramegenNetStagingStale;
+	bool statePending = g_framegenMotion.bNetStatePending;
+	bool netActive = g_framegenMotion.bNetActive;
+	bool uncheckedValid = g_framegenMotion.bUncheckedFieldValid;
+	uint32_t step = g_framegenMotion.uNetTrainStep;
+	gamescope::framegen::NetTrainingCadence cadence = g_framegenMotion.netTrainingCadence;
+	uint64_t cachedFrame = g_framegenMotion.uMotionFieldFrameId;
+	uint64_t cachedInterval = g_framegenMotion.uMotionFieldIntervalNs;
+	uint64_t progress = g_ulFramegenNetProgress;
+	uint64_t trainedSteps = g_framegenMetricsPendingEvents.trainedSteps;
+	gamescope::framegen::NetLearningPair pair = g_framegenNetLearningPair;
+	bool committed = false;
+
+	~FramegenLearningRecording()
+	{
+		if ( committed )
+			return;
+		g_framegenMotion.bNetWeightsUploaded = uploaded;
+		g_bFramegenNetStagingStale = stagingStale;
+		g_framegenMotion.bNetStatePending = statePending;
+		g_framegenMotion.bNetActive = netActive;
+		g_framegenMotion.bUncheckedFieldValid = uncheckedValid;
+		g_framegenMotion.uNetTrainStep = step;
+		g_framegenMotion.netTrainingCadence = cadence;
+		g_framegenMotion.uMotionFieldFrameId = cachedFrame;
+		g_framegenMotion.uMotionFieldIntervalNs = cachedInterval;
+		g_ulFramegenNetProgress = progress;
+		g_framegenMetricsPendingEvents.trainedSteps = trainedSteps;
+		g_framegenNetLearningPair = pair;
+	}
+};
+
+// Called after the compositor serviced this iteration's presentation. Only the
+// scratch owner token changes; queued presentation completion tokens stay intact.
+void vulkan_framegen_train_idle()
+{
+	auto &h = g_framegenHistory;
+	auto &m = g_framegenMotion;
+	if ( !vulkan_framegen_is_enabled() || !g_device.hasFramegenQueue()
+		|| ( h.bBaseLayer && g_device.framegenFamilySplit() )
+		|| !g_bFramegenNetKeyActive || !framegen_net_online_enabled()
+		|| !framegen_net_requested( g_eFramegenPipeline )
+		|| !framegen_adapt_enabled( g_eFramegenPipeline )
+		|| framegen_record_dir() != nullptr || framegen_color_record_dir() != nullptr
+		|| !h.valid || !h.previousReal || !h.currentReal
+		|| ( framegen_hud_level() != 0u && !h.bBaseLayer
+			&& !( h.bHudFreePrevious && h.bHudFreeCurrent ) ) )
+		return;
+	const auto effective = framegen_effective_config( h.nDegradeSteps );
+	if ( effective.mode == GamescopeFramegenMode::Motion
+		&& effective.pipeline >= GamescopeFramegenPipeline::Learned )
+		return;
+	// Recycle completed buffers before the admission clock; optional recording
+	// must not pay cold allocation or synchronous pipeline compilation.
+	g_device.framegenGarbageCollect();
+	if ( !g_device.hasCompletedFramegen( h.lastFramegenWorkSeqNo )
+		|| !framegen_work_completed()
+		|| !g_device.hasCompleted( std::max( h.lastCompositeSeqNo, h.lastBaseIngestSeqNo ) ) )
+		return;
+	framegen_net_profile_consume();
+	framegen_adapt_consume( effective.pipeline );
+	const auto &dispatch = framegen_dispatch_for_format( h.drmFormat );
+	if ( !framegen_learning_resources_ready( dispatch )
+		|| m.learning.warmedSeqNo == 0u || m.learning.recordCostNs == 0u )
+		return;
+	const uint64_t now = get_time_in_nanos();
+	if ( !gamescope::framegen::background_learning_due( m.learning.lastAttemptNs,
+		now, h.currentFrameId, m.netTrainingCadence.consideredPair ) )
+		return;
+	// A deliberate cadence skip is a CPU-only decision, kept across idle polls.
+	if ( !m.netTrainingCadence.due( h.currentFrameId, framegen_net_online_every() ) )
+	{
+		m.netTrainingCadence.consider( h.currentFrameId, framegen_net_online_every() );
+		framegen_net_note_skip( NetLearningSkip::Every );
+		return;
+	}
+	const uint64_t gpuCost = g_device.framegenTrainingCostNs();
+	const uint64_t deadline = framegen_learning_deadline();
+	if ( !gamescope::framegen::background_learning_fits(
+		now, deadline, gpuCost, m.learning.recordCostNs ) )
+		return;
+	m.learning.lastAttemptNs = now;
+	FramegenLearningRecording transaction;
+	auto cmd = g_device.commandBuffer( true );
+	if ( !cmd )
+		return;
+	cmd->markFramegen();
+	const int query = g_device.framegenTimestampBegin( cmd.get() );
+	if ( query < 0 || !framegen_prepare_motion( cmd.get(), h.currentReal->width(),
+		h.currentReal->height(), dispatch, GamescopeFramegenPipeline::Learned ) )
+		return;
+	framegen_record_net( cmd.get(), m.width, m.height, vulkan_framegen_bidir_active() );
+	framegen_record_adapt_probe( cmd.get(), m.width, m.height );
+	const bool readback = framegen_record_net_train_pair( cmd.get(),
+		GamescopeFramegenPipeline::Learned, true );
+	if ( !readback || g_ulFramegenNetProgress == transaction.progress )
+		return;
+	g_device.framegenTimestampEnd( cmd.get(), query );
+	const uint64_t finalNow = get_time_in_nanos();
+	// A real scheduling hitch is still real CPU cost, even when no GPU work ran.
+	m.learning.recordCostNs = std::max( m.learning.recordCostNs, finalNow - now );
+	if ( !gamescope::framegen::background_learning_fits( finalNow,
+		std::min( deadline, framegen_learning_deadline() ), gpuCost ) )
+		return;
+	const uint64_t seq = g_device.submitFramegen( std::move( cmd ),
+		std::max( h.lastCompositeSeqNo, h.lastBaseIngestSeqNo ), query, 0u, 0u, true );
+	transaction.committed = true;
+	m.uMotionFieldFrameId = 0u;
+	m.uMotionFieldIntervalNs = 0u;
+	m.bNetActive = false;
+	h.ulAdaptStatsSeqNo = 0u;
+	h.ulAdaptConsumedSeqNo = 0u;
+	h.lastFramegenWorkSeqNo = seq;
+	h.lastLearningSeqNo = seq;
+	h.genReadA = h.previousReal;
+	h.genReadB = h.currentReal;
+	h.genReadSeqNo = seq;
+	h.ulNetProfileSeqNo = seq;
+	if ( g_bFramegenDebug )
+		vk_log.infof( "framegen: idle training submitted real id=%" PRIu64 " seq=%" PRIu64
+			" effective=%s progress=%" PRIu64, h.currentFrameId, seq,
+			gamescope::framegen::pipeline_name( effective.pipeline ), g_ulFramegenNetProgress );
 }
 
 // ---------------------------------------------------------------------------
@@ -15793,7 +16032,7 @@ static void framegen_record_real_frame( gamescope::Rc<CVulkanTexture> pRealFrame
 	// adding real-frame latency.
 	const bool bLeavesEmptyVblank = gamescope::framegen::leaves_empty_vblank(
 		now, ulPrevRealFrameTimeNs, ulVblankIntervalNs );
-	const bool bGpuHasHeadroom = g_device.hasCompletedFramegen( g_framegenHistory.lastGeneratedSeqNo );
+	const bool bGpuHasHeadroom = framegen_work_completed();
 	const bool bGeneratable = bLeavesEmptyVblank && bGpuHasHeadroom;
 	const bool bCanSpeculate = g_device.hasFramegenQueue() && bGpuHasHeadroom && ulPrevRealFrameTimeNs != 0;
 	const uint32_t nShadowConfidence = g_framegenHistory.valid
