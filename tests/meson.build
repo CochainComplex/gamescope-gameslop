@@ -39,7 +39,10 @@ if get_option('enable_gamescope_wsi_layer')
 		dependencies: [catch2_dep, vkroots_dep, vulkan_dep, dep_xcb, dep_x11, dep_x11_xcb, glm_dep, wayland_client, wayland_server],
 	)
 	test('present_timing', present_timing_layer_tests, args: ['[present_timing]'])
-	test('present_timing_layer', present_timing_layer_tests, args: ['[present_timing_layer]'])
+	# WSI preferences are cached on first use; keep driver-contract fixtures
+	# independent of the developer's launcher settings and their legacy aliases.
+	test('present_timing_layer', present_timing_layer_tests, args: ['[present_timing_layer]'],
+		env: ['GAMESCOPE_WSI_MIN_IMAGE_COUNT=3', 'GAMESCOPE_WSI_ENSURE_MIN_IMAGE_COUNT=0'])
 endif
 
 test_framegen = executable(

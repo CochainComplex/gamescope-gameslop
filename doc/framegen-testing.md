@@ -133,6 +133,20 @@ Use the same `W`, `H`, `HZ`, `RENDER_DEV`, `PRESENT_DEV` and `CLIENT` on
 
 ## Vulkan validation
 
+The `present_timing_layer` Meson test exercises the actual WSI layer through a
+fake driver. Its `[surface_counts]` cases characterize capability-field and
+caller-chain forwarding, maintenance-mode injection during swapchain creation,
+and active versus retired acquire requests. Creation stops at a deliberate
+driver error before allocating Wayland protocol objects. These CPU tests do not
+establish GPU synchronization, XCB fallback behavior or frame pacing.
+
+The known image-count mismatch remains open: the layer can advertise three
+images although the downstream surface requires four. A correction must account
+for forced MAILBOX limits, capability-query modes and bypass/fallback surfaces;
+raising only the creation count leaves application acquisition guarantees
+inconsistent. The characterization tests do not certify that mismatch as valid
+behavior or imply that it has been fixed.
+
 From the repository root, use the checked-in settings (tested with Vulkan
 Validation Layers 1.4.304) and retain loader output proving which library was
 loaded:
