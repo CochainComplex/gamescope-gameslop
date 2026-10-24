@@ -475,6 +475,33 @@ x2, x3, and x4 (in forward mode the multiplier changes only buffer sizes, in bid
 low source rate, a scene cut, and presenter overload. Report quality and timing;
 an image-quality gain that introduces cadence misses is not a net improvement.
 
+### Repowise synchronization
+
+Run repository analysis outside timing and A/B campaigns, using their shared
+campaign lock. Check the actual checkout and preserve unrelated edits first.
+When incremental updates leave stale pages or incomplete analysis, reconcile the
+configured repository and persist a whole-repository health run:
+
+```sh
+repowise update --no-workspace --full --yes --docs --no-agents --no-cost-tracking
+repowise health --no-workspace --recompute
+repowise doctor --no-workspace --quick --format json
+repowise status --format json
+repowise doc-drift --no-workspace --check --format json
+```
+
+In Repowise 0.59, the unfiltered default-table health recomputation persists its
+results; JSON or file-filtered recomputation only reports them. Verify stored
+health through MCP as well as CLI output, including the analyzed revision and
+available coverage. Keep genuine findings; freshness does not mean a clean score.
+
+Regenerate coverage through the relevant tests before ingesting a fresh report
+with `repowise coverage add <report> --strict`. Its measurement revision follows
+the report's modification time, rather than ingestion time. Preserve original
+reports and their timestamps. After committing, verify synchronization against
+the new `HEAD`, including pending work and stale-page checks. Keep generated
+databases, pages, coverage reports and local receipts out of commits.
+
 ## Publication checklist
 
 - No absolute home paths, private benchmark locations, serials, credentials, or
