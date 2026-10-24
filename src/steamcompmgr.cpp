@@ -193,7 +193,7 @@ namespace gamescope
 
 static std::unordered_map<std::string, uint64_t> g_vramCapacities;
 
-static const char *cgroupPathFromPID(pid_t pid) {
+static char *cgroupPathFromPID(pid_t pid) {
 	if (!pid)
 		return NULL;
 
@@ -5486,14 +5486,17 @@ determine_and_apply_focus( global_focus_t *pFocus )
 
 	pid_t newFocusedWindowPID = pFocus->focusWindow ? pFocus->focusWindow->pid : 0;
 	if (sdFocusWindow_pid != newFocusedWindowPID) {
-		const char *unfocusedWindowCGroup = cgroupPathFromPID(sdFocusWindow_pid);
-		const char *focusedWindowCGroup = cgroupPathFromPID(newFocusedWindowPID);
+		char *unfocusedWindowCGroup = cgroupPathFromPID(sdFocusWindow_pid);
+		char *focusedWindowCGroup = cgroupPathFromPID(newFocusedWindowPID);
 		bool sameUnit = unfocusedWindowCGroup && focusedWindowCGroup && !strcmp(unfocusedWindowCGroup, focusedWindowCGroup);
 
 		if (unfocusedWindowCGroup && !sameUnit)
 			setDMemMemoryLow(unfocusedWindowCGroup, false);
 		if (focusedWindowCGroup && !sameUnit)
 			setDMemMemoryLow(focusedWindowCGroup, true);
+
+		free(unfocusedWindowCGroup);
+		free(focusedWindowCGroup);
 	}
 
 	if ( pFocus->pVirtualConnector && pFocus->inputFocusWindow )
