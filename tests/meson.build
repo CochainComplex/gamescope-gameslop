@@ -102,3 +102,6 @@ test_vblank_grid = executable(
 	cpp_args: gamescope_cpp_args,
 )
 test('vblank_grid', test_vblank_grid)
+
+test('framegen_nested_smoke', find_program('python3'),
+	args: files('test_framegen_nested_smoke.py'), timeout: 30)

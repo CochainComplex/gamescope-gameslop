@@ -520,6 +520,14 @@ Terms used in the table and bullets:
       contains a transition may be 2(D + T): up to D + T since the last
       present before it, then up to D + T from the prime's record to its
       present, which holds because the prime records at the cut.
+      Interior gaps use compositor monotonic `selection_ns` stamps from the
+      existing `presented` debug lines when both endpoints provide them.
+      Metrics-window and transition membership still use receipt time. Synthetic
+      start/end edges and legacy or mixed logs retain receipt-time comparison;
+      the evidence reports the timing source. Malformed or non-increasing event
+      stamps fail explicitly. The D + T and 2 ms allowances are unchanged.
+      These events record output selection, before backend submission/feedback;
+      they do not establish physical presentation or input-to-panel latency.
   - After the focus change: the first
     `framegen: priming history with real frame id=ID`, then the first real
     frame present (delayed or live) logged after it with an id of at least
