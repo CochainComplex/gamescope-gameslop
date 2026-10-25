@@ -1466,8 +1466,8 @@ RATE=120 scripts/framegen-capture.sh xonotic120 1280 720 20 30 -- /path/to/vsync
 ### Field gate
 
 ```text
-framegen-field-gate.py --size WxH [--stride N] [--arms a,b,...] [--domain coded|linear] [--net weights.bin] [--captures DIR] NAME...
-framegen-field-gate.py --parity DIR
+framegen-field-gate.py --size WxH --reference-model subtexel8-fp32-rtz [--stride N] [--arms a,b,...] [--domain coded|linear] [--net weights.bin] [--captures DIR] NAME...
+framegen-field-gate.py --parity DIR --reference-model subtexel8-fp32-rtz
 ```
 
 A numpy port of the production field chain (luma pair, pyramid, matcher,
@@ -1501,9 +1501,28 @@ The port's numbers count only while it reproduces the GPU. `--parity DIR` checks
 that: it runs the `checked/8` chain on the lumas of `GAMESCOPE_FRAMEGEN_RECORD`
 samples (captured as in [Offline prediction-error split](#offline-prediction-error-split-s1s2))
 and compares both fields, forward and reverse, with the ones the GPU recorded. It
-fails below 99.9% identical vectors, above a mean confidence error of 0.01 in any
-field, or on non-finite values. The last result was 99.997% identical vectors and
-a worst-field mean confidence error of 0.00019.
+fails below 99.9% matching vectors (maximum component error <0.02), above a mean
+confidence error of 0.01 in any field, or on non-finite values. All pixels count,
+including zero-confidence vectors. The old 99.997% result described one historical
+capture; broader retained/current143-pair sets failed with the old unquantized port.
+
+Both CLIs require explicit `--reference-model subtexel8-fp32-rtz`.
+GSFD v1 has no numerical provenance: selection declares assumptions and the tools
+print that capture applicability is unverified. The model snaps pyramid sampler
+fractions to an 8-bit grid, retains float32 interpolation, and uses RTZ half
+transport at actual image boundaries. Finite half overflow saturates; non-finite
+values remain invalid. Matching, refinement and forward-backward arithmetic are
+unchanged. No model is selected from a vendor name.
+
+This model passed three recorded AMD/RADV corpora (143, 143 and 180 pairs); those
+results do not establish device-wide or Vulkan-wide applicability. On the recorded
+NVIDIA 143-pair corpus, this model matches 99.6469% of vectors (required 99.9%);
+confidence MAE 0.005769 and finite checks pass. NVIDIA parity remains unresolved;
+experimental half-filter alternatives also failed and are not exposed as options.
+Neither a numeric PASS nor a FAIL proves
+capture applicability or a GPU defect. Qualify matching sampler/storage controls
+and a broad corpus before using offline rankings; a small passing capture cannot
+dismiss a broader failure. The vector/confidence/finite gates remain unchanged.
 
 Parity reaches only the `checked/8` field chain. The samples are /8 and hold the
 checked fields before refinement (`GAMESCOPE_FRAMEGEN_RECORD` is ignored while
@@ -1513,7 +1532,7 @@ the refiner.
 ### Temporal gate
 
 ```text
-framegen-temporal-gate.py --size WxH [--k 2,3] [--arms hold,checked/8,checked/4] [--stride N] [--domain coded|linear] [--methods predictive,bidir] [--captures DIR] NAME...
+framegen-temporal-gate.py --size WxH --reference-model subtexel8-fp32-rtz [--k 2,3] [--arms hold,checked/8,checked/4] [--stride N] [--domain coded|linear] [--methods predictive,bidir] [--captures DIR] NAME...
 ```
 
 Tearing and flicker are temporal: a generated frame can be close to the truth on
@@ -1546,9 +1565,9 @@ the capture and the truth is not evenly spaced.
 
 ### What the gates predicted and what they missed
 
-- The port reproduces the GPU: the last `--parity` run gave 99.997% identical
-  vectors and a worst-field mean confidence error of 0.00019, well inside the
-  limits.
+- The historical 99.997% parity result was capture-specific. Broader captures
+  exposed missing half-storage and sampler modeling; qualify the explicit model
+  on the matching implementation before using offline rankings.
 - The temporal gate did not predict the eye on swarms. It scored /4 better than
   /8 on flicker on every content class, yet in the blind A/Bs /4 looked crisper on
   Xonotic, tied on vkmark and looked blocky on GravityMark. The metric
