@@ -5,7 +5,8 @@ framegen-field-gate.py scores one generated frame at phase 1.0 (predictive) or
 0.5 (bidir). Tearing and flicker are temporal: a generated frame can be close to
 the truth on its own and still jump against its neighbours. This gate replays
 the displayed sequence instead, on the same numpy port of the production chain
-(checked with framegen-field-gate.py --parity).
+(checked with framegen-field-gate.py --parity and the same explicit
+--reference-model assumptions).
 
 Ground truth at the in-between phases: capture faster than the simulated source
 (framegen-capture.sh with RATE=120 and a vsynced client), then treat every k-th
@@ -37,7 +38,8 @@ sharp fallback by default; suffix @xf selects the crossfade fallback
 Paired change vs the first arm with a 95% bootstrap interval, for flick.
 
   framegen-temporal-gate.py --size 1280x720 --k 2,3 [--arms hold,checked/8,checked/4]
-                            [--stride 8] [--domain coded|linear] NAME...
+                            [--stride 8] [--domain coded|linear]
+                            --reference-model subtexel8-fp32-rtz NAME...
 """
 
 import argparse
@@ -61,12 +63,12 @@ def changed(frames, lo=4 / 255):
     return np.max([np.abs(f - frames[0]) for f in frames[1:]], axis=0) > lo
 
 
-def fields(arm, a, b, domain):
+def fields(arm, a, b, domain, *, numerics):
     lum = G.linear if domain == "linear" else (lambda x: x)
-    return G.arm_fields(lum(a), lum(b), arm, None)
+    return G.arm_fields(lum(a), lum(b), arm, None, numerics=numerics)
 
 
-def shown(method, arm, f, i, k, domain):
+def shown(method, arm, f, i, k, domain, *, numerics):
     """The displayed sequence f[i] .. f[i+k] for one arm, and its flip rate (or None)."""
     B, C = f[i], f[i + k]
     if arm == "hold":
@@ -74,11 +76,11 @@ def shown(method, arm, f, i, k, domain):
     arm, _, out = arm.partition("@")
     if method == "predictive":
         A = f[i - k]
-        X, _, s = fields(arm, A, B, domain)
-        Xp, _, _ = fields(arm, f[i - 2 * k], A, domain)
+        X, _, s = fields(arm, A, B, domain, numerics=numerics)
+        Xp, _, _ = fields(arm, f[i - 2 * k], A, domain, numerics=numerics)
         gen = [G.predict(A, B, X, s, j / k, sharp=out != "xf") for j in range(1, k)]
         return [B] + gen + [C], flip_rate(Xp, X, s)
-    X, Y, s = fields(arm, B, C, domain)
+    X, Y, s = fields(arm, B, C, domain, numerics=numerics)
     return [B] + [G.interpolate(B, C, X, Y, s, j / k) for j in range(1, k)] + [C], None
 
 
@@ -110,7 +112,7 @@ def score(seq, truth, mask):
     return E, flick, eflick, lost, false
 
 
-def interval(f, i, k, arms, domain, methods):
+def interval(f, i, k, arms, domain, methods, *, numerics):
     truth = [f[i + j] for j in range(k + 1)]
     mask = changed(truth)
     if mask.sum() < 500:
@@ -118,7 +120,7 @@ def interval(f, i, k, arms, domain, methods):
     rows = {}
     for method in methods:
         for arm in arms:
-            seq, flip = shown(method, arm, f, i, k, domain)
+            seq, flip = shown(method, arm, f, i, k, domain, numerics=numerics)
             rows[(method, arm)] = score(seq, truth, mask) + (flip,)
     return rows
 
@@ -133,10 +135,13 @@ def main():
     ap.add_argument("--arms", default="hold,checked/8,checked/4")
     ap.add_argument("--domain", choices=("coded", "linear"), default="coded")
     ap.add_argument("--methods", default="predictive,bidir")
+    G.add_numerics_arguments(ap)
     args = ap.parse_args()
+    numerics = G.numerics_from_args(ap, args)
     w, h = (int(v) for v in args.size.split("x"))
     arms, methods = args.arms.split(","), args.methods.split(",")
     rng = np.random.default_rng(1)
+    print(f"assumed numerics: {numerics.model_id}; capture applicability unverified")
     print(f"{args.size} {args.domain}: E | flick [paired change vs {arms[0]}, 95% CI] | eflick | lost | false | flip")
     for name in args.names:
         f = np.fromfile(args.captures / f"{name}-{args.size}.gray", np.uint8).reshape(-1, h, w)
@@ -145,7 +150,7 @@ def main():
             print(f"{name}: {dup:.1%} repeated frames, the client was slower than the capture; truth is not evenly spaced")
         f = f.astype(np.float32) / 255
         for k in (int(v) for v in args.k.split(",")):
-            rows = [r for r in (interval(f, i, k, arms, args.domain, methods)
+            rows = [r for r in (interval(f, i, k, arms, args.domain, methods, numerics=numerics)
                                 for i in range(2 * k, len(f) - k, args.stride * k)) if r]
             if not rows:
                 print(f"{name} k={k}: no interval with motion")

@@ -33,18 +33,21 @@ Captures come from framegen-capture.sh (NAME-WxH.gray). Arms:
   ...@xf                     predictive output with the crossfade fallback
                              (GAMESCOPE_FRAMEGEN_SHARP_FALLBACK=0)
 
-  framegen-field-gate.py --size 1280x720 [--stride 6] [--arms a,b,...] [--domain coded|linear] NAME...
+  framegen-field-gate.py --size 1280x720 --reference-model subtexel8-fp32-rtz [--stride 6] [--arms a,b,...] [--domain coded|linear] NAME...
 
 The port's numbers count only while it reproduces the GPU. --parity DIR runs
 the checked/8 chain on the lumas of GAMESCOPE_FRAMEGEN_RECORD samples (GSFD)
 and compares with both fields the GPU recorded; it fails below 99.9% identical
-vectors, above a mean confidence error of 0.01 in any field, or on non-finite
-values.
+vectors (max-component error < 0.02), above a mean confidence error of 0.01 in any field, or on non-finite
+values. Explicit sampler assumptions and half-float pass storage are empirical;
+GSFD v1 does not record numerical provenance. Validate the selected model
+against captures from the matching implementation before interpreting rankings.
 
-  framegen-field-gate.py --parity DIR
+  framegen-field-gate.py --parity DIR --reference-model subtexel8-fp32-rtz
 """
 
 import argparse
+from dataclasses import dataclass
 import importlib.util
 import sys
 from pathlib import Path
@@ -96,14 +99,64 @@ def base_luma(full, s):
     cy, cx = np.mgrid[0:lh, 0:lw].astype(np.float32)
     yc, xc = (cy + 0.5) / lh * h, (cx + 0.5) / lw * w
     oy, ox = 0.25 / lh * h, 0.25 / lw * w
-    return (sum(bilinear(full, yc + a * oy, xc + b * ox) for a in (-1, 1) for b in (-1, 1)) * 0.25).astype(np.float32)
+    return half_store((sum(bilinear(full, yc + a * oy, xc + b * ox) for a in (-1, 1) for b in (-1, 1)) * 0.25).astype(np.float32))
 
 
-def half(img):
+def half_store(image):
+    """Empirical RTZ image transport, preserving non-finites for the finite gate.
+
+    Vulkan permits other adjacent results. This is a selected reference model,
+    not a device-independent rounding guarantee. Finite overflow saturates to
+    signed max-half; underflow preserves the sign of zero.
+    """
+    raw = np.asarray(image)
+    with np.errstate(over="ignore", invalid="ignore"):
+        rounded = raw.astype(np.float16)
+        rounded = np.where(np.abs(rounded.astype(np.float32)) > np.abs(raw),
+                           np.nextafter(rounded, np.zeros_like(rounded)), rounded)
+    return rounded.astype(np.float32)
+
+
+REFERENCE_MODEL = "subtexel8-fp32-rtz"
+
+
+@dataclass(frozen=True)
+class Numerics:
+    model_id: str
+
+    def __post_init__(self):
+        if self.model_id != REFERENCE_MODEL:
+            raise ValueError("unsupported empirical reference model")
+
+    @property
+    def subtexel_bits(self):
+        return 8
+
+
+def add_numerics_arguments(parser):
+    parser.add_argument("--reference-model", choices=(REFERENCE_MODEL,),
+                        help="explicit empirical sampler and image-storage assumptions; no device applicability is inferred")
+
+
+def numerics_from_args(parser, args):
+    if args.reference_model is None:
+        parser.error("--reference-model is required; GSFD v1 carries no numerical provenance. "
+                     "Qualify the selected assumptions on matching captures before interpreting offline comparisons.")
+    return Numerics(args.reference_model)
+
+
+def half(img, *, numerics):
     h, w = img.shape
     lh, lw = max(1, -(-h // 2)), max(1, -(-w // 2))
     cy, cx = np.mgrid[0:lh, 0:lw].astype(np.float32)
-    return bilinear(img, (cy + 0.5) / lh * h, (cx + 0.5) / lw * w).astype(np.float32)
+    def snap(coordinate):
+        relative = coordinate - 0.5
+        whole = np.floor(relative)
+        steps = 1 << numerics.subtexel_bits
+        return whole + np.rint((relative - whole) * steps) / steps + 0.5
+
+    filtered = bilinear(img, snap((cy + 0.5) / lh * h), snap((cx + 0.5) / lw * w)).astype(np.float32)
+    return half_store(filtered)
 
 
 def _fetch(img, y, x):
@@ -191,13 +244,13 @@ def _refine(prev, cur, coarse, final):
     return _conf_subpixel(cur9, prev, yy, xx, bmy, bmx, bestSad, zero)
 
 
-def field_from_base(prev_b, cur_b, s):
+def field_from_base(prev_b, cur_b, s, *, numerics):
     levels = [(prev_b, cur_b)]
     while s * 2 ** (len(levels) - 1) < COARSEST:
-        levels.append((half(levels[-1][0]), half(levels[-1][1])))
-    f = _match(*levels[-1])
+        levels.append((half(levels[-1][0], numerics=numerics), half(levels[-1][1], numerics=numerics)))
+    f = half_store(_match(*levels[-1]))
     for i in range(len(levels) - 2, -1, -1):
-        f = _refine(levels[i][0], levels[i][1], f, i == 0)
+        f = half_store(_refine(levels[i][0], levels[i][1], f, i == 0))
     return f
 
 
@@ -230,15 +283,22 @@ def fbcheck(F, R, tol):
     return np.concatenate([out[..., :3], errc[..., None]], -1)
 
 
+def checked_pair(prev_b, cur_b, s, *, numerics):
+    """Compose the original operators at their actual half-float image boundaries."""
+    forward = field_from_base(prev_b, cur_b, s, numerics=numerics)
+    reverse = field_from_base(cur_b, prev_b, s, numerics=numerics)
+    tol = FB_TOL * 8 / s
+    return half_store(fbcheck(forward, reverse, tol)), half_store(fbcheck(reverse, forward, tol))
+
+
 # ---------------------------------------------------------------- arms
 
-def arm_fields(prev_l, cur_l, arm, net):
+def arm_fields(prev_l, cur_l, arm, net, *, numerics):
     """Checked forward (cur-anchored) and reverse fields, and the scale."""
     s = 4 if "/4" in arm else 8
     pb, cb = base_luma(prev_l, s), base_luma(cur_l, s)
-    Fw, Rv = field_from_base(pb, cb, s), field_from_base(cb, pb, s)
+    X, Y = checked_pair(pb, cb, s, numerics=numerics)
     tol = FB_TOL * 8 / s
-    X, Y = fbcheck(Fw, Rv, tol), fbcheck(Rv, Fw, tol)
     for suffix in arm.split("+")[1:]:
         X, Y = (post(X, suffix, tol), post(Y, suffix, tol))
     if arm.startswith("learned"):
@@ -318,14 +378,14 @@ def score(pred, truth, fallback):
             float(np.maximum(gt - gp, 0)[chg].mean()), float(np.maximum(gp - gt, 0)[chg].mean()))
 
 
-def triplet(A, B, C, arms, net, domain):
+def triplet(A, B, C, arms, net, domain, *, numerics):
     Al, Bl, Cl = (linear(A), linear(B), linear(C)) if domain == "linear" else (A, B, C)
     rows = {}
     for arm in arms:
         field, _, out = arm.partition("@")
-        X, _, s = arm_fields(Al, Bl, field, net)
+        X, _, s = arm_fields(Al, Bl, field, net, numerics=numerics)
         rp = score(predict(A, B, X, s, sharp=out != "xf"), C, B)
-        X, Y, s = arm_fields(Al, Cl, field, net)
+        X, Y, s = arm_fields(Al, Cl, field, net, numerics=numerics)
         rb = score(interpolate(A, C, X, Y, s), B, 0.5 * (A + C))
         if rp is None or rb is None:
             return None
@@ -342,7 +402,7 @@ def distinct_frames(path, w, h):
 PARITY_VECTORS, PARITY_CONF_MAE = 0.999, 0.01  # share of identical vectors, mean |conf error|
 
 
-def parity(rec_dir, every=7):
+def parity(rec_dir, every=7, *, numerics):
     """Does the port reproduce the GPU's checked /8 fields (vectors and confidence,
     both directions) from the lumas of GSFD samples?"""
     files = sorted(Path(rec_dir).glob("fg_*.bin"))[::every]
@@ -351,8 +411,8 @@ def parity(rec_dir, every=7):
     match, mae = [], []
     for f in files:
         lp, lc, gpu_fwd, gpu_rev = T.load_sample(f)
-        Fw, Rv = field_from_base(lp, lc, 8), field_from_base(lc, lp, 8)
-        for port, gpu in ((fbcheck(Fw, Rv, FB_TOL), gpu_fwd), (fbcheck(Rv, Fw, FB_TOL), gpu_rev)):
+        forward, reverse = checked_pair(lp, lc, 8, numerics=numerics)
+        for port, gpu in ((forward, gpu_fwd), (reverse, gpu_rev)):
             gpu = gpu.astype(np.float32)[..., :3]
             if not (np.isfinite(port[..., :3]).all() and np.isfinite(gpu).all()):
                 print(f"parity: non-finite field in {f.name}")
@@ -360,8 +420,9 @@ def parity(rec_dir, every=7):
             match.append(float((np.abs(port[..., :2] - gpu[..., :2]).max(-1) < 0.02).mean()))
             mae.append(float(np.abs(port[..., 2] - gpu[..., 2]).mean()))
     m, e = float(np.mean(match)), float(np.max(mae))
-    print(f"parity over {len(files)} GSFD pairs, both directions: vectors {m * 100:.3f}% identical, "
-          f"worst confidence MAE {e:.5f} (limits {PARITY_VECTORS * 100:.1f}%, {PARITY_CONF_MAE})")
+    print(f"{numerics.model_id}: parity over {len(files)} GSFD pairs, both directions: vectors {m * 100:.3f}% identical, "
+          f"worst confidence MAE {e:.5f} (limits {PARITY_VECTORS * 100:.1f}%, {PARITY_CONF_MAE}); "
+          "capture applicability unverified (GSFD v1 has no numerical provenance)")
     return 0 if m >= PARITY_VECTORS and e <= PARITY_CONF_MAE else 1
 
 
@@ -377,19 +438,22 @@ def main():
     ap.add_argument("--net-key", type=NE.parse_key, help="profile set key, when it holds several")
     ap.add_argument("--domain", choices=("coded", "linear"), default="coded",
                     help="matching domain; coded is production for 8/10-bit content")
+    add_numerics_arguments(ap)
     args = ap.parse_args()
+    numerics = numerics_from_args(ap, args)
     if args.parity:
-        return parity(args.parity)
+        return parity(args.parity, numerics=numerics)
     if not args.names or not args.size:
         ap.error("NAME... and --size are required without --parity")
     w, h = (int(v) for v in args.size.split("x"))
     arms = args.arms.split(",")
     net = NE.load_blob(args.net, args.net_key) if args.net else None
     rng = np.random.default_rng(1)
+    print(f"assumed numerics: {numerics.model_id}; capture applicability unverified")
     print(f"{args.size} {args.domain}: paired change vs {arms[0]} [95% CI] | sta (drag) | lost edges (smear) | false edges (tearing)")
     for name in args.names:
         f = distinct_frames(args.captures / f"{name}-{args.size}.gray", w, h)
-        rows = [r for r in (triplet(f[i - 1], f[i], f[i + 1], arms, net, args.domain)
+        rows = [r for r in (triplet(f[i - 1], f[i], f[i + 1], arms, net, args.domain, numerics=numerics)
                             for i in range(1, len(f) - 1, args.stride)) if r]
         if not rows:
             print(f"{name}: no triplet with motion")
