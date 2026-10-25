@@ -552,6 +552,8 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
+bool vulkan_prepare_composite_intermediate( const FrameInfo_t *frameInfo );
+
 // bForceFramegenHud: draw the framegen HUD even though this is an override
 // composite. Only the generated-frame presents pass true: the swapchain one
 // (vulkan_present_framegen_frame_to_window) and the output-space overlay one

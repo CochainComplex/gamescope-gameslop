@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
+#include "Utils/Defer.h"
 
 #if defined(__linux__)
 #include <sys/sysmacros.h>
@@ -6024,27 +6025,120 @@ bool vulkan_make_output()
 	return true;
 }
 
-static void update_tmp_images( uint32_t width, uint32_t height )
+static bool tmp_image_format_supported( uint32_t drmFormat )
+{
+	// The device is initialized once. Capability queries belong to that lifetime,
+	// not every composite or allocation retry.
+	static const auto formats = []
+	{
+		std::array<std::pair<uint32_t, bool>, 4> result = {{
+			{ DRM_FORMAT_ARGB8888, false },
+			{ DRM_FORMAT_ABGR8888, false },
+			{ DRM_FORMAT_ABGR2101010, false },
+			{ DRM_FORMAT_ABGR16161616F, false },
+		}};
+		VkPhysicalDeviceProperties deviceProperties = {};
+		g_device.vk.GetPhysicalDeviceProperties( g_device.physDev(), &deviceProperties );
+		const auto &extensions = g_device.supportedExtensions();
+		const bool flags2 = deviceProperties.apiVersion >= VK_API_VERSION_1_3
+			|| std::any_of( extensions.begin(), extensions.end(), []( const auto &extension )
+			{
+				return std::strcmp( extension.extensionName, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME ) == 0;
+			} );
+		for ( auto &[drm, supported] : result )
+		{
+			const VkFormat format = DRMFormatToVulkan( drm, false );
+			const VkFormat srgbFormat = DRMFormatToVulkan( drm, true );
+			if ( format == VK_FORMAT_UNDEFINED || srgbFormat == VK_FORMAT_UNDEFINED )
+				continue;
+			VkFormatProperties3 extended = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+			VkFormatProperties2 properties = {
+				.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+				.pNext = flags2 ? &extended : nullptr,
+			};
+			g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &properties );
+			const VkFormatFeatureFlags2 features = flags2 ? extended.optimalTilingFeatures
+				: properties.formatProperties.optimalTilingFeatures;
+			constexpr VkFormatFeatureFlags2 required = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT
+				| VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+			// Device creation requires shaderStorageImageWriteWithoutFormat. Before
+			// flags2, its guarantee covers these listed storage formats, not BGRA8.
+			const bool legacyWrite = format == VK_FORMAT_R8G8B8A8_UNORM
+				|| format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_R16G16B16A16_SFLOAT;
+			const bool write = flags2 ? ( features & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT ) != 0 : legacyWrite;
+			supported = ( features & required ) == required && write;
+			if ( srgbFormat != format )
+			{
+				// BInit restricts the alternate sRGB view to sampled usage.
+				VkFormatProperties viewProperties = {};
+				g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), srgbFormat, &viewProperties );
+				constexpr VkFormatFeatureFlags viewRequired = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+					| VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+				supported = supported && ( viewProperties.optimalTilingFeatures & viewRequired ) == viewRequired;
+			}
+		}
+		return result;
+	}();
+	for ( const auto &[format, supported] : formats )
+		if ( format == drmFormat )
+			return supported;
+	return false;
+}
+
+static uint32_t tmp_image_format( GamescopeAppTextureColorspace colorspace )
+{
+	switch ( colorspace )
+	{
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB:
+			return DRM_FORMAT_ABGR16161616F;
+		case GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ:
+			return DRM_FORMAT_ABGR2101010;
+		default:
+			// Both choices retain the SDR sRGB view. RGBA8 also has the legacy
+			// formatless-write guarantee when BGRA8 eligibility cannot be queried.
+			return tmp_image_format_supported( DRM_FORMAT_ARGB8888 )
+				? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888;
+	}
+}
+
+static bool update_tmp_images( uint32_t width, uint32_t height, uint32_t drmFormat )
 {
 	if ( g_output.tmpOutput != nullptr
 			&& width == g_output.tmpOutput->width()
-			&& height == g_output.tmpOutput->height() )
+			&& height == g_output.tmpOutput->height()
+			&& drmFormat == g_output.tmpOutput->drmFormat() )
 	{
-		return;
+		return true;
 	}
+	if ( !tmp_image_format_supported( drmFormat ) )
+		return false;
 
 	CVulkanTexture::createFlags createFlags;
 	createFlags.bSampled = true;
 	createFlags.bStorage = true;
 
-	g_output.tmpOutput = new CVulkanTexture();
-	bool bSuccess = g_output.tmpOutput->BInit( width, height, 1u, DRM_FORMAT_ARGB8888, createFlags, nullptr );
-
-	if ( !bSuccess )
+	gamescope::OwningRc<CVulkanTexture> replacement = new CVulkanTexture();
+	if ( !replacement->BInit( width, height, 1u, drmFormat, createFlags, nullptr ) )
 	{
-		vk_log.errorf( "failed to create fsr output" );
-		return;
+		vk_log.errorf( "failed to create composite intermediate" );
+		return false;
 	}
+	// Already-recorded command buffers retain their own references to the old
+	// image. Publish only initialized replacements, without waiting for them.
+	g_output.tmpOutput = std::move( replacement );
+	return true;
+}
+
+bool vulkan_prepare_composite_intermediate( const FrameInfo_t *frameInfo )
+{
+	const bool upscale = frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 || frameInfo->useNISLayer0;
+	if ( !upscale && !frameInfo->blurLayer0 )
+		return true;
+	if ( frameInfo->layers.count() == 0 )
+		return false;
+	const auto &layer = frameInfo->layers.get( 0 );
+	return update_tmp_images( upscale ? layer.integerWidth() : currentOutputWidth,
+		upscale ? layer.integerHeight() : currentOutputHeight, tmp_image_format( layer.colorspace ) );
 }
 
 
@@ -16876,6 +16970,32 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	// The pre-emptive upscale is the only caller that brings its own command buffer.
 	const bool bPreemptiveUpscale = pOutputOverride != nullptr && pInCommandBuffer != nullptr;
 
+	// Optional filters must not turn an allocation/capability failure into a
+	// skipped real frame. Keep the original layer stack so staging mutations
+	// remain visible to callers, but label/record the ordinary BLIT that runs.
+	const bool bRequestedFSR = frameInfo->useFSRLayer0;
+	const bool bRequestedSGSR = frameInfo->useSGSRLayer0;
+	const bool bRequestedNIS = frameInfo->useNISLayer0;
+	const BlurMode requestedBlur = frameInfo->blurLayer0;
+	bool bRestoreFilters = false;
+	defer(
+		if ( bRestoreFilters )
+		{
+			frameInfo->useFSRLayer0 = bRequestedFSR;
+			frameInfo->useSGSRLayer0 = bRequestedSGSR;
+			frameInfo->useNISLayer0 = bRequestedNIS;
+			frameInfo->blurLayer0 = requestedBlur;
+		}
+	);
+	if ( !vulkan_prepare_composite_intermediate( frameInfo ) )
+	{
+		frameInfo->useFSRLayer0 = false;
+		frameInfo->useSGSRLayer0 = false;
+		frameInfo->useNISLayer0 = false;
+		frameInfo->blurLayer0 = BLUR_MODE_OFF;
+		bRestoreFilters = true;
+	}
+
 	// Output-space cursor split, first half. Only a composite that will actually
 	// be recorded as framegen history is a candidate — the same conditions the
 	// framegen_record_real_frame call at the bottom of this function uses — and
@@ -16996,8 +17116,6 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				g_device.queueFamily() );
 		}
 
-		update_tmp_images(tempX, tempY);
-
 		cmdBuffer->bindPipeline(g_device.pipeline(frameInfo->useSGSRLayer0 ? SHADER_TYPE_SGSR : SHADER_TYPE_EASU));
 		cmdBuffer->bindTarget(g_output.tmpOutput);
 		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
@@ -17047,8 +17165,6 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				g_device.queueFamily() );
 		}
 
-		update_tmp_images(tempX, tempY);
-
 		float nisSharpness = (20 - frameInfo->nUpscaleSharpness) / 20.0f;
 
 		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_NIS));
@@ -17086,8 +17202,6 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	else if ( frameInfo->blurLayer0 )
 	{
-		update_tmp_images(currentOutputWidth, currentOutputHeight);
-
 		ShaderType type = SHADER_TYPE_BLUR_FIRST_PASS;
 
 		uint32_t blur_layer_count = 1;

@@ -72,6 +72,9 @@ test('wlserver_shutdown', find_program('python3'),
 test('vulkan_mapped_memory', find_program('python3'),
 	args: files('test_vulkan_mapped_memory.py'), timeout: 90)
 
+test('vulkan_tmp_images', find_program('python3'),
+	args: files('test_vulkan_tmp_images.py'), timeout: 180)
+
 test('vulkan_sync2', find_program('python3'),
 	args: files('test_vulkan_sync2.py'), timeout: 180)
 
