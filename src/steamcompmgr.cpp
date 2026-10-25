@@ -8719,7 +8719,10 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 	}
 
 	bool bValidPreemptiveScale = newCommit->pAcquirePoint && pUpscaleFocus && cv_upscale_preemptive;
-	bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale( pUpscaleFocus->eUpscaleFilter, pUpscaleFocus->eUpscaleScaler );
+	// An effect can replace layer 0 with a differently-sized render target.
+	// Its actual dimensions are known only in the ordinary composite path.
+	bool bPreemptiveUpscale = bValidPreemptiveScale && g_reshade_effect.empty()
+		&& newCommit->ShouldPreemptivelyUpscale( pUpscaleFocus->eUpscaleFilter, pUpscaleFocus->eUpscaleScaler );
 
 	bool bKnownReady = false;
 
@@ -8751,7 +8754,10 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		zoomScaleRatio = flOldZoomScale;
 		overscanScaleRatio = flOldOverscanScale;
 
-		PooledImage_t *pTempImage = GetTempUpscaleImage( pUpscaleFocus, g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat );
+		// Reject optional work before reserving a release point. The ordinary
+		// acquire/composite path below still presents this client commit.
+		PooledImage_t *pTempImage = vulkan_prepare_composite_intermediate( &upscaledFrameInfo )
+			? GetTempUpscaleImage( pUpscaleFocus, g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat ) : nullptr;
 		if ( pTempImage )
 		{
 			const uint64_t ulNextReleasePoint = ++pTempImage->ulLastPoint;

@@ -66,6 +66,14 @@ Which check for which change, in the order to run them:
 | Motion-field or refiner change | Offline evaluators; add the offline gates for a field or output change | A capture and `numpy`; recording frames also needs `gst-launch-1.0` with `pipewiresrc` |
 | A new default, or any field or output change | Blind A/B on all three content classes ([How to judge a setting](#how-to-judge-a-setting)) | The viewer, the same content for A and B, HUD off |
 
+`meson test -C build vulkan_tmp_images --print-errorlogs` exercises the
+production intermediate-image helpers and fallback caller fragments with CPU
+Vulkan fixtures. It checks capability rejection, SDR/PQ/scRGB format changes,
+transactional replacement, retained references and preemptive admission before
+release-point reservation. Both normal and fast-math builds run. It does not
+prove real GPU dispatch, HDR range preservation or native display behavior;
+those require separate GPU and native evidence.
+
 `GAMESCOPE_LOCAL_PREFIX` is the directory holding your locally built
 dependencies (the prefix that `scripts/env-gamescope-local.sh` puts on the
 library and pkg-config paths; its default is `$HOME/.local/gamescope-wayland`).
