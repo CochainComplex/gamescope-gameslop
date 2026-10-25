@@ -9721,8 +9721,8 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_present_front( gamescope::Rc
 	framegen_bidir_note_ring_overflow( front.ulTargetFlipNs, ulOpportunityNs, ulVblankIntervalNs );
 	static uint64_t s_uPresentedDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
-		vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u",
-			front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
+		vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u selection_ns=%" PRIu64,
+			front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ), get_time_in_nanos() );
 	return pImage;
 }
 
@@ -9900,8 +9900,8 @@ gamescope::Rc<CVulkanTexture> vulkan_framegen_consume_generated_frame( const str
 			front.ulCompositeSeqNo, front.ulTargetFlipNs );
 		static uint64_t s_uPresentedDebugLogCounter = 0;
 		if ( FramegenDebugShouldLog( s_uPresentedDebugLogCounter ) )
-			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u",
-				front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ) );
+			vk_log.infof( "framegen: presented %s frame id=%" PRIu64 ".%02u selection_ns=%" PRIu64,
+				front.bReal ? "delayed real" : "generated", front.frameId, (unsigned)( front.phase * 100.0f ), get_time_in_nanos() );
 	}
 
 	if ( g_framegenHistory.pending.empty() )
@@ -10112,7 +10112,8 @@ static gamescope::Rc<CVulkanTexture> framegen_bidir_select_flip( const gamescope
 	framegen_bidir_note_consumed( g_framegenPresentState.ulCurrentRealFrameId );
 	static uint64_t s_uLiveDebugLogCounter = 0;
 	if ( FramegenDebugShouldLog( s_uLiveDebugLogCounter ) )
-		vk_log.infof( "framegen: presented live real frame id=%" PRIu64 ".100", g_framegenHistory.currentFrameId );
+		vk_log.infof( "framegen: presented live real frame id=%" PRIu64 ".100 selection_ns=%" PRIu64,
+			g_framegenHistory.currentFrameId, get_time_in_nanos() );
 	return pComposite;
 }
 

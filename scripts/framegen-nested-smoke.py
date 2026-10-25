@@ -538,16 +538,25 @@ class RealFrame:
 
 
 @dataclass(frozen=True)
+class ContentObservation:
+    """Receipt time for window membership; optional monotonic selection time."""
+
+    receipt: float
+    selection_ns: int | None = None
+
+
+@dataclass(frozen=True)
 class BidirTimeline:
     """What a bidir log recorded, presented and declared."""
 
     reals: list[RealFrame]  # in record order
-    contents: list[float]  # first present of each distinct real or generated frame
+    contents: list[ContentObservation]  # first present of each distinct real or generated frame
     order_errors: list[tuple[float, int, int]]  # (log time, id, highest id already shown)
     cuts: list[float]  # history invalidations and resets
     rebuilds: list[float]  # re-primes, stale timelines and snaps to live
     reprimes: list[float]  # the re-prime lines among the rebuilds
     backlog_drops: list[float]  # backlogs that did not drain dropping their excess
+    selection_stamp_errors: list[str] = field(default_factory=list)
 
     @property
     def transitions(self) -> list[float]:
@@ -571,7 +580,9 @@ def bidir_timeline(records: list[tuple[float, str]]) -> BidirTimeline:
     highest: int | None = None
     recorded: dict[tuple[int, int], tuple[float, int]] = {}
     shown: dict[tuple[int, int], float] = {}
-    contents: dict[tuple[int, bool, int, str], float] = {}
+    contents: dict[tuple[int, bool, int, str], ContentObservation] = {}
+    selection_stamp_errors: list[str] = []
+    previous_selection_ns: int | None = None
     order_errors: list[tuple[float, int, int]] = []
     cuts: list[float] = []
     rebuilds: list[float] = []
@@ -594,7 +605,19 @@ def bidir_timeline(records: list[tuple[float, str]]) -> BidirTimeline:
             )
         elif match := PRESENTED_CONTENT_RE.search(text):
             generated, frame_id = match.group("kind") == "generated", int(match.group("id"))
-            contents.setdefault((segment, generated, frame_id, match.group("phase")), elapsed)
+            key = (segment, generated, frame_id, match.group("phase"))
+            if key not in contents:
+                stamps = re.findall(r"(?:^|\s)selection_ns=([^\s]*)", text)
+                selection_ns = None
+                if stamps:
+                    if len(stamps) != 1 or len(stamps[0]) > 20 or not re.fullmatch(r"[0-9]+", stamps[0]) or not 0 < int(stamps[0]) < 2**64:
+                        selection_stamp_errors.append(f"invalid selection_ns at {elapsed:.3f}s")
+                    else:
+                        selection_ns = int(stamps[0])
+                        if previous_selection_ns is not None and selection_ns <= previous_selection_ns:
+                            selection_stamp_errors.append(f"non-increasing selection_ns at {elapsed:.3f}s")
+                        previous_selection_ns = selection_ns
+                contents[key] = ContentObservation(elapsed, selection_ns)
             if generated:
                 continue
             if highest is not None and frame_id <= highest:
@@ -607,12 +630,13 @@ def bidir_timeline(records: list[tuple[float, str]]) -> BidirTimeline:
             RealFrame(key, at, time_ns, shown.get(key))
             for key, (at, time_ns) in sorted(recorded.items())
         ],
-        contents=sorted(contents.values()),
+        contents=sorted(contents.values(), key=lambda item: item.receipt),
         order_errors=order_errors,
         cuts=cuts,
         rebuilds=rebuilds,
         reprimes=reprimes,
         backlog_drops=backlog_drops,
+        selection_stamp_errors=selection_stamp_errors,
     )
 
 
@@ -653,7 +677,7 @@ def window_fill(timeline: BidirTimeline, window_end: float) -> tuple[int, float]
     and the nested host's wake rate does not matter.
     """
     count = sum(
-        window_end - METRIC_WINDOW_SECONDS < at <= window_end for at in timeline.contents
+        window_end - METRIC_WINDOW_SECONDS < item.receipt <= window_end for item in timeline.contents
     )
     return count, count / (METRIC_WINDOW_SECONDS * REFRESH_HZ)
 
@@ -978,26 +1002,30 @@ def bidir_gap_errors(
     present before it, then up to D + T from the prime's record to its present.
     """
     transitions = timeline.transitions
-    edges = [since, *(at for at in timeline.contents if since <= at <= last), last]
-    gaps: list[tuple[float, float]] = []
+    edges = [ContentObservation(since), *(item for item in timeline.contents if since <= item.receipt <= last), ContentObservation(last)]
+    gaps: list[tuple[float, float, str]] = []
+    timing_sources = {"selection_ns": 0, "receipt": 0}
     for earlier, later in zip(edges, edges[1:]):
-        bound = delay_bound_ns(windows, earlier, later)
+        bound = delay_bound_ns(windows, earlier.receipt, later.receipt)
         if bound is None:
             continue
-        if any(earlier <= at <= later for at in transitions):
+        if any(earlier.receipt <= at <= later.receipt for at in transitions):
             bound *= 2
-        if (later - earlier) * 1e9 > bound + LOG_SLACK_NS:
-            gaps.append((later - earlier, earlier))
-    errors: list[str] = []
+        source = "selection_ns" if earlier.selection_ns is not None and later.selection_ns is not None else "receipt"
+        timing_sources[source] += 1
+        gap_ns = later.selection_ns - earlier.selection_ns if source == "selection_ns" else (later.receipt - earlier.receipt) * 1e9
+        if gap_ns > bound + LOG_SLACK_NS:
+            gaps.append((gap_ns, earlier.receipt, source))
+    errors = list(timeline.selection_stamp_errors)
     if gaps:
         errors.append(
             f"bidir showed no new content for longer than {BIDIR_DELAY_FIELD} + T "
             f"{len(gaps)} times; worst "
             + ", ".join(
-                f"{gap * 1000:.0f} ms at {at:.3f}s" for gap, at in sorted(gaps, reverse=True)[:3]
+                f"{gap / 1e6:.0f} ms at {at:.3f}s ({source})" for gap, at, source in sorted(gaps, reverse=True)[:3]
             )
         )
-    return errors, f"{len(gaps)} gaps"
+    return errors, f"{len(gaps)} gaps (timing edges: selection_ns={timing_sources['selection_ns']}, receipt={timing_sources['receipt']})"
 
 
 def bidir_fill_errors(

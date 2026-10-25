@@ -490,6 +490,12 @@ Fields marked "developer diagnostic" below (commit lead, bias, provenance,
 chain resets and similar) matter only when a developer asks for them. Ignore
 them otherwise.
 
+With `--framegen-debug`, `framegen: presented ...` debug lines include
+`selection_ns`, the compositor's monotonic nanoseconds at output selection.
+This precedes backend submission and confirmed feedback. The nested bidir gap
+checker uses adjacent event stamps without interpreting them as physical flips;
+legacy logs retain explicitly reported receipt-time comparison.
+
 ### Frame counts
 
 | Field | Meaning |
