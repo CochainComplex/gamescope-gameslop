@@ -102,6 +102,9 @@ test('framegen_learning', test_framegen_learning)
 test('framegen_learning_recording', find_program('python3'),
 	args: files('test_framegen_learning.py'), timeout: 180)
 
+test('framegen_motion_cache', find_program('python3'),
+	args: files('test_framegen_motion_cache.py'), timeout: 90)
+
 test('ycbcr_samplers', find_program('python3'),
 	args: [files('test_ycbcr_samplers.py'), meson.project_build_root() / 'src' / 'gamescope.p'],
 	depends: [gamescope_exe], timeout: 30)
