@@ -318,16 +318,16 @@ bootstrap the resolved sibling directory and use the canonical module name.
 Compare different source trees in separate processes to avoid Python's module
 cache mixing their implementations.
 
-Keep CLI parsing, GSFD decoding, scoring, parity thresholds and applicability
-reporting with their existing tools. Moving an operator must preserve expression
+Keep CLI parsing, scoring, parity thresholds and applicability reporting with
+their existing tools; GSFD decoding has the separate reader boundary below. Moving an operator must preserve expression
 order, dtypes and half-image boundaries, including both sampler gradients used
 in training. The selected model remains empirical: unchanged numerical output
 does not qualify another GPU or turn a failed parity gate into a pass.
 
 `scripts/framegen_net_formats.py` owns the offline GSFR/GSFP layout constants,
 weight decoding and export. Trainer/evaluator aliases preserve existing callers;
-GSFD dataset parsing, training, scoring and CLI argument handling remain in the
-tools. This format leaf imports neither a driver nor the numerical reference.
+GSFD dataset parsing stays in its separate reader; training, scoring and CLI
+argument handling remain in the tools. This format leaf imports neither a driver nor the numerical reference.
 Preserve Python's existing admission behavior independently of the C++ runtime:
 bare shape-compatible versions warn without legacy shading migration, bare
 trailing bytes are rejected, and profile sets require the current version.
@@ -349,6 +349,16 @@ acceptance. Decode stored code values without guessing a transfer function or
 clipping HDR range; alpha is ignored and nonfinite pixels reach the existing
 scoring policy. Parser changes need exact arrays, metadata and malformed-input
 comparisons, including each supported pixel format and capture version.
+
+`scripts/framegen_field_capture.py` owns the existing GSFD v1 sample/dataset
+readers, with trainer aliases for analysis consumers. It imports no trainer,
+numerical reference or model code. Preserve native float16 field views and
+contiguous float32 lumas, including RGBA16F red-channel extraction. Keep existing
+permissive admission and dataset error/stream behavior: trailing/nonfinite data
+is not newly rejected, `load_dataset` skips `ValueError` only, and empty/all-bad
+or truncated-header inputs retain their distinct outcomes. Hindsight's broader
+exception handling remains with that consumer. Reader extraction is not policy
+hardening or a parity improvement.
 
 ## Validation by change class
 
