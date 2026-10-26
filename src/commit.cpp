@@ -23,9 +23,10 @@ commit_t::~commit_t()
         vulkanTex = nullptr;
 
     wlserver_lock();
+    wlserver_present_timing_discard( present_timing );
     if (!presentation_feedbacks.empty())
     {
-        wlserver_presentation_feedback_discard(surf, presentation_feedbacks);
+        wlserver_presentation_feedback_discard(presentation_feedbacks);
         // presentation_feedbacks cleared by wlserver_presentation_feedback_discard
     }
     wlr_buffer_unlock( buf );
@@ -69,16 +70,6 @@ void commit_t::Signal()
     uint64_t now = get_time_in_nanos();
     present_time = now;
 
-    // Snapshot once so initialization and use follow the same commit state.
-    const bool bMangoNudge = m_bMangoNudge;
-    uint64_t frametime = 0;
-    if ( bMangoNudge )
-    {
-        static uint64_t lastFrameTime = now;
-        frametime = now - lastFrameTime;
-        lastFrameTime = now;
-    }
-
     // TODO: Move this so it's called in the main loop.
     // Instead of looping over all the windows like before.
     // When we get the new IWaitable stuff in there.
@@ -87,19 +78,29 @@ void commit_t::Signal()
         m_pDoneCommits->listCommitsDone.push_back( CommitDoneEntry_t{
             .winSeq = win_seq,
             .commitID = commitID,
-            .desiredPresentTime = desired_present_time,
+            .desiredPresentTime = present_timing.target,
+            .timingFlags = present_timing.flags,
+            .route = present_timing.route,
             .fifo = fifo,
         } );
     }
 
-    if ( bMangoNudge )
-        mangoapp_update( uint64_t(~0ull), frametime, uint64_t(~0ull) );
+    if ( m_bMangoNudge )
+        mangoapp_nudge_app_frame( k_uMangoappLegacyMsgType, now );
+    if ( m_uMangoMsgType != 0 )
+        mangoapp_nudge_app_frame( m_uMangoMsgType, now );
 }
 
 void commit_t::OnPollHangUp()
 {
-    std::unique_lock lock( m_WaitableCommitStateMutex );
-    CloseFenceInternal();
+    {
+        std::unique_lock lock( m_WaitableCommitStateMutex );
+        if ( !CloseFenceInternal() )
+            return;
+    }
+
+    abandoned = true;
+    nudge_steamcompmgr();
 }
 
 bool commit_t::IsPerfOverlayFIFO()
@@ -113,26 +114,29 @@ bool commit_t::CloseFenceInternal()
     if ( m_nCommitFence < 0 )
         return false;
 
-    // Will automatically remove from epoll!
-    g_ImageWaiter.RemoveWaitable( this );
+    // Do not recreate an Rc after deletion has started.
+    if ( HasLiveReferences() )
+        g_ImageWaiter.RemoveWaitable( this );
     close( m_nCommitFence );
     m_nCommitFence = -1;
     return true;
 }
 
-void commit_t::SetFence( int nFence, bool bMangoNudge, CommitDoneList_t *pDoneCommits )
+void commit_t::SetFence( int nFence, bool bMangoNudge, uint32_t uMangoMsgType, const std::shared_ptr<CommitDoneList_t> &pDoneCommits )
 {
     std::unique_lock lock( m_WaitableCommitStateMutex );
     CloseFenceInternal();
 
     m_nCommitFence = nFence;
     m_bMangoNudge = bMangoNudge;
+    m_uMangoMsgType = uMangoMsgType;
     m_pDoneCommits = pDoneCommits;
 }
 
-void calc_scale_factor(float &out_scale_x, float &out_scale_y, float sourceWidth, float sourceHeight);
+void calc_scale_factor(GamescopeUpscaleScaler eScaler, float &out_scale_x, float &out_scale_y, float sourceWidth, float sourceHeight);
+void calc_scale_factor_scaler(GamescopeUpscaleScaler eScaler, float &out_scale_x, float &out_scale_y, float sourceWidth, float sourceHeight);
 
-bool commit_t::ShouldPreemptivelyUpscale()
+bool commit_t::ShouldPreemptivelyUpscale( GamescopeUpscaleFilter eFilter, GamescopeUpscaleScaler eScaler )
 {
     // Don't pre-emptively upscale if we are not a FIFO commit.
     // Don't want to FSR upscale 1000fps content.
@@ -141,7 +145,7 @@ bool commit_t::ShouldPreemptivelyUpscale()
 
     // If we support the upscaling filter in hardware, don't
     // pre-emptively do it via shaders.
-    if ( DoesHardwareSupportUpscaleFilter( g_upscaleFilter ) )
+    if ( DoesHardwareSupportUpscaleFilter( eFilter ) )
         return false;
 
     if ( !vulkanTex )
@@ -151,7 +155,17 @@ bool commit_t::ShouldPreemptivelyUpscale()
     float flScaleY = 1.0f;
     // I wish this function was more programatic with its inputs, but it does do exactly what we want right now...
     // It should also return a std::pair or a glm uvec
-    calc_scale_factor( flScaleX, flScaleY, vulkanTex->width(), vulkanTex->height() );
+    calc_scale_factor( eScaler, flScaleX, flScaleY, vulkanTex->width(), vulkanTex->height() );
+
+    // The pre-emptive paint forces the global scale to one, so judge magnification without it and on both axes like the paint path.
+    if ( ResolveUpscaleFilter( eFilter, colorspace(), vulkanTex->isYcbcr() ) == GamescopeUpscaleFilter::SGSR )
+    {
+        float flUpscaleX = 1.0f;
+        float flUpscaleY = 1.0f;
+        calc_scale_factor_scaler( eScaler, flUpscaleX, flUpscaleY, vulkanTex->width(), vulkanTex->height() );
+        if ( flUpscaleX <= 1.0f || flUpscaleY <= 1.0f )
+            return false;
+    }
 
     return !close_enough( flScaleX, 1.0f ) || !close_enough( flScaleY, 1.0f );
 }

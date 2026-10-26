@@ -35,11 +35,18 @@ Usage:
 
 import argparse
 import importlib.util
-import struct
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# Absolute-path consumers do not automatically add sibling modules to sys.path.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from framegen_net_formats import (
+    MAGIC_PROFILE, PROFILE_VERSION, PROFILE_MAX_SETS, _parse_gsfr, load_blob,
+)
 
 # Load the trainer as a module despite its hyphenated filename, so the GSFD
 # parser, bilinear sampler and net forward pass are shared verbatim (they MUST
@@ -51,39 +58,8 @@ T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 
 
-# --------------------------------------------------------------------------
-# Weights blob (reverse of the trainer's export())
-# --------------------------------------------------------------------------
-
-def load_blob(path):
-    raw = Path(path).read_bytes()
-    magic, version, nlayers = struct.unpack_from("<3I", raw, 0)
-    if magic != T.MAGIC_BLOB:
-        sys.exit(f"{path}: not a GSFR weights blob")
-    if nlayers != len(T.LAYERS):
-        sys.exit(f"{path}: layer count {nlayers} != expected {len(T.LAYERS)}")
-    # The trainer writes the whole shape table first, then all weight/bias data.
-    off = 12
-    shapes = []
-    for i, (exp_ci, exp_co) in enumerate(T.LAYERS, 1):
-        ci, co, ksize = struct.unpack_from("<3I", raw, off)
-        off += 12
-        if (ci, co, ksize) != (exp_ci, exp_co, T.KSIZE):
-            sys.exit(f"{path}: layer {i} shape mismatch")
-        shapes.append((ci, co, ksize))
-    params = {}
-    for i, (ci, co, ksize) in enumerate(shapes, 1):
-        n = co * ksize * ksize * ci
-        w = np.frombuffer(raw, "<f4", count=n, offset=off).reshape(co, ksize, ksize, ci)
-        off += n * 4
-        params[f"W{i}"] = np.ascontiguousarray(w.transpose(0, 3, 1, 2))  # -> (co,ci,ky,kx)
-        params[f"b{i}"] = np.array(
-            np.frombuffer(raw, "<f4", count=co, offset=off), np.float32)
-        off += co * 4
-    if version != T.BLOB_VERSION:
-        print(f"note: blob version {version} != trainer {T.BLOB_VERSION}; "
-              f"shapes match, evaluating anyway", file=sys.stderr)
-    return params
+def parse_key(text):
+    return int(text, 0)
 
 
 # --------------------------------------------------------------------------
@@ -131,10 +107,7 @@ def refine(params, X, Y, luma_src, luma_dst):
     o = o[0]
     dF = 2.0 * np.tanh(o[0:2]).transpose(1, 2, 0)                      # (H,W,2)
     Fh = X[..., 0:2].astype(np.float32) + dF
-    warped = warp(luma_src, Fh)
-    rr = np.abs(warped - luma_dst) / np.maximum(1.0, np.maximum(np.abs(warped), np.abs(luma_dst)))
-    t = np.clip((rr - 0.03) / 0.07, 0.0, 1.0)
-    gate = 1.0 - t * t * (3.0 - 2.0 * t)                              # complement smoothstep
+    gate = T.evidence_gate(warp(luma_src, Fh), luma_dst, luma_src)
     dc_raw = o[2]
     dc = dc_raw * np.where(dc_raw < 0.0, 1.0, gate)
     ch = np.clip(X[..., 2].astype(np.float32) + dc, 0.0, 1.0)
@@ -180,10 +153,12 @@ def grade_pair(flow, conf, luma_src, luma_dst):
     """All metrics for one warped field against its destination luma."""
     warped = warp(luma_src, flow)
     rm = resid_map(warped, luma_dst)
-    cw = float(conf.sum()) or 1.0
+    cw = float(conf.sum())
     return {
         "resid": float(rm.mean()),
-        "resid_conf": float((rm * conf).sum() / cw),   # weighted where it actually ships
+        # Weighted where it actually ships. A frame with no confidence ships no
+        # motion, so it has no conf-resid (None) rather than a flattering 0.
+        "resid_conf": float((rm * conf).sum() / cw) if cw > 0.0 else None,
         "bad%": float((rm > 0.10).mean() * 100.0),
         "ssim": ssim(warped, luma_dst),
         "edge": edge_err(warped, luma_dst),
@@ -214,7 +189,10 @@ def evaluate(samples, params):
     for key, rows in acc.items():
         if not rows:
             continue
-        agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
+        agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0] if k != "resid_conf"}
+        weighted = [r["resid_conf"] for r in rows if r["resid_conf"] is not None]
+        agg["resid_conf"] = float(np.mean(weighted)) if weighted else float("nan")
+        out.setdefault("conf_empty", {})[key] = len(rows) - len(weighted)
         s = np.asarray(seq[key])
         # Temporal stability: how much the per-frame residual lurches. Lower is
         # steadier (the flash/particle-chaos class the adaptation probe fights).
@@ -233,16 +211,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="capture dir (GAMESCOPE_FRAMEGEN_RECORD)")
-    ap.add_argument("--net", help="GSFR weights blob to also evaluate (refined field)")
+    ap.add_argument("--net", help="GSFR weights blob or GSFP profile to also evaluate (refined field)")
+    ap.add_argument("--net-key", type=parse_key, help="profile set key (e.g. 0xf0), when it holds several")
     args = ap.parse_args()
 
     samples = T.load_dataset(args.data)
-    params = load_blob(args.net) if args.net else None
+    params = load_blob(args.net, args.net_key) if args.net else None
     res = evaluate(samples, params)
 
     print("\nfield-resolution photometric quality "
           "(structural + temporal; higher ssim / lower everything else is better):")
     print(fmt("neutral", res["neutral"]))
+    print(f"  (conf-resid skips frames with zero confidence: {res['conf_empty']})")
     if "refined" in res:
         print(fmt("refined", res["refined"]))
         n, r = res["neutral"], res["refined"]

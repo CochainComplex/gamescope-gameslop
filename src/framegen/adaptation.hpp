@@ -13,6 +13,13 @@ namespace gamescope::framegen
 // R32_UINT values; the renderer copies them only after the submission retires.
 inline constexpr uint32_t k_uAdaptationStatsCount = 96u;
 inline constexpr uint32_t k_uAdaptationMaxTotal = 4u * 1024u * 1024u;
+// Changed-texel counters of the quality meter; the layout is documented in
+// cs_framegen_motion_stats.comp.
+inline constexpr uint32_t k_uAdaptationStatChanged = 15u;
+inline constexpr uint32_t k_uAdaptationStatChangedKilled = 91u;
+inline constexpr uint32_t k_uAdaptationStatChangedBad = 92u;
+inline constexpr uint32_t k_uAdaptationStatChangedKilledMatch = 93u;
+inline constexpr uint32_t k_uAdaptationStatChangedResidual = 94u;
 
 // Same-batch field trust and next-batch CPU adaptation thresholds. Keep these
 // together so resource sizing, push constants, and readback policy cannot drift
@@ -35,6 +42,64 @@ inline constexpr float k_flAdaptationToleranceFallPerFrame = 0.250f;
 inline constexpr float k_flAdaptationNoiseToAgreement = 6.0f;
 inline constexpr float k_flAdaptationAgreementOffsetMax = 0.15f;
 
+// Motion-field quality over changed texels (holding the previous frame would
+// mispredict them, whatever the field says), summed over stats-probe samples.
+// A static background predicts itself, so only changed texels judge the
+// field. A window reports ratios of sums, so every changed texel weighs the
+// same whatever sample it came from. Each ratio is 0 when its
+// denominator is empty; samples == 0 means nothing was measured.
+struct MotionQualityCounts
+{
+	uint64_t samples = 0;
+	uint64_t changed = 0;
+	// Final field confidence below the survive threshold.
+	uint64_t changedKilled = 0;
+	// The killed texels the matcher had already left unconfident; the rest
+	// were killed by the later consistency check or refinement.
+	uint64_t changedKilledMatch = 0;
+	// Survived, yet still mispredicted the real frame.
+	uint64_t changedBad = 0;
+	// Warped-luma residual over changed texels, x1024.
+	uint64_t changedResidualQ10 = 0;
+
+	MotionQualityCounts &operator+=( const MotionQualityCounts &other )
+	{
+		samples += other.samples;
+		changed += other.changed;
+		changedKilled += other.changedKilled;
+		changedKilledMatch += other.changedKilledMatch;
+		changedBad += other.changedBad;
+		changedResidualQ10 += other.changedResidualQ10;
+		return *this;
+	}
+
+	[[nodiscard]] double residual() const
+	{
+		return changed != 0 ? static_cast<double>( changedResidualQ10 ) / 1024.0
+			/ static_cast<double>( changed ) : 0.0;
+	}
+	// Of the changed texels that survived.
+	[[nodiscard]] double badFraction() const
+	{
+		const uint64_t survived = changed - std::min( changedKilled, changed );
+		return survived != 0 ? static_cast<double>( changedBad )
+			/ static_cast<double>( survived ) : 0.0;
+	}
+	[[nodiscard]] double killedFraction() const { return fraction( changedKilled ); }
+	[[nodiscard]] double killedMatchFraction() const { return fraction( changedKilledMatch ); }
+	[[nodiscard]] double killedFbFraction() const
+	{
+		return fraction( changedKilled - std::min( changedKilledMatch, changedKilled ) );
+	}
+
+private:
+	[[nodiscard]] double fraction( uint64_t count ) const
+	{
+		return changed != 0 ? static_cast<double>( count )
+			/ static_cast<double>( changed ) : 0.0;
+	}
+};
+
 struct AdaptationMeasurement
 {
 	float residual;
@@ -47,6 +112,8 @@ struct AdaptationMeasurement
 	uint32_t sceneCut;
 	uint32_t changedSections;
 	uint32_t sceneHistogramDistanceQ10;
+	// One quality-meter sample (samples == 1).
+	MotionQualityCounts quality;
 };
 
 struct AdaptationState
@@ -101,6 +168,19 @@ struct AdaptationState
 		}
 	}
 
+	// Each changed counter is clamped to its parent set, so a window's parts
+	// always add up.
+	const uint32_t changed = std::min( stats[ k_uAdaptationStatChanged ], total );
+	const uint32_t changedKilled = std::min( stats[ k_uAdaptationStatChangedKilled ], changed );
+	const MotionQualityCounts quality = {
+		.samples = 1u,
+		.changed = changed,
+		.changedKilled = changedKilled,
+		.changedKilledMatch = std::min( stats[ k_uAdaptationStatChangedKilledMatch ], changedKilled ),
+		.changedBad = std::min( stats[ k_uAdaptationStatChangedBad ], changed - changedKilled ),
+		.changedResidualQ10 = stats[ k_uAdaptationStatChangedResidual ],
+	};
+
 	return AdaptationMeasurement{
 		.residual = residual,
 		.badFraction = badFraction,
@@ -111,6 +191,7 @@ struct AdaptationState
 		.sceneCut = stats[ 88 ],
 		.changedSections = stats[ 89 ],
 		.sceneHistogramDistanceQ10 = stats[ 90 ],
+		.quality = quality,
 	};
 }
 

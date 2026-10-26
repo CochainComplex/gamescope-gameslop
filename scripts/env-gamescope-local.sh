@@ -49,7 +49,12 @@ _gamescope_env_prepend CMAKE_PREFIX_PATH "$GAMESCOPE_LOCAL_PREFIX"
 export GAMESCOPE_SCRIPT_PATH="$GAMESCOPE_REPO/scripts"
 
 # Let ad-hoc Vulkan clients find the local gamescope WSI layer JSON as well.
-_gamescope_env_prepend VK_LAYER_PATH "$_gamescope_env_build/layer"
+# Keep normal installed layers discoverable unless the caller chose an override.
+if [[ -n "${VK_LAYER_PATH+x}" ]]; then
+	_gamescope_env_prepend VK_LAYER_PATH "$_gamescope_env_build/layer"
+else
+	_gamescope_env_prepend VK_ADD_LAYER_PATH "$_gamescope_env_build/layer"
+fi
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 	if [[ $# -gt 0 ]]; then

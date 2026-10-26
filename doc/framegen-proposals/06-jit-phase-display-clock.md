@@ -1,7 +1,8 @@
 # Proposal 06 — JIT Phase: Display-Clock Pacing for Generated Frames
 
-Status: **prototype implemented** (opt-in via `GAMESCOPE_FRAMEGEN_JIT=1`, requires the
-dedicated framegen queue)
+Status: **shipped as the default** on the dedicated framegen queue (deadline scheduling).
+`GAMESCOPE_FRAMEGEN_JIT` is now a no-op that only logs a notice; `GAMESCOPE_FRAMEGEN_CLASSIC=1`
+selects the old batch path. The opt-in gate described below is historical.
 Scope: temporal placement of generated frames on fixed-refresh outputs
 Owner-area files: `src/rendervulkan.cpp`, `src/rendervulkan.hpp`, `src/steamcompmgr.cpp`
 
@@ -52,7 +53,7 @@ phase = (t_targetVblank − t_realFrameVblank) / predictedSourceInterval
 ```
 
 - `t_targetVblank` and `t_realFrameVblank` both come from the vblank timer
-  (`GetVBlankTimer().GetNextVBlank(0)`), whose clock is fed by the backend's real
+  (`framegen_next_vblank_ns()`), whose clock is fed by the backend's real
   flip feedback — **KMS pageflip timestamps** on DRM (`MarkVBlank` from the
   pageflip handler). This is vendor-agnostic ground truth for when frames actually
   scan out; no Vulkan extension, no new timer machinery.
@@ -125,7 +126,7 @@ What this fixes and what it doesn't:
 ## Mechanisms (all vendor-agnostic)
 
 - **Display clock**: KMS pageflip timestamps via `CVBlankTimer::GetLastVBlank()` /
-  `GetNextVBlank()`. Nested backends feed the same API; a backend that never marks
+  `framegen_next_vblank_ns()`. Nested backends feed the same API; a backend that never marks
   vblanks degrades to an epoch-aligned grid whose offset **cancels** in the phase
   subtraction (anchor and target sit on the same grid) — constant phase bias at
   worst, never a sawtooth.
@@ -153,7 +154,7 @@ What this fixes and what it doesn't:
   admission. It owns no clock, queue, mutable global, or submission decision;
   boundary behavior is covered by `tests/test_framegen.cpp`.
 - `framegen_record_real_frame` — anchors the real frame
-  (`ulCurrentRealVblankNs = GetNextVBlank(0)`), updates the source-cadence model
+  (`ulCurrentRealVblankNs = framegen_next_vblank_ns()`), updates the source-cadence model
   after frame-gap invalidation, obtains the exact next wake deadline through
   non-mutating `CalcNextWakeupTime(true)`, and runs deadline admission instead
   of batch planning.
@@ -169,7 +170,7 @@ What this fixes and what it doesn't:
   sacrificing speculative history; it never waits for framegen or overwrites a
   KMS/nested-Wayland-owned DMA-BUF.
 - `framegen_jit_submit` — the JIT planner: guards (history valid, pending empty,
-  one-batch-in-flight, idle-gap invalidation), target = `GetNextVBlank(0) +
+  one-batch-in-flight, idle-gap invalidation), target = `framegen_next_vblank_ns() +
   interval`, phase/strength computation, forward cap (`flStrengthRaw >
   k_flFramegenMaxForwardStrength` → stop generating; a stall quiesces at the cap
   exactly like the old idle refill converged to it).
@@ -219,7 +220,7 @@ What this fixes and what it doesn't:
 |---|------|------------|
 | 1 | Predictor mis-converges on bimodal frametimes (e.g. 60/30 alternation) | sample clamp and bounded alpha/beta updates prevent one hitch from taking over; the one-sided late envelope biases uncertainty toward generating, not repeating; re-seeds on discontinuity |
 | 2 | A sudden first long frame was not predictable | an overdue estimate generates immediately, and the repeat-slot tick fills from the following vblank; arbitrary future stalls cannot be predicted without delaying real frames |
-| 3 | `GetLastVBlank` staleness after missed flips skews the target by one vblank | `GetNextVBlank`'s catch-up loop self-corrects next tick; supersede/discard bound the damage to one misplaced slot |
+| 3 | `GetLastVBlank` staleness after missed flips skews the target by one vblank | `framegen_next_vblank_ns()` (`VBlank::Next`) steps past now, so it self-corrects next tick; supersede/discard bound the damage to one misplaced slot |
 | 4 | Per-slot motion estimation cost at deep stall fills | forward cap bounds fills per stall (~2 at default strength); future: cache the motion field per (previousReal, currentReal) pair |
 | 5 | Double-submit races between trigger sites | all three sites run on the steamcompmgr thread and `framegen_jit_submit` refuses when `pending` is non-empty or the previous batch is in flight |
 

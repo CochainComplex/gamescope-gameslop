@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <optional>
 
+#include <xkbcommon/xkbcommon.h>
+
 #include "WaylandServer/WaylandDecls.h"
 #include "WaylandServer/WaylandServerLegacy.h"
 
@@ -43,11 +45,12 @@ struct ResListEntry_t {
 	bool async;
 	bool fifo;
 	std::shared_ptr<wlserver_vk_swapchain_feedback> feedback;
-	std::vector<struct wl_resource*> presentation_feedbacks;
-	std::optional<uint32_t> present_id;
-	uint64_t desired_present_time;
+	std::vector<wlserver_presentation_feedback_ref> presentation_feedbacks;
+	gamescope::PresentTiming present_timing;
 	std::shared_ptr<gamescope::CAcquireTimelinePoint> pAcquirePoint;
 	std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint;
+	pixman_box32_t damageExtents;
+	std::vector<pixman_box32_t> damage;
 };
 
 struct wlserver_content_override;
@@ -67,12 +70,13 @@ public:
 	const char *get_nested_display_name() const;
 
 	void set_wl_id( struct wlserver_x11_surface_info *surf, uint32_t id );
+	void link_override( struct wlserver_x11_surface_info *surf );
 
 	_XDisplay *get_xdisplay();
 
 	std::unique_ptr<xwayland_ctx_t> ctx;
 
-	void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf);
+	void wayland_commit(ResListEntry_t entry);
 
 	std::vector<ResListEntry_t>& retrieve_commits();
 
@@ -137,6 +141,7 @@ struct wlserver_t {
 	double mouse_surface_cursorx = 0.0f;
 	double mouse_surface_cursory = 0.0f;
 	bool mouse_constraint_requires_warp = false;
+	bool physical_cursor_move = false;
 	pixman_region32_t confine;
 	std::atomic<struct wlr_pointer_constraint_v1 *> mouse_constraint = { nullptr };
 
@@ -167,6 +172,21 @@ struct wlserver_t {
 	
 	bool button_held[ WLSERVER_BUTTON_COUNT ];
 	std::set <uint32_t> touch_down_ids;
+
+	// Moves a client made to the surface under the pointer during the current
+	// press, taken back out of the pointer position so its root position holds.
+	struct {
+		struct wlr_surface *surface = nullptr;
+		double dx = 0.0;
+		double dy = 0.0;
+		int last_x = 0;
+		int last_y = 0;
+	} drag_anchor;
+
+	// The last dragged surface, and a bound on the moves it keeps sending
+	// after the release that re-arm the placement.
+	struct wlr_surface *drag_settle_surface = nullptr;
+	int drag_settle_budget = 0;
 
 	struct {
 		char *name;
@@ -199,6 +219,9 @@ struct wlserver_t {
     struct wlr_keyboard_group *keyboard_group;
     struct wl_listener keyboard_group_modifiers;
     struct wl_listener keyboard_group_key;
+
+    // Sym each held key resolved to at press time, keyed by device and keycode.
+    std::map<std::pair<struct wlr_keyboard *, xkb_keycode_t>, xkb_keysym_t> mapPressedHotkeyKeys;
 };
 
 extern struct wlserver_t wlserver;
@@ -242,6 +265,9 @@ bool wlserver_is_lock_held(void);
 
 void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain = true );
 void wlserver_key( uint32_t key, bool press, uint32_t time );
+void wlserver_keyboard_modifiers( uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group );
+void wlserver_keyboard_release_modifiers();
+void wlserver_set_keyboard_layout( const char *pszLayout );
 
 void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x = 0, int y = 0 );
 void wlserver_clear_dropdowns();
@@ -251,6 +277,8 @@ void wlserver_mousehide();
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );
 void wlserver_mousebutton( int button, bool press, uint32_t time );
 void wlserver_mousewheel( double x, double y, uint32_t time );
+bool wlserver_input_held();
+void wlserver_drag_anchor_move( struct wlr_surface *surface, int x, int y, int base_x, int base_y );
 
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor = false, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamescope::IBackendConnector* connector = nullptr );
@@ -287,17 +315,26 @@ void wlserver_open_steam_menu( bool qam );
 uint32_t wlserver_make_new_xwayland_server();
 void wlserver_destroy_xwayland_server(gamescope_xwayland_server_t *server);
 
-void wlserver_presentation_feedback_presented( struct wlr_surface *surface, std::vector<struct wl_resource*>& presentation_feedbacks, uint64_t last_refresh_nsec, uint64_t refresh_cycle );
-void wlserver_presentation_feedback_discard( struct wlr_surface *surface, std::vector<struct wl_resource*>& presentation_feedbacks );
+void wlserver_presentation_feedback_presented( std::vector<wlserver_presentation_feedback_ref>& presentation_feedbacks, uint64_t last_refresh_nsec, uint64_t refresh_cycle, uint64_t sequence );
+void wlserver_presentation_feedback_discard( std::vector<wlserver_presentation_feedback_ref>& presentation_feedbacks );
 
-void wlserver_past_present_timing( struct wlr_surface *surface, uint32_t present_id, uint64_t desired_present_time, uint64_t actual_present_time, uint64_t earliest_present_time, uint64_t present_margin );
-void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle );
+extern LogScope present_timing_log;
+
+void wlserver_present_timing_report( gamescope::PresentTiming &timing, uint64_t queue_end, uint64_t dequeued, uint64_t pixel_out, uint64_t earliest_present_time, uint64_t earliest_latch_time );
+void wlserver_present_timing_discard( gamescope::PresentTiming &timing );
+void wlserver_refresh_cycle( struct wlr_surface *surface, uint64_t refresh_cycle, uint64_t refresh_interval );
 
 void wlserver_app_presented( uint32_t app_id, uint64_t frametime_ns );
 
+// Stop dispatch and wait for backend users; call without the Wayland lock.
 void wlserver_shutdown();
+void wlserver_shutdown_input();
 
 void wlserver_send_gamescope_control( wl_resource *control );
+
+void wlserver_set_frame_limiter_state( uint32_t uState );
+uint32_t wlserver_get_frame_limiter_state( void );
+void wlserver_flush_frame_limiter_state( void );
 
 bool wlsession_active();
 

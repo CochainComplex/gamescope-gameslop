@@ -15,9 +15,9 @@ uniform framegen_hud_t {
     uint u_lineCount;
     uint u_widthChars;
     uint u_hdr;
-    uint u_reserved;
-    uint u_lineLengths[7];
-    uint u_text[126];
+    uint u_style;
+    uint u_lineLengths[8];
+    uint u_text[144];
     uint u_font[256];
 };
 
@@ -49,9 +49,56 @@ bool glyph_pixel(uint glyph, uvec2 pixel) {
     return ((rowBits >> pixel.x) & 1u) != 0u;
 }
 
+uint line_pitch() { return (u_style & 1u) != 0u ? 11u : 8u; }
+
+bool text_pixel(uvec2 logical) {
+    if (logical.x < kPadding || logical.y < kPadding) return false;
+    uvec2 p = logical - uvec2(kPadding);
+    uint row = p.y % line_pitch();
+    if (row >= 8u) return false;
+    uint line = p.y / line_pitch(), column = p.x >> 3u;
+    if (line >= u_lineCount) return false;
+    if (column >= u_lineLengths[line]) return false;
+    return glyph_pixel(text_byte(line, column) & 127u, uvec2(p.x & 7u, row));
+}
+
+vec3 cga_background(uvec2 logical, uint height) {
+    const uint bayer[16] = uint[16](0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5);
+    uint step = min(16u, logical.y * 16u / max(1u, height - 1u));
+    bool magenta = bayer[(logical.y & 3u) * 4u + (logical.x & 3u)] < step;
+    return magenta ? vec3(1.0, 1.0/3.0, 1.0) : vec3(1.0/3.0, 1.0, 1.0);
+}
+
+vec3 srgb_decode(vec3 x) {
+    return mix(x / 12.92, pow((max(x, vec3(0.0)) + 0.055) / 1.055, vec3(2.4)),
+        greaterThan(x, vec3(0.04045)));
+}
+vec3 srgb_encode(vec3 x) {
+    x = max(x, vec3(0.0));
+    return mix(12.92 * x, 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055,
+        greaterThan(x, vec3(0.0031308)));
+}
+vec3 pq_decode(vec3 x) {
+    vec3 p = pow(max(x, vec3(0.0)), vec3(1.0 / 78.84375));
+    return pow(max(p - 0.8359375, vec3(0.0)) /
+        max(vec3(18.8515625) - 18.6875 * p, vec3(1e-6)), vec3(1.0 / 0.1593017578125));
+}
+vec3 pq_encode(vec3 x) {
+    vec3 p = pow(max(x, vec3(0.0)), vec3(0.1593017578125));
+    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(78.84375));
+}
+vec3 palette(vec3 srgb) {
+    vec3 linear = srgb_decode(srgb);
+    if (u_hdr == 0u) return linear;
+    // Rec.709 -> Rec.2020, at 160 nit reference white in PQ's 10000-nit units.
+    return mat3(0.627404, 0.069097, 0.016391,
+                0.329283, 0.919540, 0.088013,
+                0.043313, 0.011362, 0.895595) * linear * 0.016;
+}
+
 void main() {
     uvec2 local = gl_GlobalInvocationID.xy;
-    uvec2 logicalBlockSize = uvec2(u_widthChars * 8u, u_lineCount * 8u)
+    uvec2 logicalBlockSize = uvec2(u_widthChars * 8u, u_lineCount * line_pitch())
         + uvec2(kPadding * 2u);
     uvec2 blockSize = logicalBlockSize * u_scale;
     if (local.x >= blockSize.x || local.y >= blockSize.y)
@@ -66,29 +113,58 @@ void main() {
     // the same unique pixel lets this single pass provide real alpha blending
     // without requiring shaderStorageImageReadWithoutFormat.
     vec4 base = texelFetch(s_samplers[0], ivec2(coord), 0);
-    vec3 result = mix(base.rgb, vec3(0.015), 0.42);
-
-    // Spark bars are ordinary font glyphs, so text and history share this path.
+    vec3 linearBase = u_hdr != 0u ? pq_decode(base.rgb) : srgb_decode(base.rgb);
     uvec2 logical = local / u_scale;
-    bool ink = false;
-    if (logical.x >= kPadding && logical.y >= kPadding) {
-        uvec2 textPixel = logical - uvec2(kPadding);
-        uint line = textPixel.y >> 3u;
-        uint column = textPixel.x >> 3u;
-        if (line < u_lineCount && column < u_lineLengths[line]) {
-            uint glyph = min(text_byte(line, column), 127u);
-            ink = glyph_pixel(glyph, textPixel & 7u);
-        }
+    bool cga = (u_style & 1u) != 0u;
+    vec3 background = cga ? cga_background(logical, logicalBlockSize.y)
+        : vec3(0.065, 0.050, 0.105);
+    uint encodedOpacity = (u_style >> 8u) & 255u;
+    float opacity = encodedOpacity == 0u ? (cga ? 0.36 : 0.14)
+        : clamp(float(encodedOpacity - 1u) / 100.0, 0.0, 1.0);
+    vec3 result = mix(linearBase, palette(background), opacity);
+    // Dim only the text cells; keep the CGA fade visible in the gutters/gaps.
+    // This backing also vanishes at 0% opacity, independently of the lettering.
+    if (cga && logical.y + 1u >= kPadding && logical.x + 1u >= kPadding) {
+        uint py = logical.y >= kPadding ? logical.y - kPadding : 0u;
+        uint line = py / line_pitch();
+        if (line < u_lineCount && py % line_pitch() < 9u
+            && logical.x < kPadding + u_lineLengths[line] * 8u + 1u)
+            result = mix(result, palette(vec3(0.0)), opacity * 0.65);
     }
 
+    if (logical.y == 0u)
+        result = mix(result, palette(cga ? vec3(1.0) : vec3(0.50, 0.88, 0.90)), 0.48);
+    if (logical.x == 0u && logical.y > 0u)
+        result = mix(result, palette(cga ? vec3(1.0) : vec3(0.88, 0.40, 0.72)), 0.38);
+    bool ink = text_pixel(logical);
+    bool value = false;
     if (ink) {
-        // Known HDR simplification: this deliberately bypasses the compositor's
-        // color-management pipeline. 0.579 is the fixed ST-2084 code value for
-        // roughly 200 nits; SDR uses a fixed light gray. The backing is likewise
-        // a low-alpha raw-code blend rather than a color-managed overlay.
-        float glyphValue = u_hdr != 0u ? 0.579f : 0.82f;
-        result = mix(result, vec3(glyphValue), 0.96);
+        uvec2 p = logical - uvec2(kPadding);
+        value = (text_byte(p.y / line_pitch(), p.x >> 3u) & 128u) != 0u;
+    }
+    // Crisp four-sided dark outline; unlike an offset shadow, this does not
+    // create a second text image. CGA always has it. Quiet/Mallsoft get it
+    // below 10% explicit backing opacity, where a bright scene would swallow
+    // the light lettering. Integer compare on the encoded percent, exactly as
+    // framegen_hud_outlined in hud.hpp (a float compare at 10/100 may round
+    // either way on GPUs that lower the division to a reciprocal multiply).
+    bool lowBacking = encodedOpacity != 0u && encodedOpacity - 1u < 10u;
+    if (cga || lowBacking) {
+        bool outline = !ink && (text_pixel(logical + uvec2(1u,0u))
+            || text_pixel(logical - uvec2(1u,0u))
+            || text_pixel(logical + uvec2(0u,1u))
+            || text_pixel(logical - uvec2(0u,1u)));
+        // Weight: k_flFramegenHudOutlineBlend in hud.hpp (test-pinned).
+        if (outline) result = mix(result, palette(vec3(0.0)), 0.98);
+    }
+    if (cga) {
+        // White values and cyan labels in pixel lettering.
+        if (ink) result = mix(result, palette(value ? vec3(1.0) : vec3(1.0/3.0,1.0,1.0)), 0.98);
+    } else if (ink) {
+        vec3 color = value ? vec3(0.96,0.94,0.98) : vec3(0.63,0.80,0.82);
+        result = mix(result, palette(color), value ? 0.98 : 0.90);
     }
 
+    result = u_hdr != 0u ? pq_encode(result) : srgb_encode(result);
     imageStore(dst, ivec2(coord), vec4(result, base.a));
 }

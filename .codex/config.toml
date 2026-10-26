@@ -1,0 +1,36 @@
+[features]
+hooks = true
+
+# Native child-thread cap excludes the primary. Keep the user's root model,
+# permissions, sandbox and unrelated MCP settings inherited.
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-6.1-sol"
+default_subagent_reasoning_effort = "medium"
+
+[mcp_servers.repowise]
+command = "/home/awarth/.local/bin/repowise"
+args = ["mcp", "/home/awarth/Devstuff/dummy/gamescope"]
+cwd = "/home/awarth/Devstuff/dummy/gamescope"
+enabled = true
+startup_timeout_sec = 60
+tool_timeout_sec = 120
+
+[mcp_servers.repowise.tools.get_answer]
+approval_mode = "approve"
+
+[mcp_servers.repowise.tools.get_context]
+approval_mode = "approve"
+
+[mcp_servers.repowise.tools.get_symbol]
+approval_mode = "approve"
+
+[mcp_servers.repowise.tools.get_change_risk]
+approval_mode = "approve"
+
+[mcp_servers.repowise.tools.get_risk]
+approval_mode = "approve"
+
+[mcp_servers.repowise.tools.search_codebase]
+approval_mode = "approve"

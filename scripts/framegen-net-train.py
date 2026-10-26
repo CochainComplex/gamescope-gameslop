@@ -34,182 +34,26 @@ Usage:
 """
 
 import argparse
-import struct
 import sys
 from pathlib import Path
 
 import numpy as np
 
-MAGIC_SAMPLE = 0x44465347  # 'GSFD'
-MAGIC_BLOB = 0x52465347    # 'GSFR'
-BLOB_VERSION = 3           # + zero-neutral causal shading-focus output
-LAYERS = ((12, 16), (16, 16), (16, 4))
-KSIZE = 3
+# Preserve direct execution and absolute-path imports from analysis consumers.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from framegen_field_capture import MAGIC_SAMPLE, load_sample, load_dataset
+from framegen_field_reference import bilinear_with_grad as bilinear
+from framegen_net_formats import MAGIC_BLOB, BLOB_VERSION, LAYERS, KSIZE, export
+from framegen_net import conv_fwd, conv_bwd, net_fwd, net_bwd, init_params
+from framegen_net_features import evidence_gate, features
+
 CHARB_EPS = 1e-3
 FLOW_AUX = 0.05     # keep a flow-learning signal where confidence was killed
 LAMBDA_DF = 0.01    # pull the flow residual toward Stage B
 LAMBDA_TV = 0.005   # smoothness of the refined flow (flow-boundary jaggies)
 LAMBDA_DC = 0.005   # keep the confidence correction gentle
-
-
-# --------------------------------------------------------------------------
-# Dataset
-# --------------------------------------------------------------------------
-
-def load_sample(path):
-    raw = path.read_bytes()
-    hdr = struct.unpack_from("<8I", raw, 0)
-    if hdr[0] != MAGIC_SAMPLE or hdr[1] != 1:
-        raise ValueError(f"{path}: not a GSFD v1 sample")
-    w, h, luma_bpp, field_bpp, flags = hdr[2], hdr[3], hdr[4], hdr[5], hdr[6]
-    if field_bpp != 8 or not (flags & 1):
-        raise ValueError(f"{path}: unsupported layout")
-    off = 8 * 4 + 8  # header + seqno
-
-    def luma_plane():
-        nonlocal off
-        n = w * h * luma_bpp
-        plane = np.frombuffer(raw, dtype=np.float16, count=n // 2, offset=off)
-        off += n
-        if luma_bpp == 8:  # rgba16f luma texture: luma sits in .r
-            plane = plane.reshape(h, w, 4)[..., 0]
-        return np.ascontiguousarray(plane.reshape(h, w), dtype=np.float32)
-
-    def field_plane():
-        nonlocal off
-        n = w * h * 8
-        plane = np.frombuffer(raw, dtype=np.float16, count=n // 2, offset=off)
-        off += n
-        return np.ascontiguousarray(plane.reshape(h, w, 4))
-
-    luma_prev, luma_cur = luma_plane(), luma_plane()
-    field_fwd, field_rev = field_plane(), field_plane()
-    return luma_prev, luma_cur, field_fwd, field_rev
-
-
-def load_dataset(data_dir):
-    files = sorted(Path(data_dir).glob("fg_*.bin"))
-    if not files:
-        sys.exit(f"no fg_*.bin samples under {data_dir}")
-    samples = []
-    for f in files:
-        try:
-            samples.append(load_sample(f))
-        except ValueError as e:
-            print(f"skipping {e}", file=sys.stderr)
-    print(f"loaded {len(samples)} samples "
-          f"({samples[0][0].shape[1]}x{samples[0][0].shape[0]} field res)")
-    return samples
-
-
-# --------------------------------------------------------------------------
-# Bilinear sampling (GL semantics: clamp-to-edge, half-texel centers)
-# --------------------------------------------------------------------------
-
-def bilinear(img, cy, cx):
-    """Sample img at continuous texel coords (cy, cx); returns value and the
-    analytic gradient (d/dcy, d/dcx). Matches texture() with a normalized
-    clamp-to-edge bilinear sampler."""
-    h, w = img.shape
-    fy = cy - 0.5
-    fx = cx - 0.5
-    y0 = np.floor(fy).astype(np.int64)
-    x0 = np.floor(fx).astype(np.int64)
-    wy = (fy - y0).astype(np.float32)
-    wx = (fx - x0).astype(np.float32)
-    y0c = np.clip(y0, 0, h - 1)
-    y1c = np.clip(y0 + 1, 0, h - 1)
-    x0c = np.clip(x0, 0, w - 1)
-    x1c = np.clip(x0 + 1, 0, w - 1)
-    v00 = img[y0c, x0c]
-    v10 = img[y0c, x1c]
-    v01 = img[y1c, x0c]
-    v11 = img[y1c, x1c]
-    top = v00 + wx * (v10 - v00)
-    bot = v01 + wx * (v11 - v01)
-    val = top + wy * (bot - top)
-    dvdx = (1.0 - wy) * (v10 - v00) + wy * (v11 - v01)
-    dvdy = bot - top
-    return val, dvdy, dvdx
-
-
-# --------------------------------------------------------------------------
-# Features (channel-for-channel the shader's phase A)
-# --------------------------------------------------------------------------
-
-def features(X, Y, luma_src, luma_dst, y0, x0, size, mode=0.0):
-    """12-channel feature crop of `size` starting at (y0, x0)."""
-    ys, xs = slice(y0, y0 + size), slice(x0, x0 + size)
-    Xc = X[ys, xs].astype(np.float32)
-    Yc = Y[ys, xs].astype(np.float32)
-    ld = luma_dst[ys, xs].astype(np.float32)
-    py, px = np.mgrid[y0:y0 + size, x0:x0 + size].astype(np.float32)
-    lw, _, _ = bilinear(luma_src, py + 0.5 - Xc[..., 1], px + 0.5 - Xc[..., 0])
-    resid = np.abs(ld - lw) / np.maximum(1.0, np.maximum(np.abs(ld), np.abs(lw)))
-    f = np.empty((12, size, size), np.float32)
-    f[0] = Xc[..., 0] * 0.125
-    f[1] = Xc[..., 1] * 0.125
-    f[2] = Xc[..., 2]
-    f[3] = np.minimum(Xc[..., 3] * 0.5, 1.0)
-    f[4] = Yc[..., 0] * 0.125
-    f[5] = Yc[..., 1] * 0.125
-    f[6] = Yc[..., 2]
-    f[7] = np.minimum(Yc[..., 3] * 0.5, 1.0)
-    f[8] = ld
-    f[9] = lw
-    f[10] = resid
-    f[11] = mode
-    return f
-
-
-# --------------------------------------------------------------------------
-# The net: three valid 3x3 convs (matches the shader's fused kernel over a
-# padded tile; training crops sit in the interior so no padding is needed)
-# --------------------------------------------------------------------------
-
-def conv_fwd(x, W, b):
-    win = np.lib.stride_tricks.sliding_window_view(x, (KSIZE, KSIZE), axis=(2, 3))
-    return np.einsum("bihwkl,oikl->bohw", win, W, optimize=True) + b[None, :, None, None]
-
-
-def conv_bwd(x, W, dout):
-    win = np.lib.stride_tricks.sliding_window_view(x, (KSIZE, KSIZE), axis=(2, 3))
-    dW = np.einsum("bihwkl,bohw->oikl", win, dout, optimize=True)
-    db = dout.sum(axis=(0, 2, 3))
-    dpad = np.pad(dout, ((0, 0), (0, 0), (2, 2), (2, 2)))
-    dwin = np.lib.stride_tricks.sliding_window_view(dpad, (KSIZE, KSIZE), axis=(2, 3))
-    dx = np.einsum("bohwkl,oikl->bihw", dwin, W[:, :, ::-1, ::-1], optimize=True)
-    return dx, dW, db
-
-
-def net_fwd(params, x):
-    a1 = np.maximum(conv_fwd(x, params["W1"], params["b1"]), 0.0)
-    a2 = np.maximum(conv_fwd(a1, params["W2"], params["b2"]), 0.0)
-    o = conv_fwd(a2, params["W3"], params["b3"])
-    return o, (x, a1, a2)
-
-
-def net_bwd(params, cache, do):
-    x, a1, a2 = cache
-    da2, dW3, db3 = conv_bwd(a2, params["W3"], do)
-    da2 *= a2 > 0
-    da1, dW2, db2 = conv_bwd(a1, params["W2"], da2)
-    da1 *= a1 > 0
-    _, dW1, db1 = conv_bwd(x, params["W1"], da1)
-    return {"W1": dW1, "b1": db1, "W2": dW2, "b2": db2, "W3": dW3, "b3": db3}
-
-
-def init_params(rng):
-    p = {}
-    for i, (ci, co) in enumerate(LAYERS, 1):
-        if i == len(LAYERS):
-            # Zero head: the untrained net is exactly Stage B.
-            p[f"W{i}"] = np.zeros((co, ci, KSIZE, KSIZE), np.float32)
-        else:
-            std = np.sqrt(2.0 / (ci * KSIZE * KSIZE))
-            p[f"W{i}"] = rng.normal(0.0, std, (co, ci, KSIZE, KSIZE)).astype(np.float32)
-        p[f"b{i}"] = np.zeros(co, np.float32)
-    return p
 
 
 # --------------------------------------------------------------------------
@@ -255,10 +99,7 @@ def batch_loss(params, views, size, train=True):
     # correction may recover confidence only when its FINAL vector predicts
     # this frame pair. The gate is intentionally stop-gradient; it is a safety
     # verdict, while FLOW_AUX below supplies the rejected flow's learning path.
-    refined_resid = np.abs(warped - ld) / np.maximum(
-        1.0, np.maximum(np.abs(warped), np.abs(ld)))
-    t = np.clip((refined_resid - 0.03) / 0.07, 0.0, 1.0)
-    gate = 1.0 - t * t * (3.0 - 2.0 * t)
+    gate = evidence_gate(warped, ld, ls_pt)
     dc_raw = o[:, 2]
     dc_chain = np.where(dc_raw < 0.0, 1.0, gate)
     dc = dc_raw * dc_chain
@@ -341,20 +182,6 @@ def make_views(samples, idx, rng, crop, count):
         views.append((ff, fr, lp, lc, y0, x0))
         views.append((fr, ff, lc, lp, y0, x0))
     return views
-
-
-def export(params, path):
-    with open(path, "wb") as f:
-        f.write(struct.pack("<3I", MAGIC_BLOB, BLOB_VERSION, len(LAYERS)))
-        for ci, co in LAYERS:
-            f.write(struct.pack("<3I", ci, co, KSIZE))
-        for i in range(1, len(LAYERS) + 1):
-            # Shader layout: [c_out][ky][kx][c_in] — input channels contiguous
-            # so the kernel reads whole vec4 groups.
-            params[f"W{i}"].transpose(0, 2, 3, 1).astype("<f4").tofile(f)
-            params[f"b{i}"].astype("<f4").tofile(f)
-    total = sum(p.size for p in params.values())
-    print(f"exported {total} floats -> {path}")
 
 
 def main():

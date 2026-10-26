@@ -13,4 +13,4 @@ source "$(dirname "$0")/steamos_common_remote.sh" "$2" "$3"
 
 ./copy_to_steamos_device_rsync.sh "$STEAMOS_DEVICE_IP"
 envsshpass ssh -t "steamos@$STEAMOS_DEVICE_IP" \
-    "$STEAMOS_REMOTE_REPO/tools/steamos_sessionctl_local.sh $SESSION_VERB '$STEAMOS_USER_PASSWORD'"
+    "$(envquote "$STEAMOS_DEVICE_PATH/tools/steamos_sessionctl_local.sh") $(envquote "$SESSION_VERB") $(envquote "$STEAMOS_USER_PASSWORD")"

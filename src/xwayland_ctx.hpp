@@ -21,6 +21,7 @@ class gamescope_xwayland_server_t;
 struct ignore;
 struct steamcompmgr_win_t;
 class MouseCursor;
+namespace gamescope { struct PresentTimingRoute; }
 
 extern LogScope xwm_log;
 
@@ -33,7 +34,11 @@ struct focus_t
 	steamcompmgr_win_t				*externalOverlayWindow = nullptr;
 	steamcompmgr_win_t				*notificationWindow = nullptr;
 	steamcompmgr_win_t				*overrideWindow = nullptr;
+	// Earlier overrides still mapped beneath the current one, oldest first. Global focus only.
+	std::vector<steamcompmgr_win_t*>	overrideUnderlayWindows;
 	steamcompmgr_win_t				*overrideWindowMouse = nullptr;
+	// Same-app helpers from other processes (eg. Xalia's highlight), painted above the override.
+	std::vector<steamcompmgr_win_t*>	decorationWindows;
 	bool			outdatedInteractiveFocus = false;
 	bool			bResetToCorner = false;
 	bool			bResetToCenter = false;
@@ -48,6 +53,10 @@ struct CommitDoneEntry_t
 	uint64_t winSeq;
 	uint64_t commitID;
 	uint64_t desiredPresentTime;
+	uint32_t timingFlags;
+	std::shared_ptr<gamescope::PresentTimingRoute> route;
+	uint64_t presentAnchor;
+	uint64_t presentAnchorGrid;
 	uint64_t earliestPresentTime;
 	uint64_t earliestLatchTime;
 	bool fifo;
@@ -88,14 +97,14 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 
 	std::unique_ptr<MouseCursor> cursor;
 
-	CommitDoneList_t doneCommits;
+	std::shared_ptr<CommitDoneList_t> doneCommits = std::make_shared<CommitDoneList_t>();
 
 	double accum_x = 0.0;
 	double accum_y = 0.0;
 
 	bool force_windows_fullscreen = false;
 
-	bool bTouchPointerEmulation = false;
+	std::optional<bool> obTouchPointerEmulation;
 
 	std::vector< steamcompmgr_win_t* > GetPossibleFocusWindows();
 	void DetermineAndApplyFocus( const std::vector< steamcompmgr_win_t* > &vecPossibleFocusWindows );
@@ -105,6 +114,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gameAtom;
 		Atom overlayAtom;
 		Atom externalOverlayAtom;
+		Atom mangoappMsgTypeAtom;
 		Atom gamesRunningAtom;
 		Atom screenZoomAtom;
 		Atom screenScaleAtom;
@@ -120,7 +130,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom winNormalAtom;
 		Atom sizeHintsAtom;
 		Atom netWMStateFullscreenAtom;
-		Atom activeWindowAtom;
+		Atom netActiveWindowAtom;
 		Atom netWMStateAtom;
 		Atom WMTransientForAtom;
 		Atom netWMStateHiddenAtom;
@@ -166,6 +176,8 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom gamescopeXWaylandModeControl;
 
 		Atom gamescopeFPSLimit;
+		Atom gamescopeKeyboardLayout;
+		Atom gamescopeLimiterFeedback;
 		Atom gamescopeDynamicRefresh[gamescope::GAMESCOPE_SCREEN_TYPE_COUNT];
 		Atom gamescopeLowLatency;
 

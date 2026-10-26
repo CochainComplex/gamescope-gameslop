@@ -170,6 +170,7 @@ namespace gamescope
 
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) override;
 		virtual bool UsesModifiers() const override;
+		virtual bool UsesDmabufForPresentation() const override { return false; }
 		virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const override;
 
         virtual IBackendConnector *GetCurrentConnector() override;
@@ -180,6 +181,7 @@ namespace gamescope
         virtual bool SupportsTearing() const override;
 		virtual bool SupportsFramegen() const override;
 		virtual bool UsesVulkanSwapchain() const override;
+		virtual bool SupportsIndependentRefresh() const override { return true; }
 
 		virtual bool IsSessionBased() const override;
 		virtual bool SupportsExplicitSync() const override;
@@ -447,14 +449,14 @@ namespace gamescope
 		// produced it, as the DRM and nested-Wayland present paths do.
 		vulkan_framegen_note_present_composite_seqno( *oCompositeResult );
 
+		// Complete the composite and its present-layout transition before
+		// queueing presentation; queue issue order alone does not cover it.
+		vulkan_wait( *oCompositeResult, true );
+
 		// PresentationFeedback is hooked up inside vulkan_present_to_window():
 		// this backend's completion signal is VK_KHR_present_wait, published from
 		// the present-wait thread.
 		const bool bPresented = vulkan_present_to_window();
-
-		// Wait for the composite result on our side *after* we
-		// commit the buffer to the compositor to avoid a bubble.
-		vulkan_wait( *oCompositeResult, true );
 
 		// No image reached the swapchain; rendervulkan has arranged a retry
 		// (or shutdown), so keep the requests this frame was meant to service.

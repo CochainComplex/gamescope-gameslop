@@ -1,10 +1,37 @@
 # Frame Generation Maintenance and Publication Guide
 
-This guide defines the contracts that a frame-generation change must preserve.
-It complements the algorithm description in
-[`framegen-architecture.md`](framegen-architecture.md). The numbered proposal
-documents are design history; they are not a substitute for checking the current
-symbols below.
+The contracts a frame-generation change must preserve, the source map, and the
+validation and publication checks. It complements the algorithm description in
+[`framegen-architecture.md`](framegen-architecture.md); the numbered proposal
+documents are design history, not a substitute for checking the current symbols.
+
+Audience: maintainers and reviewers of the frame-generation code.
+Related: [Documentation index](README.md) · [User guide](framegen-howto.md) · [Configuration reference](framegen-reference.md) · [Architecture](framegen-architecture.md) · [Testing](framegen-testing.md) · [Proposals](framegen-proposals/README.md)
+
+## I changed X: what do I run?
+
+Start here, then read the matching class in
+[Validation by change class](#validation-by-change-class) for the commands.
+
+| You changed | Minimum to run | What it proves |
+|---|---|---|
+| Docs, launcher scripts, comments | The shell and Python checks from CI (`bash -n`, `shellcheck -x`, the hybrid fixture test, `py_compile`) | Scripts parse and lint; no GPU needed |
+| A policy header in `src/framegen` | The standalone `c++` contract test, then `meson test` for `framegen_deadline` | The pure logic still meets its contract; no Vulkan or meson needed for the first step |
+| Scheduler, queue, resources or shaders | Full `meson test`, the nested smoke harness ([testing](framegen-testing.md)), and a native DRM/KMS run | Execution and import (nested); real vblank smoothness (native only) |
+| Shader math, confidence or ML | All of the above, plus the offline evaluators and matched visual A/Bs | Quality and timing, not only that it runs |
+| A flag, variable, default, HUD row or metrics field | Update [`framegen-reference.md`](framegen-reference.md) in the same commit | The reference stays complete |
+
+## Contents
+
+- [I changed X: what do I run?](#i-changed-x-what-do-i-run)
+- [Source map](#source-map)
+- [Non-negotiable runtime contracts](#non-negotiable-runtime-contracts)
+- [Temporal and algorithm contracts](#temporal-and-algorithm-contracts)
+- [C++ and shader ABI](#c-and-shader-abi)
+- [Resource and cache identity](#resource-and-cache-identity)
+- [In-situ learning](#in-situ-learning)
+- [Validation by change class](#validation-by-change-class)
+- [Publication checklist](#publication-checklist)
 
 ## Source map
 
@@ -13,6 +40,8 @@ symbols below.
 | CLI and environment | `src/main.cpp` | parsing, validation, debug controls |
 | Framegen types and pipeline policy | `src/framegen/types.hpp`, `src/framegen/policy.hpp` | mode/pipeline vocabulary and pure degradation-ladder resolution |
 | Temporal, scheduling, and dispatch policy | `src/framegen/temporal.hpp`, `src/framegen/scheduling.hpp`, `src/framegen/dispatch_policy.hpp` | pure phase math, cadence/deadline planning, and capability-to-strategy selection |
+| Deadline timeline and bidir delay controller | `src/framegen/deadline.hpp` | absolute-deadline admission, the display-chain timing state and the minimum viable present lead (`update_minimum_viable_present_lead`), and the bidir delay D, ring bound and queue planning |
+| HUD, metrics and GPU timing | `src/framegen/hud.hpp`, `src/framegen/metrics.hpp`, `src/framegen/query_ring.hpp` | HUD text/rate state, metrics-window accounting, and timestamp-query ring bookkeeping |
 | Self-supervised adaptation policy | `src/framegen/adaptation.hpp` | B4 counter decoding, EMA state, and next-batch threshold derivation |
 | Numeric and setting contracts | `src/framegen/numeric.hpp`, `src/framegen/settings.hpp` | fast-math-safe fp32 classification and strict scalar/path parsing |
 | Shader and ML contracts | `src/framegen/push_constants.hpp`, `src/framegen/net_layout.hpp`, `src/framegen/net_profile.hpp` | CPU/GLSL ABI, tensor layout, and GSFR validation/migration |
@@ -22,8 +51,9 @@ symbols below.
 | Presentation choice | `src/steamcompmgr.cpp` | real/generated/repeat arbitration and timed flips |
 | Backend present | `src/Backends/DRMBackend.cpp`, `src/Backends/WaylandBackend.cpp` | final generated-frame substitution |
 | Algorithms | `src/shaders/cs_framegen_*.comp` | extrapolation, motion estimation, validation, warp, ML |
-| Offline ML tools | `scripts/framegen-net-*.py` | GSFD parsing, training, GSFR evaluation |
-| Contract tests | `tests/test_framegen.cpp` | degradation, temporal, cadence/deadline admission, adaptation, dispatch, ABI encoding, net layout, GSFR compatibility, and atomic-output contracts |
+| Offline ML tools | `scripts/framegen-net-*.py`, `scripts/framegen-color-eval.py` | GSFD parsing, training, GSFR evaluation, GSCF full-colour evaluation |
+| Validation harness | `scripts/framegen-nested-smoke.py`, `scripts/framegen-showcase.sh`, `scripts/framegen-showcase-report.py`, `scripts/framegen-hindsight-eval.py`, `scripts/framegen-headless-host.py` | nested smoke cases, showcase/baseline compare, offline evaluation; see [framegen-testing.md](framegen-testing.md) |
+| Contract tests | `tests/test_framegen.cpp`, `tests/framegen_deadline.cpp` | degradation, temporal, cadence/deadline admission, adaptation, dispatch, ABI encoding, net layout, GSFR compatibility, and atomic-output contracts |
 
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
@@ -80,7 +110,10 @@ or ownership bugs.
 8. **Classic fixed-slot mode suppresses VRR and tearing.** VRR hybrid is an
    explicit, dedicated-queue-only timing regime. Do not let a shader-quality
    change implicitly select a present mode.
-9. **JIT prediction is admission-only.** It may spend idle presentation-GPU work
+9. **Deadline-scheduler prediction is admission-only** (called "JIT" in
+   [proposal 06](framegen-proposals/06-jit-phase-display-clock.md); the
+   `GAMESCOPE_FRAMEGEN_JIT` variable is a legacy no-op, the deadline scheduler
+   is the default). It may spend idle presentation-GPU work
    on a disposable backup or skip that work. It must not delay a real frame,
    wait for a generated frame, or override real/generated/repeat arbitration.
 10. **Storage-image formats match their views.** Generic output shaders use
@@ -135,15 +168,17 @@ or ownership bugs.
 Framegen push constants bypass the shared upload arena so dedicated-queue work
 cannot race its host allocator. The C++ structures from `FramegenPushData_t`
 through `FramegenMotionNetOptPush_t` are copied verbatim into GLSL blocks.
-`src/framegen/push_constants.hpp` has compile-time size, semantic-member offset,
-standard-layout, and trivially-copyable assertions for every block.
+`src/framegen/push_constants.hpp` has compile-time per-block size, semantic-member offset,
+standard-layout, and trivially-copyable assertions for the blocks it covers;
+the cap on block size (`k_uFramegenPushConstantSize`) is asserted in `src/rendervulkan.cpp`.
 
 When changing a push block:
 
 1. Change the C++ structure and every matching GLSL variant in the same commit.
 2. Preserve scalar types and byte offsets; do not substitute C++ `bool` for a
    shader integer or float flag.
-3. Keep the block at or below `k_uFramegenPushConstantSize`.
+3. Keep the block at or below `k_uFramegenPushConstantSize` (64, defined in
+   `src/rendervulkan.cpp` with its `static_assert`).
 4. Build all shaders, including paired, fp16, bidirectional, training, and
    optimizer variants. A successful C++ compile alone does not prove the GLSL
    member order matches.
@@ -173,8 +208,9 @@ Other duplicated ABI constants require the same treatment:
   readback paths. `src/framegen/adaptation.hpp` is the CPU source of truth for
   the image width, counter interpretation, EMA, and derived thresholds. A shader
   layout change requires matching decoder and boundary-test changes.
-- `k_uFramegenDescriptorSets` must cover the maximum dispatch count of one legal
-  batch. The current worst case is 25 and the ring has 30 entries. Recording
+- `k_uFramegenDescriptorSets` (`src/rendervulkan.hpp`) must cover the maximum dispatch count of one legal
+  batch. The current worst case is 25 (`k_uFramegenMaxDispatchesPerBatch`, also in
+  `src/rendervulkan.hpp`) and the ring has 30 entries. Recording
   counts framegen dispatches and fails before a descriptor can wrap within one
   batch; this capacity does not permit a second batch in flight.
 
@@ -246,14 +282,25 @@ reinitialized from the finite prior.
 Profile I/O stays off the compositor hot path. Checkpoints use the owned writer
 thread and atomic replace; reset/exit joins it before the final flush. The
 renderer owns profile state, logging, and worker synchronization;
-`net_profile.hpp` owns the stateless serialized-format checks; and
+`net_profile.hpp` owns the stateless serialized-format checks;
+`net_profile_io.cpp` owns cold synchronous GSFR/GSFP input-file reads, returning
+status and validated data to the renderer's existing logging/activation path.
+Bare GSFR retains legacy migration and trailing-byte acceptance; GSFP retains
+its bounded read and exact current-format checks. This input seam does not own
+the store, neutral initialization, checkpoint worker or GPU readbacks.
 `AtomicOutputFile` owns only the output transaction. It creates a unique staging
 file beside the destination, checks every write and the buffered close, then
 renames. Destruction before commit removes the staging file and preserves the
 old destination. Concurrent instances can race over which complete snapshot is
 newest, but cannot share or corrupt a partial staging file. GSFD/GSCF capture
-uses the same primitive and remains a measurement-only synchronous path. Keep
-the three disk/readback consumers explicitly out of line: they are polled from
+uses the same primitive and remains a measurement-only synchronous path.
+GSFD/GSCF payload serialization lives in `src/framegen/capture_file.cpp`. It
+accepts borrowed CPU plane views only; the renderer retires GPU writes before
+constructing them and owns transaction commit, capture counters, logging,
+readback release and post-capture history invalidation. The serializer neither
+retains views nor submits work. One packed-row writer serves both formats;
+byte-level file contract tests protect metadata, plane order and padding.
+Keep the three disk/readback consumers explicitly out of line: they are polled from
 `framegen_submit_planned`, and GCC otherwise folds cold string and file machinery
 into the Vulkan command recorder even when capture is disabled.
 
@@ -265,20 +312,103 @@ the only data eligible for persistence after optimizer divergence. During tests,
 point `GAMESCOPE_FRAMEGEN_NET_PROFILE` at a disposable copy. Never use a known-good
 profile as the writable test destination.
 
+## Offline numerical reference
+
+`scripts/framegen_field_reference.py` owns the shared CPU field/reconstruction
+operators, empirical `Numerics` model and bilinear sampler with analytic
+gradients. It depends only on NumPy and the standard library. The trainer
+re-exports the same sampler; the field gate retains its existing operator
+aliases for temporal analysis and other consumers. File-based script imports
+bootstrap the resolved sibling directory and use the canonical module name.
+Compare different source trees in separate processes to avoid Python's module
+cache mixing their implementations.
+
+Keep CLI parsing, scoring, parity thresholds and applicability reporting with
+their existing tools; GSFD decoding has the separate reader boundary below. Moving an operator must preserve expression
+order, dtypes and half-image boundaries, including both sampler gradients used
+in training. The selected model remains empirical: unchanged numerical output
+does not qualify another GPU or turn a failed parity gate into a pass.
+
+`scripts/framegen_net_formats.py` owns the offline GSFR/GSFP layout constants,
+weight decoding and export. Trainer/evaluator aliases preserve existing callers;
+GSFD dataset parsing stays in its separate reader; training, scoring and CLI
+argument handling remain in the tools. This format leaf imports neither a driver
+nor the numerical reference.
+Preserve Python's existing admission behavior independently of the C++ runtime:
+bare shape-compatible versions warn without legacy shading migration, bare
+trailing bytes are rejected, and profile sets require the current version.
+Format refactors need exact bytes, array layout and error/stream comparisons.
+
+`scripts/framegen_net.py` owns the shared NumPy convolution, forward/backward
+passes and initialization for the fixed offline refiner. It imports the existing
+layout constants from the format leaf; trainer aliases preserve analysis callers.
+Keep loss, optimizer and CLI policy in the trainer; cropped features/evidence
+have the separate boundary below. Preserve expression
+order, ReLU masks, cache ownership and RNG progression (the zero head and biases
+consume no draws). Verify nonzero-head gradients as well as neutral output;
+neutral-only comparisons can hide changes in the earlier layers.
+
+`scripts/framegen_color_capture.py` owns GSCF v1/v2/v3 admission, metadata
+and packed RGB plane decoding. The color evaluator re-exports the existing
+names and retains optional LPIPS and CLI policy; NumPy scoring has the separate
+boundary below.
+Preserve plane/candidate identity, validation order, errors and extra flag-bit
+acceptance. Decode stored code values without guessing a transfer function or
+clipping HDR range; alpha is ignored and nonfinite pixels reach the existing
+scoring policy. Parser changes need exact arrays, metadata and malformed-input
+comparisons, including each supported pixel format and capture version.
+
+`scripts/framegen_color_metrics.py` owns full-color code-value box means, SSIM,
+luminance, per-frame grading and temporal residual-change measurements, with
+evaluator aliases for analysis consumers. It imports only NumPy and `math`.
+Preserve reference-based HDR scaling, reduction order and metric thresholds;
+do not unify these with field-resolution scoring or infer an EOTF transform.
+Per-frame grading sanitizes nonfinite components and reports affected pixels;
+temporal scoring deliberately propagates nonfinite residuals. Sequence ordering
+and homogeneous-set checks remain in the evaluator. Verify exact metrics and
+CLI output, continuity breaks, candidate identity and block partitions. These
+image-quality measurements do not qualify live pacing or input latency.
+
+`scripts/framegen_field_capture.py` owns the existing GSFD v1 sample/dataset
+readers, with trainer aliases for analysis consumers. It imports no trainer,
+numerical reference or model code. Preserve native float16 field views and
+contiguous float32 lumas, including RGBA16F red-channel extraction. Keep existing
+permissive admission and dataset error/stream behavior: trailing/nonfinite data
+is not newly rejected, `load_dataset` skips `ValueError` only, and empty/all-bad
+or truncated-header inputs retain their distinct outcomes. Hindsight's broader
+exception handling remains with that consumer. Reader extraction is not policy
+hardening or a parity improvement.
+
+`scripts/framegen_net_features.py` owns the trainer's cropped twelve-channel
+inputs and evidence gate, retaining trainer aliases for analysis consumers.
+It uses the canonical bilinear sampler and imports no trainer, model, capture
+reader or scoring policy. Preserve casts before crop arithmetic, channel order,
+mode and evidence thresholds/expression order. The evaluator's whole-frame
+builder retains its separate shape, fixed mode and dtype timing; do not unify
+it with the crop builder or merge the distinct SSIM implementations as a source
+refactor. Verify channels, sampler coordinates, gate boundaries and actual
+training/evaluator outputs; exact CPU extraction does not qualify GPU parity.
+
 ## Validation by change class
 
-**Documentation, launchers, comments, and compile-time guards:**
+**Documentation, launchers, comments:**
 
 ```sh
-bash -n scripts/env-gamescope-local.sh scripts/test-framegen.sh \
-  scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
-  scripts/run-framegen-native.sh
-shellcheck -x scripts/env-gamescope-local.sh scripts/test-framegen.sh \
-  scripts/framegen-launch-common.sh scripts/watch-framegen.sh \
-  scripts/run-framegen-native.sh
-PYTHONPYCACHEPREFIX=/tmp/gamescope-pycache \
-  python3 -m py_compile scripts/framegen-net-train.py \
-    scripts/framegen-net-eval.py scripts/framegen-color-eval.py
+bash -n scripts/framegen-doctor.sh   # repeat per file; bash -n parses only its first operand
+shellcheck -x scripts/*.sh
+bash tests/gamescope_hybrid_test.sh
+python3 -m py_compile scripts/*.py
+```
+
+Proves: the scripts parse, lint clean, the hybrid launcher fixture passes, and
+the Python tools compile. The authority is the "Check framegen maintenance
+tooling" step in `.github/workflows/main.yml`, which lists the exact files; do
+not maintain a second copy here. The globs above are a quick local shortcut
+and may include scripts CI does not check.
+
+**Policy headers only (standalone, no Vulkan or meson):**
+
+```sh
 c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
   tests/test_framegen.cpp src/framegen/atomic_file.cpp \
   -o /tmp/gamescope-framegen-contracts
@@ -290,7 +420,16 @@ c++ -std=c++20 -O3 -ffast-math -Wall -Wextra -Werror -Isrc \
 git diff --check
 ```
 
+Proves: the stateless contract tests pass with and without `-ffast-math`
+(the second run catches NaN/inf checks that fast math would optimise away).
+The standalone `c++` lines build only `tests/test_framegen.cpp`. The second
+contract test, `tests/framegen_deadline.cpp`, needs Catch2 and runs only through
+meson: `meson test -C <builddir> framegen framegen_deadline` is the fast path.
+
 **C++, shader, resource, queue, or scheduling changes:**
+
+Proves: it builds, the contract tests pass, and the shader benchmark still
+runs. It does not prove pacing; the nested and native runs below do that.
 
 ```sh
 GAMESCOPE_BUILD_DIR=build-perf ./scripts/env-gamescope-local.sh \
@@ -298,8 +437,22 @@ GAMESCOPE_BUILD_DIR=build-perf ./scripts/env-gamescope-local.sh \
 GAMESCOPE_BUILD_DIR=build-perf ./scripts/env-gamescope-local.sh \
   meson test -C build-perf --print-errorlogs
 GAMESCOPE_BUILD_DIR=build-perf PIPELINE=guided \
-  ./scripts/test-framegen.sh bench vendor:device
+  ./scripts/test-framegen.sh bench <gpu>
 ```
+
+`<gpu>` is `auto`, `nvidia`, `amd`, `intel`, or a `vendor:device` id taken from
+`./scripts/test-framegen.sh gpus`.
+
+`build-perf` is just a second meson build directory used for benchmarks. Any
+name works, and `GAMESCOPE_BUILD_DIR` selects it. Create it once:
+
+```sh
+GAMESCOPE_BUILD_DIR=build-perf ./scripts/env-gamescope-local.sh \
+  meson setup build-perf -Dbuildtype=release -Denable_tests=true
+```
+
+Use the same tree for every script in one comparison. Mixing trees makes
+benchmark and cadence comparisons meaningless.
 
 Also run a nested functional test and a native DRM/KMS pacing test. Check debug
 logs for real/generated/repeat cadence, degradation changes, scene cuts, output
@@ -308,7 +461,7 @@ import; it does not prove native vblank smoothness.
 
 **Shader math, phase, confidence, reconstruction, or ML changes:** perform all of
 the above, then compare held-out GSCF/GSFD metrics and run matched visual A/Bs at
-x2, x3, and x4. Include fast camera motion, disocclusion, translucency, HUD/text,
+x2, x3, and x4 (in forward mode the multiplier changes only buffer sizes, in bidir it changes how many frames are made). Include fast camera motion, disocclusion, translucency, HUD/text,
 low source rate, a scene cut, and presenter overload. Report quality and timing;
 an image-quality gain that introduces cadence misses is not a net improvement.
 
@@ -319,9 +472,13 @@ an image-quality gain that introduces cadence misses is not a net improvement.
 - Build trees, wrap downloads, captures, learned profiles, logs, and benchmark
   binaries are not committed. Meson wrap directories stay ignored; wrap files
   and submodule declarations are the reproducible dependency boundary.
-- New files are covered by the repository's BSD-2-Clause license unless they
-  carry a different explicit license. Do not redistribute third-party benchmark
+- New files follow the repository default license in [`LICENSE`](../LICENSE)
+  unless they carry their own SPDX header. Do not redistribute third-party benchmark
   assets with this repository.
+- Any new or changed flag, environment variable, default, HUD row or metrics
+  field updates [`framegen-reference.md`](framegen-reference.md) in the same
+  commit. Verify against the getopt table in `src/main.cpp` and
+  `grep -rn GAMESCOPE_FRAMEGEN_ src/`.
 - `git diff --check`, the local build, and the full test suite pass. Review the
   final diff specifically for push-layout, queue wait/signal, cache-key, history
   invalidation, and flip-priority changes.

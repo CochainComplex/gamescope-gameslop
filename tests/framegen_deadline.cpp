@@ -3,15 +3,19 @@
 
 #include "framegen/deadline.hpp"
 #include "framegen/hud.hpp"
+#include "framegen/hud_history.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -45,6 +49,128 @@ CausalPlanOptions_t dedicated_backup_options( uint64_t nowNs, uint64_t epoch )
 
 } // namespace
 
+
+TEST_CASE("GPU diagnostics distinguish candidates from verified device inventory", "[framegen][hud][gpu-diagnostics]")
+{
+    GpuDiagnostics inventory;
+    inventory.cards={
+        {"AMD integrated", "0000:66:00.0", "/dev/dri/renderD128", "RADV", 0x1002,0x150e,false},
+        {"NVIDIA discrete", "0000:01:00.0", "/dev/dri/renderD129", "NVIDIA",0x10de,0x2db9,false},
+        {"CPU Vulkan", "", "", "software",0x10005,0,true}};
+    inventory.presenter=0;
+    inventory.scope="Nested swapchain: outer display GPU unknown";
+    inventory.build="0.1.0+abc123+";
+    const auto inferred=resolve_gpu_diagnostics(inventory,gpu_buffer_observation("NVIDIA",true));
+    REQUIRE(inferred.renderer==1u);
+    CHECK(inferred.cards[inferred.presenter].pci=="0000:66:00.0");
+    CHECK(inferred.cards[inferred.renderer].pci=="0000:01:00.0");
+    CHECK(inferred.evidence.find("Inferred")!=std::string::npos);
+    CHECK(inferred.transport=="staged / copied");
+    CHECK(inferred.scope.find("outer display GPU unknown")!=std::string::npos);
+    CHECK(inferred.build==inventory.build);
+
+    const auto linear=resolve_gpu_diagnostics(inventory,gpu_buffer_observation("linear",false));
+    CHECK(linear.renderer==kUnknownGpu); // Importability is not producer identity.
+    CHECK(linear.evidence.find("no GPU identity")!=std::string::npos);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("cpu",false)).renderer==kUnknownGpu);
+    CHECK(resolve_gpu_diagnostics(inventory,0).renderer==kUnknownGpu);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("AMD",false)).renderer==0u);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("linear",true)).renderer==1u);
+    CHECK(resolve_gpu_diagnostics(inventory,gpu_buffer_observation("vendor0xaa",true)).renderer==kUnknownGpu);
+
+    auto multiple=inventory;
+    multiple.cards.push_back({"Second NVIDIA", "0000:02:00.0", "", "",0x10de,0x2db9,false});
+    const auto ambiguous=resolve_gpu_diagnostics(multiple,gpu_buffer_observation("NVIDIA",true));
+    CHECK(ambiguous.renderer==kUnknownGpu);
+    CHECK(ambiguous.evidence.find("multiple")!=std::string::npos);
+    CHECK(resolve_gpu_diagnostics(multiple,gpu_buffer_observation("linear",true)).renderer==kUnknownGpu);
+
+    GpuDiagnosticsStore cache;
+    cache.initialize(inventory);
+    cache.observe("NVIDIA",true);
+    CHECK(cache.snapshot().renderer==1u);
+    cache.initialize(multiple); // Reinitialization must not reuse an old observation.
+    CHECK(cache.snapshot().renderer==kUnknownGpu);
+
+    FramegenHudSnapshot_t snapshot;
+    snapshot.gpu=inferred;
+    snapshot.clientBuffersStaged=true;
+    const auto hud=format_framegen_hud(2u,snapshot);
+    CHECK(std::string_view(hud.lines[1].data()).find("COMPOSE: AMD integrated @ 0000:66:00.0")!=std::string_view::npos);
+    CHECK(std::string_view(hud.lines[2].data()).find("RENDER?: NVIDIA discrete @ 0000:01:00.0")!=std::string_view::npos);
+    CHECK(std::string_view(hud.lines[2].data()).find("[staged]")!=std::string_view::npos);
+    snapshot.gpu=ambiguous;
+    CHECK(std::string_view(format_framegen_hud(2u,snapshot).lines[2].data()).find("@ unknown")!=std::string_view::npos);
+    for (uint32_t i=0;i<hud.lineCount;++i) CHECK(std::strlen(hud.lines[i].data())<=k_uFramegenHudMaxColumns);
+}
+
+TEST_CASE( "GPU buffer observations retain their packed wire values", "[framegen][gpu-diagnostics]" )
+{
+    const struct { const char *origin; uint32_t kind; } cases[] = {
+        {nullptr, 0}, {"", 0}, {"cpu", 1}, {"linear", 2}, {"AMD", 3},
+        {"NVIDIA", 4}, {"Intel", 5}, {"vendor0xaa", 6}, {"amd", 6}, {"CPU", 6},
+    };
+    for (const auto &c : cases) {
+        CAPTURE(c.origin, c.kind);
+        CHECK(gpu_buffer_observation(c.origin, false) == c.kind);
+        CHECK(gpu_buffer_observation(c.origin, true) == (c.kind | 256u));
+    }
+}
+
+TEST_CASE( "GPU diagnostics preserve evidence and ignore software candidates", "[framegen][gpu-diagnostics]" )
+{
+    GpuDiagnostics inventory;
+    inventory.cards = {
+        {"AMD", "", "", "", 0x1002, 0, false},
+        {"Software NVIDIA", "", "", "", 0x10de, 0, true},
+        {"Intel", "", "", "", 0x8086, 0, false},
+    };
+    inventory.presenter = 0;
+    inventory.renderer = 0; // Every resolution must discard stale inference.
+    inventory.evidence = "stale";
+    inventory.transport = "stale";
+    inventory.scope = "test scope";
+    inventory.build = "test build";
+    const struct {
+        uint32_t observation, renderer;
+        const char *evidence, *transport;
+    } cases[] = {
+        {0, kUnknownGpu, "No composited client buffer observed", "not observed"},
+        {256, kUnknownGpu, "No composited client buffer observed", "not observed"},
+        {1, kUnknownGpu, "CPU/shared-memory buffer; GPU producer unknown", "imported / not staged"},
+        {257, kUnknownGpu, "CPU/shared-memory buffer; GPU producer unknown", "staged / copied"},
+        {2, kUnknownGpu, "Unknown: linear buffer has no GPU identity", "imported / not staged"},
+        {258, 2, "Inferred: staged linear buffer, one other GPU", "staged / copied"},
+        {3, 0, "Inferred: modifier vendor, one matching GPU", "imported / not staged"},
+        {259, 0, "Inferred: modifier vendor, one matching GPU", "staged / copied"},
+        {4, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "imported / not staged"},
+        {260, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "staged / copied"},
+        {5, 2, "Inferred: modifier vendor, one matching GPU", "imported / not staged"},
+        {261, 2, "Inferred: modifier vendor, one matching GPU", "staged / copied"},
+        {6, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "imported / not staged"},
+        {262, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "staged / copied"},
+        {511, kUnknownGpu, "Unknown: buffer vendor has no matching visible GPU", "staged / copied"},
+    };
+    for (const auto &c : cases) {
+        CAPTURE(c.observation);
+        const auto result = resolve_gpu_diagnostics(inventory, c.observation);
+        CHECK(result.renderer == c.renderer);
+        CHECK(result.evidence == c.evidence);
+        CHECK(result.transport == c.transport);
+        CHECK(result.presenter == inventory.presenter);
+        CHECK(result.cards.size() == inventory.cards.size());
+        CHECK(result.scope == inventory.scope);
+        CHECK(result.build == inventory.build);
+    }
+    // Two real alternatives are ambiguous, even when the presenter is unknown.
+    inventory.presenter = kUnknownGpu;
+    CHECK(resolve_gpu_diagnostics(inventory, 258).evidence
+        == "Ambiguous: multiple matching GPUs; no exact address");
+    inventory.cards.clear();
+    CHECK(resolve_gpu_diagnostics(inventory, 258).renderer == kUnknownGpu);
+    CHECK(resolve_gpu_diagnostics(inventory, 3).renderer == kUnknownGpu);
+}
+
 TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]" )
 {
 	const FramegenHudSnapshot_t snapshot = {
@@ -76,30 +202,32 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	};
 	const FramegenHudText_t text = format_framegen_hud( 2u, snapshot );
 
-	REQUIRE( text.lineCount == 7u );
+	REQUIRE( text.lineCount == 8u );
 	CHECK( text.lines[0].data() == std::string_view{
 		"gameslop 0.1.0+76e6d5         motion x2 . learned . 120Hz fixed" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics render NVIDIA GeForce RTX  buffers xGPU" } );
+		"PRESENT: AMD Radeon Graphics @ unknown" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:online  adapt:on" } );
+		"RENDER?: NVIDIA GeForce RTX 3070 @ unknown [staged]" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 98%" } );
+		"BIDIR: off | BASE: off | NET: online | ADAPT: on" } );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   learned/motion rung 0/0  full" } );
-	std::string paceLine = "pace     hit 99%  ";
+		"SOURCE: 40fps[200] | GEN: 78fps[390] | REPEAT: 2fps | FILL: 98%" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: learned/motion rung 0/0 | STATE: full" } );
+	std::string paceLine = "HIT: 99% ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x08' );
-	paceLine += "   jitter +/-0.7ms  ";
+	paceLine += " | JITTER: +/-0.7ms ";
 	paceLine.append( k_nFramegenHudSparklineSamples, '\x02' );
-	CHECK( text.lines[5].data() == paceLine );
-	CHECK( text.lines[6].data() == std::string_view{
-		"net      online . 1.2k steps . profile loaded" } );
+	CHECK( text.lines[6].data() == paceLine );
+	CHECK( text.lines[7].data() == std::string_view{
+		"LEARN: online | STEPS: 1.2k | PROFILE: loaded" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 
 	const FramegenHudUniform_t uniform = make_framegen_hud_uniform( text, true );
-	CHECK( uniform.lineCount == 7u );
-	CHECK( uniform.widthChars == 68u );
+	CHECK( uniform.lineCount == 8u );
+	CHECK( uniform.widthChars <= k_uFramegenHudMaxColumns );
 	CHECK( uniform.hdr == 1u );
 	CHECK( ( uniform.text[0] & 0xffu ) == static_cast<uint32_t>( 'g' ) );
 	CHECK( uniform.font[static_cast<uint32_t>( 'A' ) * 2u]
@@ -109,14 +237,71 @@ TEST_CASE( "framegen HUD describes causal net cross-GPU state", "[framegen][hud]
 	tiledSnapshot.renderOrigin = "NVIDIA";
 	const FramegenHudText_t tiledText = format_framegen_hud( 2u, tiledSnapshot );
 	CHECK( tiledText.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics render NVIDIA              buffers xGPU" } );
+		"PRESENT: AMD Radeon Graphics @ unknown" } );
 
 	auto ambiguousLinearSnapshot = snapshot;
 	ambiguousLinearSnapshot.otherDeviceName = nullptr;
 	const FramegenHudText_t ambiguousLinearText =
 		format_framegen_hud( 2u, ambiguousLinearSnapshot );
 	CHECK( ambiguousLinearText.lines[1].data() == std::string_view{
-		"present  AMD Radeon Graphics render other-GPU           buffers xGPU" } );
+		"PRESENT: AMD Radeon Graphics @ unknown" } );
+}
+
+TEST_CASE( "CGA HUD uses the matching bounded ABI and ordered two-color fade", "[framegen][hud]" )
+{
+	CHECK( framegen_hud_cga_color( 0u, 0u, 0u ) == 0x55ffffu );
+	CHECK( framegen_hud_cga_color( 0u, 0u, 1u ) == 0x55ffffu );
+	for ( uint32_t step = 0u; step < 16u; ++step )
+	{
+		uint32_t magenta = 0u;
+		for ( uint32_t y = 0u; y < 4u; ++y )
+			for ( uint32_t x = 0u; x < 4u; ++x )
+			{
+				const uint32_t color = framegen_hud_cga_color( x, step * 4u + y, 65u );
+				CHECK( ( color == 0x55ffffu || color == 0xff55ffu ) );
+				magenta += color == 0xff55ffu;
+			}
+		CHECK( magenta == step );
+	}
+	for ( uint32_t x = 0u; x < 4u; ++x )
+	{
+		CHECK( framegen_hud_cga_color( x, 0u, 65u ) == 0x55ffffu );
+		CHECK( framegen_hud_cga_color( x, 64u, 65u ) == 0xff55ffu );
+	}
+	FramegenHudText_t text;
+	framegen_hud_add_line( text, "CGA" );
+	const auto normal = make_framegen_hud_uniform( text, true );
+	const auto cga = make_framegen_hud_uniform( text, true, true );
+	CHECK( normal.style == 0u );
+	CHECK( cga.style == 1u );
+	CHECK( cga.hdr == 1u );
+	CHECK( cga.font == normal.font );
+	CHECK( cga.text == normal.text );
+	CHECK( cga.lineCount == normal.lineCount );
+	CHECK( sizeof( cga ) == 1648u );
+	CHECK( framegen_hud_line_pitch( false ) == 8u );
+	CHECK( framegen_hud_line_pitch( true ) == 11u );
+	CHECK( framegen_hud_height( 5u, false ) == 48u );
+	CHECK( framegen_hud_height( 5u, true ) == 63u );
+	const auto clear = make_framegen_hud_uniform( text, true, true, 0u );
+	const auto solid = make_framegen_hud_uniform( text, true, true, 100u );
+	CHECK( ( clear.style & 1u ) == 1u );
+	CHECK( ( ( clear.style >> 8u ) & 255u ) == 1u );
+	CHECK( ( ( solid.style >> 8u ) & 255u ) == 101u );
+	CHECK( ( cga.style >> 8u ) == 0u );
+	CHECK( clear.text == solid.text );
+	CHECK( clear.font == solid.font );
+	CHECK( make_framegen_hud_uniform( text, false, false, 50u ).style == ( 51u << 8u ) );
+	// Outline: always for CGA; Quiet/Mallsoft only below 10% backing, never
+	// for the automatic 14%.
+	CHECK( framegen_hud_outlined( true ) );
+	CHECK( framegen_hud_outlined( true, 100u ) );
+	CHECK( framegen_hud_outlined( false, 0u ) );
+	CHECK( framegen_hud_outlined( false, 9u ) );
+	CHECK_FALSE( framegen_hud_outlined( false, 10u ) );
+	CHECK_FALSE( framegen_hud_outlined( false, 100u ) );
+	CHECK_FALSE( framegen_hud_outlined( false ) );
+
 }
 
 TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hud]" )
@@ -134,30 +319,30 @@ TEST_CASE( "framegen HUD exposes requested modes that fell back", "[framegen][hu
 		.generated = 390u,
 		.repeats = 10u,
 	};
-	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
+	const FramegenHudText_t text = format_framegen_hud_detailed( 1u, snapshot );
 
-	REQUIRE( text.lineCount == 5u );
+	REQUIRE( text.lineCount == 6u );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon RX 5700  render n/a                 buffers local" } );
-	CHECK( text.lines[2].data() == std::string_view{
-		"modes    bidir:requested(OFF)  base:off  net:off  adapt:off" } );
+		"PRESENT: AMD Radeon RX 5700 XT @ unknown" } );
+	CHECK( text.lines[3].data() == std::string_view{
+		"BIDIR: requested(OFF) | BASE: off | NET: off | ADAPT: off" } );
 	auto netOnly = snapshot;
 	netOnly.bidirRequested = false;
 	netOnly.netRequested = true;
-	const FramegenHudText_t netText = format_framegen_hud( 1u, netOnly );
-	CHECK( netText.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:requested(OFF)  adapt:off" } );
+	const FramegenHudText_t netText = format_framegen_hud_detailed( 1u, netOnly );
+	CHECK( netText.lines[3].data() == std::string_view{
+		"BIDIR: off | BASE: off | NET: requested(OFF) | ADAPT: off" } );
 	auto bothRequested = snapshot;
 	bothRequested.netRequested = true;
-	const FramegenHudText_t bothText = format_framegen_hud( 1u, bothRequested );
-	CHECK( bothText.lines[2].data() == std::string_view{
-		"modes    bidir:requested(OFF)  base:off  net:requested(OFF)  adapt:off" } );
+	const FramegenHudText_t bothText = format_framegen_hud_detailed( 1u, bothRequested );
+	CHECK( bothText.lines[3].data() == std::string_view{
+		"BIDIR: requested(OFF) | BASE: off | NET: requested(OFF) | ADAPT: off" } );
 	auto vrrOnly = snapshot;
 	vrrOnly.bidirRequested = false;
 	vrrOnly.vrrRequested = true;
-	const FramegenHudText_t vrrText = format_framegen_hud( 1u, vrrOnly );
-	CHECK( vrrText.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:off  adapt:off  vrr:requested(off)" } );
+	const FramegenHudText_t vrrText = format_framegen_hud_detailed( 1u, vrrOnly );
+	CHECK( vrrText.lines[3].data() == std::string_view{
+		"BIDIR: off | BASE: off | NET: off | ADAPT: off | VRR: requested(off)" } );
 	for ( uint32_t line = 0u; line < text.lineCount; line++ )
 		CHECK( std::strlen( text.lines[line].data() ) <= k_uFramegenHudMaxColumns );
 }
@@ -178,14 +363,761 @@ TEST_CASE( "framegen HUD keeps single-GPU no-net level one lean", "[framegen][hu
 	const FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
 
 	REQUIRE( text.lineCount == 5u );
+	CHECK( text.lines[0].data() == std::string_view{
+		"SOURCE: 40 fps | GENERATED: 78 fps | FILL: 98%" } );
 	CHECK( text.lines[1].data() == std::string_view{
-		"present  AMD Radeon 890M     render n/a                 buffers local" } );
+		"MODE: motion/learned x2 120Hz | GIT: 76e6d5" } );
 	CHECK( text.lines[2].data() == std::string_view{
-		"modes    bidir:off  base:off  net:off  adapt:off" } );
+		"LEARN: off | PROFILE: not loaded" } );
 	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 40fps[200] gen 78fps[390] repeat 2fps fill 98%" } );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   learned/motion rung 0/0  full" } );
+		"STATE: full | HIT: 0% | JITTER: 0.0ms" } );
+	CHECK( text.lines[4].data() ==
+		"HIT: " + std::string( 12, '\x01' ) + " | JITTER: " + std::string( 12, '\x01' ) );
+	auto buildIdentity = snapshot;
+	buildIdentity.version = "3.16.14+96ad25e89-dirty";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
+		"GIT: 96ad25e89-dirty" ) != std::string_view::npos );
+	// Meson's dirty checkout marker is a trailing '+', not only '-dirty'.
+	buildIdentity.version = "0.1.0+96ad25e89+";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
+		"GIT: 96ad25e89+" ) != std::string_view::npos );
+	// A reachable tag makes describe longer than 16 characters; the tail
+	// (hash and dirty marker) is what names the binary, so it is kept.
+	buildIdentity.version = "3.16.14+v3.16.1-120-gabcdef123+";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).ends_with(
+		"| GIT: -120-gabcdef123+" ) );
+	buildIdentity.version = "3.16.14+v3.16.1-120-gabcdef123";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).ends_with(
+		"| GIT: 1-120-gabcdef123" ) );
+	buildIdentity.version = "0123456789abcdef";
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).ends_with(
+		"| GIT: 0123456789abcdef" ) );
+	buildIdentity.version = nullptr;
+	CHECK( std::string_view( format_framegen_hud( 1u, buildIdentity ).lines[1].data() ).find(
+		"GIT: unknown" ) != std::string_view::npos );
+	const auto uniform = make_framegen_hud_uniform( text, false );
+	CHECK( uniform.lineCount == 5u );
+	CHECK( uniform.widthChars <= k_uFramegenHudMaxColumns );
+	// SOURCE is a label; its measured value carries the high-bit attribute.
+	CHECK_FALSE( framegen_hud_value_column(text.lines[0].data(),0u) );
+	CHECK( framegen_hud_value_column(text.lines[0].data(),8u) );
+	CHECK( ((uniform.text[2] >> 0u) & 0xffu) == (uint32_t('4') | 128u) );
+	CHECK( (uniform.text[0] & 0xffu) == uint32_t('S') );
+
+	auto warning = snapshot;
+	warning.netRequested = true;
+	warning.bidirRequested = true;
+	warning.vrrRequested = true;
+	const auto compact = format_framegen_hud( 1u, warning );
+	REQUIRE( compact.lineCount == 6u );
+	const std::string_view status = compact.lines[5].data();
+	CHECK( status.find( "net:requested(OFF)" ) != std::string_view::npos );
+	CHECK( status.find( "bidir:requested(OFF)" ) != std::string_view::npos );
+	CHECK( status.find( "vrr:requested(off)" ) != std::string_view::npos );
+	warning.netActive = true;
+	warning.netOnline = true;
+	warning.netTrainedSteps = 1200u;
+	warning.deadlineHitHistory.fill( 100.0 );
+	warning.pacingSdMsHistory.fill( 4.0 );
+	const auto training = format_framegen_hud( 1u, warning );
+	CHECK( training.lines[4].data() ==
+		"HIT: " + std::string( 12, '\x08' ) + " | JITTER: " + std::string( 12, '\x08' ) );
+	CHECK( std::string_view( training.lines[2].data() ).find( "online 1.2k steps" ) != std::string_view::npos );
+}
+
+static std::string framegen_read_source( const char *path )
+{
+	std::ifstream file( path );
+	return std::string( ( std::istreambuf_iterator<char>( file ) ),
+		std::istreambuf_iterator<char>() );
+}
+
+static bool framegen_source_ident( char c )
+{
+	return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) || c == '_';
+}
+
+// C++/GLSL source reduced to a canonical form for exact comparison: comments
+// dropped, whitespace removed except one space between two identifier
+// characters, string/char literals kept verbatim (raw strings and digit
+// separators included). `literal` marks the characters inside a literal.
+struct FramegenSourceCode
+{
+	std::string text;
+	std::vector<bool> literal;
+};
+
+static FramegenSourceCode framegen_source_normalize( std::string_view source )
+{
+	FramegenSourceCode code;
+	bool pendingSpace = false;
+	const auto emit = [&]( char c, bool literal )
+	{
+		if ( pendingSpace && !literal && !code.text.empty() && framegen_source_ident( code.text.back() )
+			&& framegen_source_ident( c ) )
+		{
+			code.text.push_back( ' ' );
+			code.literal.push_back( false );
+		}
+		pendingSpace = false;
+		code.text.push_back( c );
+		code.literal.push_back( literal );
+	};
+	size_t i = 0;
+	while ( i < source.size() )
+	{
+		const char c = source[i];
+		if ( source.substr( i, 2 ) == "//" )
+		{
+			while ( i < source.size() && source[i] != '\n' )
+				i++;
+			pendingSpace = true;
+		}
+		else if ( source.substr( i, 2 ) == "/*" )
+		{
+			const size_t end = source.find( "*/", i + 2 );
+			i = end == std::string_view::npos ? source.size() : end + 2;
+			pendingSpace = true;
+		}
+		else if ( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' )
+		{
+			i++;
+			pendingSpace = true;
+		}
+		else if ( c == 'R' && source.substr( i + 1, 1 ) == "\""
+			&& ( i == 0 || !framegen_source_ident( source[i - 1] ) || source[i - 1] == '8'
+				|| source[i - 1] == 'u' || source[i - 1] == 'U' || source[i - 1] == 'L' ) )
+		{
+			const size_t open = source.find( '(', i + 2 );
+			const std::string close = ")" + std::string( source.substr( i + 2, open - ( i + 2 ) ) ) + "\"";
+			const size_t end = source.find( close, open );
+			const size_t stop = end == std::string_view::npos ? source.size() : end + close.size();
+			emit( 'R', false );
+			for ( i++; i < stop; i++ )
+				emit( source[i], true );
+		}
+		else if ( c == '"' || ( c == '\'' && !( i > 0 && framegen_source_ident( source[i - 1] ) ) ) )
+		{
+			emit( c, false );
+			for ( i++; i < source.size() && source[i] != c; i++ )
+			{
+				if ( source[i] == '\\' && i + 1 < source.size() )
+					emit( source[i++], true );
+				emit( source[i], true );
+			}
+			if ( i < source.size() )
+				emit( source[i++], false );
+		}
+		else
+			emit( source[i++], false );
+	}
+	return code;
+}
+
+// Each statement that starts with `start` (canonical form, at an identifier
+// boundary, outside literals) and runs to the first `end` outside a literal,
+// whole and canonical. Comparing the full list pins both the text and the
+// number of such statements.
+static std::vector<std::string> framegen_source_statements( std::string_view source,
+	std::string_view start, std::string_view end )
+{
+	const FramegenSourceCode code = framegen_source_normalize( source );
+	std::vector<std::string> statements;
+	for ( size_t at = code.text.find( start ); at != std::string::npos; at = code.text.find( start, at + 1 ) )
+	{
+		if ( code.literal[at] || ( at > 0 && framegen_source_ident( start.front() )
+			&& framegen_source_ident( code.text[at - 1] ) ) )
+			continue;
+		size_t stop = code.text.find( end, at + start.size() );
+		while ( stop != std::string::npos && code.literal[stop] )
+			stop = code.text.find( end, stop + 1 );
+		if ( stop == std::string::npos )
+			break;
+		statements.push_back( code.text.substr( at, stop + end.size() - at ) );
+	}
+	return statements;
+}
+
+// Each definition starting with `start` through its matching closing brace.
+static std::vector<std::string> framegen_source_definitions( std::string_view source, std::string_view start )
+{
+	const FramegenSourceCode code = framegen_source_normalize( source );
+	std::vector<std::string> definitions;
+	for ( size_t at = code.text.find( start ); at != std::string::npos; at = code.text.find( start, at + 1 ) )
+	{
+		if ( code.literal[at] || ( at > 0 && framegen_source_ident( code.text[at - 1] ) ) )
+			continue;
+		int depth = 0;
+		for ( size_t i = at; i < code.text.size(); i++ )
+		{
+			if ( code.literal[i] )
+				continue;
+			if ( code.text[i] == '{' )
+				depth++;
+			else if ( code.text[i] == '}' && --depth == 0 )
+			{
+				definitions.push_back( code.text.substr( at, i + 1 - at ) );
+				break;
+			}
+		}
+	}
+	return definitions;
+}
+
+static std::string framegen_canonical( std::string_view source )
+{
+	return framegen_source_normalize( source ).text;
+}
+
+// The single unsigned capture of `pattern`, which must match exactly once.
+static std::optional<uint32_t> framegen_hud_shader_uint( const std::string &source, const char *pattern )
+{
+	const std::regex expression( pattern );
+	auto match = std::sregex_iterator( source.begin(), source.end(), expression );
+	if ( match == std::sregex_iterator() || std::next( match ) != std::sregex_iterator() )
+		return std::nullopt;
+	return static_cast<uint32_t>( std::stoul( ( *match )[1].str() ) );
+}
+
+TEST_CASE( "HUD UBO declaration and outline threshold match cs_framegen_hud.comp", "[framegen][hud]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_HUD_SHADER_PATH );
+	REQUIRE_FALSE( source.empty() );
+
+	// Scalar-layout block: member order and array sizes give the offsets that
+	// the static_asserts in hud.hpp pin on the C++ side.
+	const std::regex block(
+		R"(uniform\s+framegen_hud_t\s*\{\s*)"
+		R"(uint\s+u_lineCount\s*;\s*uint\s+u_widthChars\s*;\s*)"
+		R"(uint\s+u_hdr\s*;\s*uint\s+u_style\s*;\s*)"
+		R"(uint\s+u_lineLengths\s*\[\s*(\d+)\s*\]\s*;\s*)"
+		R"(uint\s+u_text\s*\[\s*(\d+)\s*\]\s*;\s*)"
+		R"(uint\s+u_font\s*\[\s*(\d+)\s*\]\s*;\s*\})" );
+	std::smatch members;
+	REQUIRE( std::regex_search( source, members, block ) );
+	const FramegenHudUniform_t uniform{};
+	CHECK( std::stoul( members[1].str() ) == uniform.lineLengths.size() );
+	CHECK( std::stoul( members[1].str() ) == k_uFramegenHudMaxLines );
+	CHECK( std::stoul( members[2].str() ) == uniform.text.size() );
+	CHECK( std::stoul( members[2].str() ) == k_uFramegenHudPackedTextWords );
+	CHECK( std::stoul( members[3].str() ) == uniform.font.size() );
+
+	// text_byte's row stride is the packed column count.
+	CHECK( framegen_hud_shader_uint( source, R"(byteIndex\s*=\s*line\s*\*\s*(\d+)u\s*\+\s*column)" )
+		== k_uFramegenHudMaxColumns );
+
+	// The outline threshold compares the encoded percent (opacity + 1) as an
+	// integer, exactly as framegen_hud_outlined. Each statement is compared
+	// whole, up to its ';' or '{', so nothing can be appended to it.
+	CHECK( framegen_source_statements( source, "uint encodedOpacity=", ";" )
+		== std::vector<std::string>{ "uint encodedOpacity=(u_style>>8u)&255u;" } );
+	CHECK( framegen_source_statements( source, "bool lowBacking=", ";" )
+		== std::vector<std::string>{ "bool lowBacking=encodedOpacity!=0u&&encodedOpacity-1u<"
+			+ std::to_string( k_uFramegenHudOutlineBelowPercent ) + "u;" } );
+	CHECK( framegen_source_statements( source, "if(cga||", "{" )
+		== std::vector<std::string>{ "if(cga||lowBacking){" } );
+	CHECK( framegen_hud_shader_uint( source,
+		R"(encodedOpacity\s*!=\s*0u\s*&&\s*encodedOpacity\s*-\s*1u\s*<\s*(\d+)u)" )
+		== k_uFramegenHudOutlineBelowPercent );
+
+	// The outline's blend weight is hud.hpp's constant: the whole statement,
+	// with the weight as the only free part.
+	const std::vector<std::string> outlineBlend =
+		framegen_source_statements( source, "if(outline)", ";" );
+	REQUIRE( outlineBlend.size() == 1u );
+	const std::string_view outlinePrefix = "if(outline)result=mix(result,palette(vec3(0.0)),";
+	const std::string_view outlineSuffix = ");";
+	REQUIRE( outlineBlend[0].starts_with( outlinePrefix ) );
+	REQUIRE( outlineBlend[0].ends_with( outlineSuffix ) );
+	const std::string outlineWeight = outlineBlend[0].substr( outlinePrefix.size(),
+		outlineBlend[0].size() - outlinePrefix.size() - outlineSuffix.size() );
+	REQUIRE( std::regex_match( outlineWeight, std::regex( R"(\d+\.\d+)" ) ) );
+	CHECK( std::stof( outlineWeight ) == k_flFramegenHudOutlineBlend );
+
+	// Which pixels the outline covers: background pixels with lettering in
+	// one of the four direct neighbours.
+	CHECK( framegen_source_statements( source, "bool outline=", ";" ) == std::vector<std::string>{
+		"bool outline=!ink&&(text_pixel(logical+uvec2(1u,0u))||text_pixel(logical-uvec2(1u,0u))"
+		"||text_pixel(logical+uvec2(0u,1u))||text_pixel(logical-uvec2(0u,1u)));" } );
+}
+
+TEST_CASE( "HUD shader statement matcher compares whole statements", "[framegen][hud]" )
+{
+	const std::string shader =
+		"bool lowBacking = encodedOpacity != 0u && encodedOpacity - 1u < 10u && false; // x\n"
+		"if (outline) result = mix(result, palette(vec3(0.0)), 0.5);\n";
+	CHECK( framegen_source_statements( shader, "bool lowBacking=", ";" )
+		== std::vector<std::string>{ "bool lowBacking=encodedOpacity!=0u&&encodedOpacity-1u<10u&&false;" } );
+	CHECK( framegen_source_statements( shader, "if(outline)", ";" )
+		== std::vector<std::string>{ "if(outline)result=mix(result,palette(vec3(0.0)),0.5);" } );
+	// Comments are not code: a commented-out copy does not count.
+	CHECK( framegen_source_statements( "// bool lowBacking = 1;\n/* bool lowBacking = 2; */\n",
+		"bool lowBacking=", ";" ).empty() );
+	// Literals stay verbatim and hide their ';', '{' and comment markers;
+	// raw strings and digit separators are not mistaken for literals' ends.
+	CHECK( framegen_canonical( "x = \"a ; // b\" ;  y = 3'296u ;" ) == "x=\"a ; // b\";y=3'296u;" );
+	CHECK( framegen_source_statements( "f( \"a;b\" ); f( 1 );", "f(", ";" )
+		== std::vector<std::string>{ "f(\"a;b\");", "f(1);" } );
+	CHECK( framegen_canonical( "auto r = R\"x(a \" ) b)x\" ; int i;" ) == "auto r=R\"x(a \" ) b)x\";int i;" );
+	CHECK( framegen_source_definitions( "static int g() { if ( a ) { return '}'; } return 0; } int h;",
+		"static int g(" ) == std::vector<std::string>{ "static int g(){if(a){return'}';}return 0;}" } );
+	// Identifier boundary: `xbool lowBacking=` is not the statement.
+	CHECK( framegen_source_statements( "xbool lowBacking = 1;", "bool lowBacking=", ";" ).empty() );
+}
+
+// ---------------------------------------------------------------------------
+// HUD history split (framegen/hud_history.hpp) and its wiring in rendervulkan.cpp.
+
+namespace
+{
+
+constexpr std::array<FramegenHudHistoryCheck, 5> k_eHudHistoryCheckOrder = {
+	FramegenHudHistoryCheck::FramegenEnabled,
+	FramegenHudHistoryCheck::OwnsOutputRing,
+	FramegenHudHistoryCheck::CursorSplitEnabled,
+	FramegenHudHistoryCheck::BidirActive,
+	FramegenHudHistoryCheck::ColorProbeRecording,
+};
+
+// One enumerated case: the split facts plus the live check answers.
+struct HudHistoryCase
+{
+	FramegenHudHistoryState state;
+	bool enabled = false, owns = false, cursorSwitch = false, bidir = false, probe = false;
+
+	static HudHistoryCase from_bits( uint32_t bits )
+	{
+		HudHistoryCase c;
+		c.state.splitCandidate = bits & ( 1u << 0 );
+		c.state.hudOn = bits & ( 1u << 1 );
+		c.state.cursorSplit = bits & ( 1u << 2 );
+		c.state.compositeImage = bits & ( 1u << 3 );
+		c.state.transferSrc = bits & ( 1u << 4 );
+		c.state.hudFreeImage = bits & ( 1u << 5 );
+		c.enabled = bits & ( 1u << 6 );
+		c.owns = bits & ( 1u << 7 );
+		c.cursorSwitch = bits & ( 1u << 8 );
+		c.bidir = bits & ( 1u << 9 );
+		c.probe = bits & ( 1u << 10 );
+		return c;
+	}
+
+	bool answer( FramegenHudHistoryCheck check ) const
+	{
+		switch ( check )
+		{
+			case FramegenHudHistoryCheck::FramegenEnabled: return enabled;
+			case FramegenHudHistoryCheck::OwnsOutputRing: return owns;
+			case FramegenHudHistoryCheck::CursorSplitEnabled: return cursorSwitch;
+			case FramegenHudHistoryCheck::BidirActive: return bidir;
+			case FramegenHudHistoryCheck::ColorProbeRecording: return probe;
+		}
+		return false;
+	}
+
+	// The reason and every check asked, in order.
+	std::pair<const char *, std::vector<FramegenHudHistoryCheck>> reason() const
+	{
+		std::vector<FramegenHudHistoryCheck> asked;
+		const char *r = framegen_hud_in_history_reason( state, [&]( FramegenHudHistoryCheck check )
+		{
+			asked.push_back( check );
+			return answer( check );
+		} );
+		return { r, asked };
+	}
+};
+
+constexpr uint32_t k_uHudHistoryCaseCount = 1u << 11;
+
+std::string hud_reason_text( const char *reason )
+{
+	return reason != nullptr ? reason : "<none>";
+}
+
+} // namespace
+
+TEST_CASE( "HUD history split decisions match their definition for every input", "[framegen][hud][hud-history]" )
+{
+	for ( uint32_t bits = 0; bits < k_uHudHistoryCaseCount; bits++ )
+	{
+		const HudHistoryCase c = HudHistoryCase::from_bits( bits );
+		const FramegenHudHistoryState &s = c.state;
+		INFO( "case bits " << bits );
+		const bool candidate = s.splitCandidate && s.hudOn;
+		CHECK( framegen_hud_split_candidate( s ) == candidate );
+		CHECK( framegen_hud_history_copy_wanted( s )
+			== ( candidate && !s.cursorSplit && s.compositeImage && s.transferSrc ) );
+		CHECK( framegen_hud_free_history( s ) == ( candidate && ( s.cursorSplit || s.hudFreeImage ) ) );
+	}
+	// Spot rows, readable on their own.
+	FramegenHudHistoryState s;
+	s.splitCandidate = true;
+	s.hudOn = true;
+	s.compositeImage = true;
+	s.transferSrc = true;
+	CHECK( framegen_hud_history_copy_wanted( s ) );
+	CHECK_FALSE( framegen_hud_free_history( s ) );         // pool busy
+	s.hudFreeImage = true;
+	CHECK( framegen_hud_free_history( s ) );
+	s.hudOn = false;
+	CHECK_FALSE( framegen_hud_history_copy_wanted( s ) );  // HUD off: no copy
+	CHECK_FALSE( framegen_hud_free_history( s ) );
+	s.hudOn = true;
+	s.cursorSplit = true;
+	CHECK_FALSE( framegen_hud_history_copy_wanted( s ) );  // cursor split: already HUD-free
+	s.hudFreeImage = false;
+	CHECK( framegen_hud_free_history( s ) );
+	s.splitCandidate = false;
+	CHECK_FALSE( framegen_hud_free_history( s ) );
+}
+
+TEST_CASE( "HUD-in-history reason is set exactly when history carries the HUD", "[framegen][hud][hud-history]" )
+{
+	for ( uint32_t bits = 0; bits < k_uHudHistoryCaseCount; bits++ )
+	{
+		const HudHistoryCase c = HudHistoryCase::from_bits( bits );
+		INFO( "case bits " << bits );
+		const auto [reason, asked] = c.reason();
+		const bool hudFree = framegen_hud_free_history( c.state );
+		CHECK( ( reason != nullptr ) == ( !hudFree && c.enabled && c.state.hudOn ) );
+		// HUD-free history never reads a live input; otherwise framegen
+		// enablement is read first, and nothing else when it or the HUD is off.
+		if ( hudFree )
+			CHECK( asked.empty() );
+		else
+		{
+			REQUIRE_FALSE( asked.empty() );
+			CHECK( asked.front() == FramegenHudHistoryCheck::FramegenEnabled );
+			if ( !c.enabled || !c.state.hudOn )
+				CHECK( asked.size() == 1u );
+		}
+	}
+}
+
+TEST_CASE( "HUD-in-history reason names the first cause in a fixed order", "[framegen][hud][hud-history]" )
+{
+	uint32_t seen[8] = {};
+	for ( uint32_t bits = 0; bits < k_uHudHistoryCaseCount; bits++ )
+	{
+		const HudHistoryCase c = HudHistoryCase::from_bits( bits );
+		const FramegenHudHistoryState &s = c.state;
+		INFO( "case bits " << bits );
+		const auto [reason, asked] = c.reason();
+		if ( reason == nullptr )
+			continue;
+
+		// The cascade, as a table: the first cause that holds is named, and
+		// the live checks asked are exactly those up to the deciding one.
+		const bool candidate = s.splitCandidate && s.hudOn;
+		const struct { bool holds; const char *text; size_t checksAsked; } cascade[] = {
+			{ !c.owns, "a Vulkan-swapchain backend (nested SDL) has no compositor-owned output ring", 2u },
+			{ !c.cursorSwitch, "GAMESCOPE_FRAMEGEN_CURSOR=0 disables the split", 3u },
+			{ c.bidir, "bidirectional interpolation flips its history images", 4u },
+			{ c.probe, "the colour probe is recording", 5u },
+			{ candidate && s.compositeImage && !s.transferSrc, "the output image lacks transferSrc", 5u },
+			{ candidate, "the owned history pool was busy", 5u },
+			{ true, "the HUD-free split conditions were not met", 5u },
+		};
+		size_t first = 0;
+		while ( !cascade[first].holds )
+			first++;
+		CHECK( hud_reason_text( reason ) == cascade[first].text );
+		REQUIRE( asked.size() == cascade[first].checksAsked );
+		for ( size_t i = 0; i < asked.size(); i++ )
+			CHECK( asked[i] == k_eHudHistoryCheckOrder[i] );
+		seen[first]++;
+	}
+	// Every reason, the catch-all included, is produced by some input.
+	for ( uint32_t i = 0; i < 7u; i++ )
+	{
+		INFO( "cascade row " << i );
+		CHECK( seen[i] > 0u );
+	}
+}
+
+TEST_CASE( "HUD-in-history reasons in the states vulkan_composite can produce", "[framegen][hud][hud-history]" )
+{
+	// The split candidate as vulkan_composite computes it: framegen on, the
+	// CURSOR switch on, a compositor-owned ring, not a side composite, no
+	// bidir, no colour probe, no base-layer scene, a composite that records
+	// history. The cursor split needs the candidate, a composite image, a
+	// topmost cursor layer and a free pool image; the HUD copy then needs a
+	// free pool image of its own.
+	std::vector<std::string> catchAllWhy;
+	uint32_t reasons[8] = {};
+	for ( uint32_t bits = 0; bits < ( 1u << 14 ); bits++ )
+	{
+		const bool enabled = bits & 1u, cursorSwitch = bits & 2u, owns = bits & 4u, side = bits & 8u;
+		const bool bidir = bits & 16u, probe = bits & 32u, baseLayer = bits & 64u, records = bits & 128u;
+		const bool hudOn = bits & 256u, image = bits & 512u, transferSrc = bits & 1024u;
+		const bool cursorTop = bits & 2048u, poolForCursor = bits & 4096u, poolForHud = bits & 8192u;
+		if ( side || !enabled || !hudOn )
+			continue; // side composites never record; no reason without framegen and the HUD
+		HudHistoryCase c;
+		c.enabled = enabled;
+		c.owns = owns;
+		c.cursorSwitch = cursorSwitch;
+		c.bidir = bidir;
+		c.probe = probe;
+		c.state.hudOn = hudOn;
+		c.state.splitCandidate = enabled && cursorSwitch && owns && !bidir && !probe && !baseLayer && records;
+		c.state.cursorSplit = c.state.splitCandidate && image && cursorTop && poolForCursor;
+		c.state.compositeImage = image;
+		c.state.transferSrc = image && transferSrc;
+		c.state.hudFreeImage = framegen_hud_history_copy_wanted( c.state ) && poolForHud;
+		const char *reason = c.reason().first;
+		INFO( "case bits " << bits );
+		CHECK( ( reason == nullptr ) == framegen_hud_free_history( c.state ) );
+		// Without a composite image the history image is null too, and
+		// framegen_record_real_frame returns before the note.
+		if ( reason == nullptr || !image )
+			continue;
+		const std::string text = reason;
+		if ( text == k_pszFramegenHudInHistoryUnmet )
+		{
+			// Only a non-candidate with every live check passing: a base-layer
+			// scene or a composite that records no history.
+			CHECK( owns );
+			CHECK( cursorSwitch );
+			CHECK_FALSE( bidir );
+			CHECK_FALSE( probe );
+			CHECK( ( baseLayer || !records ) );
+			reasons[7]++;
+		}
+		else if ( text == k_pszFramegenHudInHistorySwapchain )
+			reasons[1]++;
+		else if ( text == k_pszFramegenHudInHistoryCursorOff )
+			reasons[2]++;
+		else if ( text == k_pszFramegenHudInHistoryBidir )
+			reasons[3]++;
+		else if ( text == k_pszFramegenHudInHistoryColorProbe )
+			reasons[4]++;
+		else if ( text == k_pszFramegenHudInHistoryNoTransferSrc )
+		{
+			CHECK( c.state.splitCandidate );
+			CHECK( image );
+			CHECK_FALSE( c.state.cursorSplit );
+			reasons[5]++;
+		}
+		else if ( text == k_pszFramegenHudInHistoryPoolBusy )
+		{
+			CHECK( c.state.splitCandidate );
+			CHECK( c.state.transferSrc );
+			CHECK_FALSE( poolForHud );
+			reasons[6]++;
+		}
+	}
+	for ( uint32_t i = 1; i < 8u; i++ )
+	{
+		INFO( "reason " << i );
+		CHECK( reasons[i] > 0u );
+	}
+}
+
+TEST_CASE( "HUD-in-history note is said once, for a frame that carries the HUD", "[framegen][hud][hud-history]" )
+{
+	// Exact strings: the log reads them, and the reason test pins the rest.
+	CHECK( std::string_view( k_pszFramegenHudInHistoryUnmet ) == "the HUD-free split conditions were not met" );
+
+	FramegenHudInHistoryNote note;
+	CHECK( note.take( true, true, "R" ) == nullptr );   // HUD-free: nothing to say
+	CHECK( note.take( false, false, "R" ) == nullptr ); // HUD off: nothing to say
+	CHECK_FALSE( note.logged );
+	CHECK( hud_reason_text( note.take( false, true, "R" ) ) == "R" );
+	CHECK( note.logged );
+	CHECK( note.take( false, true, "S" ) == nullptr );  // said once
+	CHECK( note.take( false, true, nullptr ) == nullptr );
+
+	FramegenHudInHistoryNote fallback;
+	CHECK( hud_reason_text( fallback.take( false, true, nullptr ) ) == "the HUD-free split conditions were not met" );
+	CHECK( fallback.take( false, true, "R" ) == nullptr );
+}
+
+// rendervulkan.cpp is not compiled by any test, so its wiring is pinned as
+// source: change it together with these expectations, never alone.
+TEST_CASE( "vulkan_composite decides the HUD history split only through hud_history.hpp", "[framegen][hud][hud-history]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_statements( source, "gamescope::framegen::FramegenHudHistoryState hudHistory;",
+		"hudHistory,framegen_hud_history_check);" ) == std::vector<std::string>{ framegen_canonical( R"src(
+	gamescope::framegen::FramegenHudHistoryState hudHistory;
+	hudHistory.splitCandidate = bCursorSplitCandidate;
+	hudHistory.hudOn = framegen_hud_level() != 0u;
+	hudHistory.cursorSplit = bCursorSplit;
+	hudHistory.compositeImage = compositeImage != nullptr;
+	hudHistory.transferSrc = compositeImage != nullptr && compositeImage->transferSrc();
+	gamescope::Rc<CVulkanTexture> pHudFreeHistoryImage;
+	if ( gamescope::framegen::framegen_hud_history_copy_wanted( hudHistory ) )
+	{
+		pHudFreeHistoryImage = framegen_acquire_cursor_history_image(
+			compositeImage->width(), compositeImage->height(), compositeImage->drmFormat() );
+	}
+	hudHistory.hudFreeImage = pHudFreeHistoryImage != nullptr;
+	const bool bHudFreeHistory = gamescope::framegen::framegen_hud_free_history( hudHistory );
+	const char *pszHudInHistoryReason = gamescope::framegen::framegen_hud_in_history_reason(
+		hudHistory, framegen_hud_history_check );)src" ) } );
+
+	CHECK( framegen_source_definitions( source, "static bool framegen_hud_history_check(" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+static bool framegen_hud_history_check( gamescope::framegen::FramegenHudHistoryCheck eCheck )
+{
+	switch ( eCheck )
+	{
+		case gamescope::framegen::FramegenHudHistoryCheck::FramegenEnabled:
+			return vulkan_framegen_is_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::OwnsOutputRing:
+			return framegen_owns_output_ring();
+		case gamescope::framegen::FramegenHudHistoryCheck::CursorSplitEnabled:
+			return framegen_cursor_split_enabled();
+		case gamescope::framegen::FramegenHudHistoryCheck::BidirActive:
+			return vulkan_framegen_bidir_active();
+		case gamescope::framegen::FramegenHudHistoryCheck::ColorProbeRecording:
+			return framegen_color_record_dir() != nullptr;
+	}
+	return false;
+})src" ) } );
+
+	// Neither verdict is assigned anywhere else, and both reach framegen.
+	CHECK( framegen_source_statements( source, "bHudFreeHistory=", ";" ).size() == 1u );
+	CHECK( framegen_source_statements( source, "pszHudInHistoryReason=", ";" ).size() == 1u );
+	CHECK( framegen_source_statements( source, "framegen_record_real_frame(pFramegenHistoryImage", ";" )
+		== std::vector<std::string>{ "framegen_record_real_frame(pFramegenHistoryImage,frameInfo,sequence,"
+			"bCursorFreeHistory,bHudFreeHistory,pszHudInHistoryReason);" } );
+	// The cursor-split candidate the state is built from: same order as ever.
+	CHECK( framegen_source_statements( source, "const bool bCursorSplitCandidate=", ";" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+	const bool bCursorSplitCandidate = vulkan_framegen_is_enabled()
+		&& framegen_cursor_split_enabled()
+		&& framegen_owns_output_ring()
+		&& !partial && pPipewireTexture == nullptr && pOutputOverride == nullptr
+		&& !vulkan_framegen_bidir_active()
+		&& framegen_color_record_dir() == nullptr
+		&& !framegen_base_layer_usable( frameInfo )
+		&& framegen_composite_records_history( frameInfo );)src" ) } );
+}
+
+TEST_CASE( "vulkan_composite takes the HUD-free copy before the HUD pass", "[framegen][hud][hud-history]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_statements( source, "const bool bCursorSplit=", ";" )
+		== std::vector<std::string>{ "const bool bCursorSplit=pCursorScanoutImage!=nullptr;" } );
+	CHECK( framegen_source_statements( source, "if(pHudFreeHistoryImage!=nullptr)", "}" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+	if ( pHudFreeHistoryImage != nullptr )
+	{
+		cmdBuffer->copyImage( compositeImage, pHudFreeHistoryImage );
+		pFramegenHistoryImage = std::move( pHudFreeHistoryImage );
+	})src" ) } );
+	// Decide, copy, draw the HUD, then hand history to framegen: in that order.
+	const std::string code = framegen_canonical( source );
+	const size_t decided = code.find( "const bool bHudFreeHistory=" );
+	const size_t copied = code.find( "if(pHudFreeHistoryImage!=nullptr)" );
+	const size_t hud = code.find( "nFramegenHudSlot=framegen_hud_record(" );
+	const size_t recorded = code.find( "framegen_record_real_frame(pFramegenHistoryImage" );
+	REQUIRE( decided != std::string::npos );
+	REQUIRE( copied != std::string::npos );
+	REQUIRE( hud != std::string::npos );
+	REQUIRE( recorded != std::string::npos );
+	CHECK( decided < copied );
+	CHECK( copied < hud );
+	CHECK( hud < recorded );
+	CHECK( code.find( "nFramegenHudSlot=framegen_hud_record(", hud + 1 ) == std::string::npos );
+}
+
+TEST_CASE( "framegen_record_real_frame says the HUD-in-history note through hud_history.hpp", "[framegen][hud][hud-history]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_definitions( source, "static void framegen_note_hud_in_history(" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+static void framegen_note_hud_in_history( bool bHudFreeRealFrame, const char *pszReason )
+{
+	static gamescope::framegen::FramegenHudInHistoryNote s_note;
+	if ( const char *pszLog = s_note.take( bHudFreeRealFrame, framegen_hud_level() != 0u, pszReason ) )
+		vk_log.infof( "framegen: HUD is in real-frame history (%s); motion estimation, generated frames and online training see it (logged once)",
+			pszLog );
+})src" ) } );
+	// Called once, from the output-space history shift, with the composite's
+	// verdicts, right where the HUD-free flag of the new current frame is set.
+	CHECK( framegen_source_statements( source, "g_framegenHistory.bHudFreeCurrent=bHudFreeRealFrame;",
+		"pszHudInHistoryReason);" ) == std::vector<std::string>{ "g_framegenHistory.bHudFreeCurrent=bHudFreeRealFrame;"
+			"framegen_note_hud_in_history(bHudFreeRealFrame,pszHudInHistoryReason);" } );
+	CHECK( framegen_source_statements( source, "framegen_note_hud_in_history(bHudFree", ";" )
+		== std::vector<std::string>{ "framegen_note_hud_in_history(bHudFreeRealFrame,pszHudInHistoryReason);" } );
+	CHECK( framegen_source_statements( source, "g_framegenHistory.bHudFreeCurrent=", ";" )
+		== std::vector<std::string>{ "g_framegenHistory.bHudFreeCurrent=false;",
+			"g_framegenHistory.bHudFreeCurrent=bHudFreeRealFrame;" } );
+}
+
+TEST_CASE( "framegen_hud_cga reads GAMESCOPE_FRAMEGEN_HUD_STYLE only through the settings helpers", "[framegen][hud]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+	REQUIRE_FALSE( source.empty() );
+
+	CHECK( framegen_source_definitions( source, "static bool framegen_hud_cga(" )
+		== std::vector<std::string>{ framegen_canonical( R"src(
+static bool framegen_hud_cga()
+{
+	static const bool enabled = gamescope::framegen::framegen_hud_style_cga( framegen_setting(
+		"GAMESCOPE_FRAMEGEN_HUD_STYLE", gamescope::framegen::k_eFramegenHudStyleDefault,
+		gamescope::framegen::parse_hud_style_setting, gamescope::framegen::k_pszFramegenHudStyleDefault ) );
+	return enabled;
+})src" ) } );
+	// No second reader of the variable anywhere in the file (comments aside),
+	// and the uniform takes the style from framegen_hud_cga().
+	const std::string code = framegen_canonical( source );
+	CHECK( code.find( "GAMESCOPE_FRAMEGEN_HUD_STYLE" ) == code.rfind( "GAMESCOPE_FRAMEGEN_HUD_STYLE" ) );
+	CHECK( framegen_source_statements( source, "gamescope::framegen::make_framegen_hud_uniform(", ";" )
+		== std::vector<std::string>{ "gamescope::framegen::make_framegen_hud_uniform(g_framegenHud.text,"
+			"g_framegenHud.hdr,framegen_hud_cga(),framegen_hud_opacity());" } );
+	CHECK( framegen_source_statements( source, "framegen_hud_cga(", ")" ).size() == 2u );
+}
+
+TEST_CASE( "CGA HUD Bayer table matches cs_framegen_hud.comp", "[framegen][hud]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_HUD_SHADER_PATH );
+	REQUIRE_FALSE( source.empty() );
+	const std::string_view marker = "uint[16](";
+	const size_t first = source.find( marker );
+	REQUIRE( first != std::string::npos );
+	REQUIRE( source.find( marker, first + marker.size() ) == std::string::npos );
+
+	std::vector<uint32_t> parsed;
+	size_t pos = first + marker.size();
+	for ( ;; )
+	{
+		while ( pos < source.size() && ( source[pos] == ' ' || source[pos] == '\t' ) )
+			++pos;
+		REQUIRE( pos < source.size() );
+		REQUIRE( ( source[pos] >= '0' && source[pos] <= '9' ) );
+		uint32_t value = 0u;
+		while ( pos < source.size() && source[pos] >= '0' && source[pos] <= '9' )
+			value = value * 10u + static_cast<uint32_t>( source[pos++] - '0' );
+		if ( pos < source.size() && ( source[pos] == 'u' || source[pos] == 'U' ) )
+			++pos;
+		REQUIRE( pos < source.size() );
+		REQUIRE( ( source[pos] == ',' || source[pos] == ')' ) );
+		parsed.push_back( value );
+		if ( source[pos++] == ')' )
+			break;
+	}
+
+	REQUIRE( parsed.size() == k_uFramegenHudCgaBayer.size() );
+	for ( size_t i = 0u; i < parsed.size(); ++i )
+	{
+		CAPTURE( i );
+		CHECK( parsed[i] == k_uFramegenHudCgaBayer[i] );
+	}
+	std::vector<uint32_t> sorted = parsed;
+	std::sort( sorted.begin(), sorted.end() );
+	for ( uint32_t i = 0u; i < sorted.size(); ++i )
+		CHECK( sorted[i] == i );
 }
 
 TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
@@ -201,28 +1133,28 @@ TEST_CASE( "framegen HUD describes ladder recovery states", "[framegen][hud]" )
 		.ladderHold = 3u,
 		.ladderRecoveryBackoffDecisions = 90u,
 	};
-	FramegenHudText_t text = format_framegen_hud( 1u, snapshot );
-	CHECK( text.lines[3].data() == std::string_view{
-		"rates    source 246fps[1.2k] gen 999fps[56.8k] repeat 0fps fill 100%" } );
+	FramegenHudText_t text = format_framegen_hud_detailed( 1u, snapshot );
 	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  hold" } );
+		"SOURCE: 246fps[1.2k] | GEN: 999fps[56.8k] | REPEAT: 0fps | FILL: 100%" } );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: hold" } );
 
 	snapshot.ladderHold = 0u;
 	snapshot.ladderRecoveryProbationRemaining = 46u;
-	text = format_framegen_hud( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  probation 2s" } );
+	text = format_framegen_hud_detailed( 1u, snapshot );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: probation 2s" } );
 
 	snapshot.ladderRecoveryProbationRemaining = 0u;
 	snapshot.ladderRecoveryDecisionsSinceClimb = 44u;
-	text = format_framegen_hud( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  recover in 2s" } );
+	text = format_framegen_hud_detailed( 1u, snapshot );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: recover in 2s" } );
 
 	snapshot.ladderRecoveryDecisionsSinceClimb = 90u;
-	text = format_framegen_hud( 1u, snapshot );
-	CHECK( text.lines[4].data() == std::string_view{
-		"ladder   checked/extrapolate rung 2/4  watching" } );
+	text = format_framegen_hud_detailed( 1u, snapshot );
+	CHECK( text.lines[5].data() == std::string_view{
+		"QUALITY: checked/extrapolate rung 2/4 | STATE: watching" } );
 }
 
 TEST_CASE( "framegen HUD sparkline mapping is monotone and saturated",
@@ -467,6 +1399,118 @@ TEST_CASE( "large anchor correction discards only matching provisional slots", "
 	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true ) );
 }
 
+TEST_CASE( "nested correction retains the 22 recorded irreplaceable provisional slots",
+	"[framegen][deadline][nested][correction]" )
+{
+	// Step-1 ladder-decisions.csv: all 22 lost slots had p_admit=p_submitted=1.
+	// Four followup-{checked,learned}-r{1,2} H1 runs. Times are relative to
+	// p_now_ns; use callback arrival (earlier than discard/replan) to give the
+	// replacement its most generous possible budget. All costs were mature.
+	struct RecordedReplacement
+	{
+		uint64_t arrivalNs, rawTargetNs, rawWakeNs, biasedWakeNs, costNs;
+	};
+	constexpr RecordedReplacement lost[] = {
+		{ 7'570'144u, 12'229'708u, 8'179'708u, 7'289'094u, 501'908u },
+		{ 6'399'918u, 12'179'783u, 8'129'783u, 6'910'915u, 502'316u },
+		{ 6'734'974u, 12'305'390u, 8'255'390u, 7'004'011u, 508'917u },
+		{ 7'682'194u, 12'330'716u, 8'280'716u, 7'247'622u, 547'352u },
+		{ 7'011'040u, 12'254'122u, 8'204'122u, 7'000'967u, 537'036u },
+		{ 6'655'365u, 11'852'949u, 7'802'949u, 6'731'436u, 536'736u },
+		{ 6'933'054u, 12'340'684u, 8'290'173u, 7'050'119u, 442'626u },
+		{ 7'842'274u, 12'308'918u, 8'258'918u, 7'288'623u, 501'317u },
+		{ 6'880'677u, 12'340'130u, 8'290'130u, 7'362'072u, 546'513u },
+		{ 6'971'376u, 12'276'897u, 8'226'897u, 7'123'744u, 482'262u },
+		{ 7'018'705u, 12'225'239u, 8'175'239u, 7'036'879u, 534'010u },
+		{ 7'147'815u, 11'989'340u, 7'939'340u, 6'932'698u, 461'453u },
+		{ 6'924'007u, 12'250'161u, 8'200'161u, 7'018'284u, 534'138u },
+		{ 6'573'713u, 12'292'455u, 8'242'455u, 6'866'661u, 505'244u },
+		{ 7'518'468u, 12'318'070u, 8'268'070u, 7'774'930u, 532'194u },
+		{ 7'772'413u, 12'282'153u, 8'232'153u, 7'766'776u, 562'854u },
+		{ 7'552'542u, 12'249'449u, 8'199'449u, 7'670'138u, 577'265u },
+		{ 7'481'088u, 12'302'109u, 8'252'109u, 7'994'279u, 526'679u },
+		{ 7'744'561u, 12'336'853u, 8'286'853u, 7'837'453u, 518'075u },
+		{ 7'640'988u, 12'268'871u, 8'218'871u, 7'634'995u, 459'637u },
+		{ 7'849'567u, 12'286'802u, 8'236'802u, 7'755'393u, 555'290u },
+		{ 7'300'942u, 12'301'805u, 8'251'780u, 7'794'687u, 454'961u },
+	};
+	constexpr uint64_t intervalNs = 8'333'333u;
+	const AnchorCorrection_t correction = {
+		.anchor = { .realFrameId = 42u }, .matched = true, .discardProvisional = true };
+	uint32_t expired = 0u;
+	for ( const auto &d : lost )
+	{
+		CAPTURE( d.arrivalNs, d.rawWakeNs, d.biasedWakeNs, d.costNs );
+		// The old raw-wake-only guard allowed all 22 discards.
+		CHECK( fixed_grid_slot_submittable( d.rawTargetNs, d.rawWakeNs,
+			d.rawTargetNs - intervalNs, d.arrivalNs, intervalNs,
+			cadence_arrival_guard_ns( intervalNs ) ) );
+		CHECK( discard_pending_provisional_slot( correction, 42u, true ) );
+		CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+			d.costNs, k_uDeadlineMinSamples, d.biasedWakeNs, d.arrivalNs ) );
+		expired += d.arrivalNs >= d.biasedWakeNs;
+	}
+	CHECK( expired == 8u ); // Other 14 still have time, but insufficient budget.
+}
+
+TEST_CASE( "nested correction uses strict measured admission before discarding pixels",
+	"[framegen][deadline][nested][correction]" )
+{
+	const AnchorCorrection_t correction = {
+		.anchor = { .realFrameId = 42u }, .matched = true, .discardProvisional = true };
+	// Existing admission's 85% jitter margin, including its exact boundary.
+	CHECK( discard_pending_provisional_slot( correction, 42u, true,
+		850u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		851u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		1u, k_uDeadlineMinSamples, 2'000u, 2'000u ) );
+	// A cold/unknown replacement cannot justify discarding submitted pixels.
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		0u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, true,
+		1u, k_uDeadlineMinSamples - 1u, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 41u, true,
+		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	CHECK_FALSE( discard_pending_provisional_slot( correction, 42u, false,
+		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+	AnchorCorrection_t small = correction;
+	small.discardProvisional = false;
+	CHECK_FALSE( discard_pending_provisional_slot( small, 42u, true,
+		1u, k_uDeadlineMinSamples, 2'000u, 1'000u ) );
+}
+
+TEST_CASE( "nested correction wires the biased deadline and current work class into discard",
+	"[framegen][deadline][nested][correction][reference-wiring]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+	REQUIRE_FALSE( source.empty() );
+	const auto statement = [&]( std::string_view start )
+	{
+		return framegen_source_statements( source, framegen_canonical( start ), ";" );
+	};
+	CHECK( statement( "const uint64_t ulReplacementWakeNs =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const uint64_t ulReplacementWakeNs = gamescope::framegen::apply_present_bias_ns("
+			" ulRawWakeNs, g_framegenPresentState.displayTiming.presentBias.emaNs );" ) } );
+	CHECK( statement( "const FramegenCausalRungSelection_t replacement =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const FramegenCausalRungSelection_t replacement = framegen_sample_causal_rung("
+			" g_framegenHistory.nDegradeSteps );" ) } );
+	CHECK( statement( "const bool bDiscard =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const bool bDiscard = gamescope::framegen::discard_pending_provisional_slot("
+			" correction, entry.ulAnchorRealFrameId, entry.bProvisional,"
+			" replacement.ulCostNs, replacement.uSamples, ulReplacementWakeNs, ulNowNs );" ) } );
+	// Even with enough budget, generation or idle training blocks replacement.
+	CHECK( statement( "const bool bCanReplace =" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const bool bCanReplace = bDiscard"
+			" && framegen_work_completed();" ) } );
+	CHECK( statement( "return bCanReplace" )
+		== std::vector<std::string>{ framegen_canonical( "return bCanReplace;" ) } );
+}
+
 TEST_CASE( "one-vblank late provisional anchor changes the generated phase", "[framegen][deadline]" )
 {
 	constexpr uint64_t interval = 8'334'000u;
@@ -650,6 +1694,71 @@ TEST_CASE( "discard-only present-bias outliers retain the two-strike guard",
 	STATIC_REQUIRE( second.discardProvisional );
 	STATIC_REQUIRE( second.state.emaNs == mature.emaNs );
 	STATIC_REQUIRE( second.state.samples == mature.samples );
+}
+
+TEST_CASE( "a present bias that warmed up a vblank off relearns from agreeing outliers",
+	"[framegen][deadline]" )
+{
+	// The nested 60 Hz trap: warm-up flips read 0, the chain's offset is
+	// 17.5 ms, beyond the outlier bound |ema| + T.
+	constexpr uint64_t T = 16'666'667u;
+	constexpr uint64_t guardNs = T / 32u;
+	constexpr int64_t offsetNs = 17'500'000;
+	PresentBiasState_t bias = { .samples = k_uPresentBiasWarmupSamples };
+	uint64_t rawNs = 1'000'000'000u;
+	const auto flip = [&]( int64_t chainOffsetNs, bool hitch = false ) {
+		rawNs += T;
+		bias = update_present_bias( bias, apply_present_bias_ns( rawNs, bias.emaNs ),
+			rawNs + static_cast<uint64_t>( chainOffsetNs ), guardNs, T, hitch ).state;
+	};
+
+	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	CHECK( bias.emaNs == 0 );
+	CHECK( bias.outlierRun == k_uPresentBiasRelearnSamples - 1u );
+	flip( offsetNs );
+	CHECK( bias.emaNs == offsetNs );
+	CHECK( bias.outlierRun == 0u );
+	CHECK( bias.samples == k_uPresentBiasWarmupSamples );
+	// From there the EMA tracks the chain as usual.
+	flip( offsetNs + 800'000 );
+	CHECK( bias.emaNs == offsetNs + 100'000 );
+
+	// Outliers that scatter more than half a vblank never move it: a stutter.
+	bias = { .samples = k_uPresentBiasWarmupSamples };
+	for ( uint32_t i = 0u; i < 4u * k_uPresentBiasRelearnSamples; i++ )
+		flip( i % 2u != 0u ? offsetNs : offsetNs + static_cast<int64_t>( T / 2u ) + 1 );
+	CHECK( bias.emaNs == 0 );
+
+	// An accepted sample or a hitch ends a run. The accepted sample also
+	// confirms the bias: from then on a run must span
+	// k_ulPresentBiasRelearnSpanNs, so a contention episode of consistent
+	// lateness (here 300 ms at two vblanks) never moves it.
+	bias = { .samples = k_uPresentBiasWarmupSamples };
+	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	flip( 0 );
+	CHECK( bias.outlierRun == 0u );
+	CHECK( bias.confirmed );
+	for ( uint32_t i = 1u; i < k_uPresentBiasRelearnSamples; i++ )
+		flip( offsetNs );
+	flip( offsetNs, true );
+	CHECK( bias.outlierRun == 0u );
+	CHECK( bias.emaNs == 0 );
+	for ( uint64_t spanNs = 0u; spanNs < 300'000'000u; spanNs += T )
+		flip( 2 * static_cast<int64_t>( T ) );
+	CHECK( bias.emaNs == 0 );
+	flip( 0 );
+	CHECK( bias.emaNs == 0 );
+	// A chain whose offset really moved relearns once the run spans long enough.
+	uint32_t flips = 0u;
+	while ( bias.emaNs == 0 && flips < 1000u )
+	{
+		flip( offsetNs );
+		flips++;
+	}
+	CHECK( bias.emaNs == offsetNs );
+	CHECK( uint64_t{ flips - 1u } * T >= k_ulPresentBiasRelearnSpanNs );
 }
 
 TEST_CASE( "deadline hit arithmetic uses the biased target", "[framegen][deadline]" )
@@ -1223,8 +2332,16 @@ namespace
 //
 // Source time and record time are separate: a real's latency is the hold from
 // its source-ready time to its commit, and it is recorded at the first wake
-// after that (recordNs).
+// after that (recordNs). Source times can be latched to the vblank grid, as a
+// compositor-paced source's are.
+//
+// The display chain flips every present displayOffsetNs after its opportunity.
+// The loop learns that offset as the renderer does: a delayed real shown at its
+// own opportunity (bidir_real_on_slot) feeds update_present_bias with its raw
+// target plus the bias learned so far (display_target_ns). Nothing the
+// planner or the presenter decides reads it.
 constexpr uint64_t k_ulLoopVblankNs = 16'666'667u;
+constexpr uint64_t k_ulLoop120HzNs = 8'333'333u;
 constexpr uint64_t k_ulLoopWakeLeadNs = 3'000'000u;
 constexpr uint64_t k_ulLoopStartNs = 1'000'000'000u;
 constexpr uint64_t k_ulLoopSecondNs = 1'000'000'000u;
@@ -1247,6 +2364,9 @@ struct BidirLoopInjection_t
 	uint64_t failedImageRealId = 0;	// this queued real's present image cannot be made (0: none)
 	size_t ringImages = 8u;
 	uint32_t multiplier = 2u;
+	uint64_t vblankNs = k_ulLoopVblankNs;
+	uint64_t sourceQuantumNs = 0;	// source-ready times lie on this grid (0: as the cadence gives them)
+	uint64_t displayOffsetNs = 0;	// every flip lands this long after its opportunity
 };
 
 struct BidirLoopReal_t
@@ -1259,6 +2379,8 @@ struct BidirLoopReal_t
 	uint64_t pushNs = 0;		// target - its own slot: displaced behind an older real
 	uint64_t pastIdealNs = 0;	// target - its display time on the translation
 	bool kept = false;			// queued by a plan that kept the translation
+
+	bool operator==( const BidirLoopReal_t & ) const = default;
 };
 
 struct BidirLoopEvent_t
@@ -1266,6 +2388,8 @@ struct BidirLoopEvent_t
 	uint64_t atNs = 0;
 	BidirReestablish_t kind = BidirReestablish_t::Kept;
 	uint64_t delayNs = 0;
+
+	bool operator==( const BidirLoopEvent_t & ) const = default;
 };
 
 struct BidirLoopResult_t
@@ -1276,6 +2400,9 @@ struct BidirLoopResult_t
 	std::vector<uint64_t> holeNs;			// serviced opportunities that showed nothing new
 	std::vector<uint64_t> lateSlotNs;		// a kept plan's interpolation slot planned after its wake
 	size_t capacity = 0;
+	uint64_t vblankNs = 0;
+	PresentBiasState_t presentBias;			// learned from the delayed reals' flips
+	uint64_t worstBiasErrorNs = 0;			// the most the learned bias left the display offset after its first sample
 	size_t recorded = 0;
 	size_t generated = 0;
 	size_t doublePresents = 0;			// after the first establishment's opportunity
@@ -1336,11 +2463,16 @@ struct BidirLoopEntry_t
 
 BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, const BidirLoopInjection_t &inject = {} )
 {
-	constexpr uint64_t T = k_ulLoopVblankNs;
-	BidirLoopResult_t r = { .capacity = bidir_pending_hard_capacity( inject.ringImages, inject.multiplier ) };
+	const uint64_t T = inject.vblankNs;
+	BidirLoopResult_t r = { .capacity = bidir_pending_hard_capacity( inject.ringImages, inject.multiplier ), .vblankNs = T };
 	std::vector<uint64_t> source = { k_ulLoopStartNs + T - 5'000'000u };
 	for ( const uint64_t intervalNs : intervalsNs )
 		source.push_back( source.back() + intervalNs );
+	if ( inject.sourceQuantumNs != 0u )
+	{
+		for ( uint64_t &sourceNs : source )
+			sourceNs = source.front() + round_up_to_vblanks( sourceNs - source.front(), inject.sourceQuantumNs );
+	}
 	std::vector<uint64_t> ready( source.size() );
 	for ( size_t id = 0; id < source.size(); id++ )
 	{
@@ -1402,6 +2534,15 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 		r.shown.push_back( reals[ id ] );
 		r.shown.back().flipNs = opportunityNs;
 	};
+	const auto learn_bias = [&]( uint64_t targetNs, uint64_t opportunityNs ) {
+		if ( !bidir_real_on_slot( targetNs, opportunityNs, T ) )
+			return;
+		const DisplayChainTimingState_t timing = { .presentBias = r.presentBias };
+		r.presentBias = update_present_bias( r.presentBias, display_target_ns( targetNs, timing ),
+			opportunityNs + inject.displayOffsetNs, cadence_arrival_guard_ns( T ), T, false ).state;
+		r.worstBiasErrorNs = std::max( r.worstBiasErrorNs,
+			signed_ns_magnitude( r.presentBias.emaNs - static_cast<int64_t>( inject.displayOffsetNs ) ) );
+	};
 	const auto present = [&]( uint64_t opportunityNs ) {
 		const BidirPresenterView_t view = view_at( opportunityNs );
 		if ( !queue.empty() && bidir_timeline_stale( queue.front().targetNs, opportunityNs, view.capacity, T ) )
@@ -1421,6 +2562,9 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 				true, queue.size(), view ) );
 			if ( action == BidirFrontAction_t::Wait )
 				return;
+			if ( bidir_front_forced( front.targetNs, opportunityNs, T ) )
+				state.ringBound = observe_bidir_ring_overflow( state.ringBound, opportunityNs,
+					state.epoch.valid ? state.epoch.delayNs : 0u );
 			queue.pop_front();
 			if ( action != BidirFrontAction_t::Present )
 				continue;
@@ -1431,7 +2575,10 @@ BidirLoopResult_t run_bidir_loop( const std::vector<uint64_t> &intervalsNs, cons
 			}
 			lastFrontNs = opportunityNs;
 			if ( front.real )
+			{
 				show_real( front.id, opportunityNs );
+				learn_bias( front.targetNs, opportunityNs );
+			}
 			else
 			{
 				show( opportunityNs );
@@ -1662,7 +2809,7 @@ size_t reals_beyond_bound( const BidirLoopResult_t &r, uint64_t fromNs, uint64_t
 {
 	return static_cast<size_t>( std::ranges::count_if( r.shown, [&]( const BidirLoopReal_t &real ) {
 		return real.delayNs != 0u && real.recordNs >= fromNs
-			&& real.flipNs - real.recordNs > real.delayNs + k_ulLoopVblankNs + slackNs + ( withPush ? real.pushNs : 0u );
+			&& real.flipNs - real.recordNs > real.delayNs + r.vblankNs + slackNs + ( withPush ? real.pushNs : 0u );
 	} ) );
 }
 
@@ -1683,7 +2830,7 @@ namespace
 // multiplier can fill.
 size_t fillable_holes_from( const BidirLoopResult_t &r, uint64_t fromNs, uint32_t multiplier = 2u )
 {
-	constexpr uint64_t T = k_ulLoopVblankNs;
+	const uint64_t T = r.vblankNs;
 	size_t holes = 0;
 	const uint64_t endNs = r.shown.empty() ? 0u : r.shown.back().flipNs - 300'000'000u;
 	for ( size_t i = 1u; i < r.shown.size(); i++ )
@@ -1703,7 +2850,7 @@ size_t fillable_holes_from( const BidirLoopResult_t &r, uint64_t fromNs, uint32_
 // A pair across a dropped real is no pair.
 size_t spacing_errors( const BidirLoopResult_t &r, uint64_t fromNs )
 {
-	constexpr int64_t T = k_ulLoopVblankNs;
+	const int64_t T = static_cast<int64_t>( r.vblankNs );
 	size_t errors = 0;
 	const uint64_t endNs = r.shown.empty() ? 0u : r.shown.back().flipNs - 300'000'000u;
 	for ( size_t i = 1u; i < r.shown.size(); i++ )
@@ -1856,8 +3003,11 @@ TEST_CASE( "a bidir pre-record hold step is no delay transition", "[framegen][de
 	// (a frame limiter, a slower submission). Record time follows it, so a step
 	// of it makes one long or one short pair, never a D transition: steps of
 	// 0..3T in 2 ms steps on every cadence, and of 0..100 ms at 30 and 42 fps,
-	// up and down, keep the one D. A source no faster than the display drops no
-	// real; a faster one only what the display cannot show in time. A second
+	// up and down, keep the one D. A source faster than the display at times
+	// holds D at the ring's predicted bound, which a step may move once: an
+	// overflow shortens it, or a hold with room lengthens it a vblank. A source
+	// no faster than the display drops no real; a
+	// faster one only what the display cannot show in time. A second
 	// after the step every slot is planned in time and every opportunity filled.
 	constexpr uint64_t T = k_ulLoopVblankNs;
 	constexpr uint64_t at = k_ulLoopInjectAtNs;
@@ -1878,7 +3028,8 @@ TEST_CASE( "a bidir pre-record hold step is no delay transition", "[framegen][de
 				const BidirLoopResult_t r = run_bidir_loop( sweep.cadence.intervals, { .latency =
 					[=]( size_t, uint64_t sourceNs ) { return ( sourceNs >= at ) == up ? stepNs : 0u; } } );
 				check_loop( r );
-				CHECK( r.events.size() == 1u );
+				CHECK( r.count( BidirReestablish_t::Established ) == 1u );
+				CHECK( r.delay_changes() <= ( sweep.cadence.everyIntervalAtLeastAVblank ? 0u : 1u ) );
 				CHECK( r.dropped() == r.planDropped );
 				if ( sweep.cadence.everyIntervalAtLeastAVblank )
 					CHECK( r.dropped() == 0u );
@@ -1977,8 +3128,10 @@ TEST_CASE( "a lone high or low bidir latency never moves the delay", "[framegen]
 TEST_CASE( "a noisy bimodal bidir latency keeps one delay", "[framegen][deadline]" )
 {
 	// A pre-record hold alternating between 10-25 ms and 45-65 ms every
-	// 0.1-0.9 s, on every cadence at the default ring: one D, established once,
-	// no real dropped. At x4 on a ring of 12 no real is dropped either. A 10-25 /
+	// 0.1-0.9 s, on every cadence at the default ring: established once, moved
+	// at most once (the ring overflowing at a switch of the hold shortens it, or
+	// a quiet hold with room lengthens it a vblank), and no real dropped. At x4
+	// on a ring of 12 no real is dropped either. A 10-25 /
 	// 30-40 ms hold at 30 fps also fills every pair with a slot to fill.
 	for ( const LoopCadence_t &cadence : loop_cadences( 25u * k_ulLoopSecondNs ) )
 	{
@@ -1990,7 +3143,7 @@ TEST_CASE( "a noisy bimodal bidir latency keeps one delay", "[framegen][deadline
 		CHECK( r.dropped() == 0u );
 		CHECK( r.backlogDropNs.empty() );
 		CHECK( r.count( BidirReestablish_t::Established ) == 1u );
-		CHECK( r.delay_changes() == 0u );
+		CHECK( r.delay_changes() <= 1u );
 		const BidirLoopResult_t x4 = run_bidir_loop( cadence.intervals, { .latency = latencyOf, .ringImages = 12u, .multiplier = 4u } );
 		check_loop( x4 );
 		CHECK( x4.dropped() == 0u );
@@ -2336,12 +3489,13 @@ TEST_CASE( "a steady bidir regime yields one delay however it is reached", "[fra
 TEST_CASE( "a slow bidir cadence turning fast keeps its reals and their spacing", "[framegen][deadline]" )
 {
 	// A loading-screen cadence of 60-240 ms, then 16.7-33.3 ms. D never
-	// lengthens. It shortens at once where the ring bound falls below it, and
-	// after the release hold where the envelope falls further; the queued reals
+	// lengthens. It shortens at once where the ring overflows below a lower
+	// predicted bound, and after the release hold where the envelope falls; the
+	// queued reals
 	// move with it, and a second after the switch consecutive reals are shown at
 	// their source spacing within a vblank. No real is dropped, except at the
 	// display's own rate (16.7 ms), where the excess left over from the long D
-	// cannot drain and one backlog drop takes at most two reals.
+	// cannot drain and one backlog drop takes the reals of that excess.
 	constexpr uint64_t T = k_ulLoopVblankNs;
 	for ( const uint64_t slowNs : { 60'000'000ull, 100'000'000ull, 150'000'000ull, 240'000'000ull } )
 	{
@@ -2365,9 +3519,36 @@ TEST_CASE( "a slow bidir cadence turning fast keeps its reals and their spacing"
 			else
 			{
 				CHECK( r.backlogDropNs.size() <= 1u );
-				CHECK( r.dropped() <= 2u );
+				CHECK( r.dropped() <= 3u );
 			}
 			CHECK( spacing_errors( r, switched->flipNs + k_ulLoopSecondNs ) == 0u );
+		}
+	}
+}
+
+TEST_CASE( "a fast bidir cadence turning slow lets D follow the envelope again", "[framegen][deadline]" )
+{
+	// A game that drops from a fast cadence to a slow one: the ring bound the
+	// fast cadence needed must not keep D short, which would cost every
+	// interpolation of the slow cadence. Once the source slowed, the bound
+	// rises to what the ring holds and D follows the envelope.
+	for ( const uint64_t T : { k_ulLoopVblankNs, k_ulLoop120HzNs } )
+	for ( const uint64_t fastNs : { 8'400'000ull, 12'000'000ull, 16'700'000ull, 20'000'000ull } )
+	{
+		for ( const uint64_t slowNs : { 50'000'000ull, 66'666'667ull, 100'000'000ull } )
+		{
+			CAPTURE( T, fastNs, slowNs );
+			std::vector<uint64_t> intervals = pattern_cadence( { fastNs }, 8u * k_ulLoopSecondNs );
+			const std::vector<uint64_t> slow = pattern_cadence( { slowNs }, 12u * k_ulLoopSecondNs );
+			intervals.insert( intervals.end(), slow.begin(), slow.end() );
+			const BidirLoopResult_t r = run_bidir_loop( intervals, { .vblankNs = T } );
+			check_loop( r );
+			CHECK( r.dropped() == r.planDropped );
+			CHECK( r.finalDelayNs == bidir_target_delay( r.finalEnvelopeNs, T ) );
+			// The recovery only lengthens D: nothing overflows on the way up.
+			CHECK( std::ranges::none_of( r.events, [&]( const BidirLoopEvent_t &e ) {
+				return e.kind == BidirReestablish_t::Shortened
+					&& e.atNs >= k_ulLoopStartNs + 10u * k_ulLoopSecondNs; } ) );
 		}
 	}
 }
@@ -2444,6 +3625,159 @@ TEST_CASE( "a bidir source faster than the display is shown within its bound", "
 		CHECK( r.dropped() == r.planDropped );
 		CHECK( r.backlogDropNs.empty() );
 		CHECK( reals_beyond_bound( r, r.firstEstablishNs, ( k_uBidirEnvelopeSamples - 1u ) * T + k_ulLoopWakeLeadNs, false ) == 0u );
+	}
+}
+
+namespace
+{
+
+// A cadence repeating pattern, with a burst of four reals one vblank apart
+// every everyNs.
+std::vector<uint64_t> isolated_bursts( const std::vector<uint64_t> &pattern, uint64_t vblankNs,
+	uint64_t everyNs, uint64_t durationNs )
+{
+	std::vector<uint64_t> intervals;
+	uint64_t nextBurstNs = everyNs;
+	for ( uint64_t totalNs = 0; totalNs < durationNs; totalNs += intervals.back() )
+	{
+		if ( totalNs >= nextBurstNs )
+		{
+			intervals.insert( intervals.end(), { vblankNs, vblankNs, vblankNs } );
+			totalNs += 3u * vblankNs;
+			nextBurstNs += everyNs;
+		}
+		intervals.push_back( pattern[ intervals.size() % pattern.size() ] );
+	}
+	return intervals;
+}
+
+// GravityMark's source cadence at 120 Hz in whole vblanks (8.3, 16.7, 25 and
+// 33 ms; p50 16.7 ms), recorded nested past its loading screen: regimes of 60,
+// 48, 80 and 36 fps that change every few seconds.
+constexpr std::string_view k_szRecordedVblankCadence =
+	"5132111221111114312232681411111111111111111111111111111111111180311222222222222222222221312222222222"
+	"2222222212222222222322222222222222222222222221321312312321321313213222222222222222222222322223323233"
+	"2323333332222322222222222222223223223222322232222322322322232222122221222121212112111112111211212212"
+	"2222222223223223223223223232222223222223222223222322333324233332323323332332323232232222223223323233"
+	"2332323232322323323323332332323232323232323322322232222222222221222222222222222222122122121221212121"
+	"2121212121212121221222122222223222222222222222322222222222222223222222122122122122212223122222222213"
+	"1222222222232223223322323232322233233233323223222323333232323323333233233333233323332332323232232322"
+	"3223232232232322323223233332333232233232322232222222222222222222122212222343343343434343433434334334"
+	"3433433433433434334322222222222312221222212222122222222232332323232323323232232222322222322222322332"
+	"3323333233323323323323323232332323233233233323333332333332333233233233323332333323323323323323233233"
+	"2332323323232323232323232232323223232232232322322323223223232232232232232232322322322322322322323223"
+	"2232232232322322322322322322323223223223223223232232232232232322322322323223223232232232232322322322"
+	"3223232232232232322322322323223223223232232232232322323223232232322323223223232232322322322323223232"
+	"2322323223232232232322322323223232232322323223223232232232322323223232232232322322323223223232232232"
+	"3223223232232322322323223223232232322322323223232232232322322323223232232232322322323223232232232322"
+	"3223232232232322323223223232232232322323223223232232232322323223223232232322333332333333333323333333"
+	"332423333333332333333333323333333332333333332333333333233333333233333333233";
+
+std::vector<uint64_t> recorded_cadence( uint64_t vblankNs )
+{
+	std::vector<uint64_t> intervals;
+	for ( const char vblanks : k_szRecordedVblankCadence )
+		intervals.push_back( static_cast<uint64_t>( vblanks - '0' ) * vblankNs );
+	return intervals;
+}
+
+} // namespace
+
+TEST_CASE( "isolated bidir bursts on a quantised source never re-prime", "[framegen][deadline]" )
+{
+	// Four reals one vblank apart, further apart than a window and a hold, on a
+	// source latched to the vblank grid at 60 and 120 Hz, x2 and x4: a burst is
+	// one piece of evidence, which costs at most an early-shown real and never
+	// moves D or loses a real.
+	for ( const uint64_t T : { k_ulLoopVblankNs, k_ulLoop120HzNs } )
+	{
+		for ( const std::vector<uint64_t> &pattern : { std::vector<uint64_t>{ 2u * T }, std::vector<uint64_t>{ 3u * T },
+			std::vector<uint64_t>{ 2u * T, 2u * T, 2u * T, 4u * T } } )
+		{
+			for ( const uint32_t multiplier : { 2u, 4u } )
+			{
+				CAPTURE( T, pattern.size(), pattern.front(), multiplier );
+				const BidirLoopResult_t r = run_bidir_loop(
+					isolated_bursts( pattern, T, k_ulBidirWindowNs + k_ulBidirReleaseHoldNs + 500'000'000u, 30u * k_ulLoopSecondNs ),
+					{ .ringImages = multiplier == 4u ? 12u : 8u, .multiplier = multiplier, .vblankNs = T, .sourceQuantumNs = T } );
+				check_loop( r );
+				CHECK( r.dropped() == 0u );
+				CHECK( r.events.size() == 1u );
+			}
+		}
+	}
+}
+
+TEST_CASE( "a recorded 120 Hz cadence never flaps the bidir delay", "[framegen][deadline]" )
+{
+	// GravityMark's recorded cadence, twice over, with source times latched to
+	// the vblank grid and a 0-4 ms hold before each record, at 120 and 60 Hz: D
+	// is established once, changes at most once per 10 s, where a bound that
+	// moved on the prediction alone changed it every few seconds, and no real is
+	// dropped.
+	for ( const uint64_t T : { k_ulLoop120HzNs, k_ulLoopVblankNs } )
+	{
+		std::vector<uint64_t> intervals = recorded_cadence( T );
+		const std::vector<uint64_t> once = intervals;
+		intervals.insert( intervals.end(), once.begin(), once.end() );
+		uint64_t durationNs = 0;
+		for ( const uint64_t intervalNs : intervals )
+			durationNs += intervalNs;
+		for ( const uint64_t holdNs : { uint64_t{ 0u }, uint64_t{ 4'000'000u } } )
+		{
+			CAPTURE( T, holdNs );
+			auto rng = std::make_shared<LoopRng_t>();
+			const BidirLoopResult_t r = run_bidir_loop( intervals, {
+				.latency = [=]( size_t, uint64_t ) { return rng->uniform( 0u, holdNs ); },
+				.vblankNs = T, .sourceQuantumNs = T } );
+			check_loop( r );
+			CHECK( r.dropped() == 0u );
+			CHECK( r.count( BidirReestablish_t::Established ) == 1u );
+			CHECK( r.delay_changes() * 10u * k_ulLoopSecondNs <= durationNs );
+		}
+	}
+}
+
+TEST_CASE( "bidir learns the display offset from its delayed reals alone", "[framegen][deadline]" )
+{
+	// A display chain that flips every present 0, a third of a vblank or a
+	// whole vblank after its opportunity (native, a host compositor's frame):
+	// the bias the delayed reals teach is exactly that offset from its first
+	// sample on, through stalls, lost presents, opportunity jumps and presents
+	// only at composites, whose late and early reals never move it. The planner
+	// and the presenter never read it: every decision is the same for every
+	// offset.
+	constexpr uint64_t at = k_ulLoopInjectAtNs;
+	const std::array<BidirLoopInjection_t, 6> injections = {
+		BidirLoopInjection_t{},
+		BidirLoopInjection_t{ .stallAtNs = at + 5'000'000u, .stallForNs = 84'000'000u, .compositesPerVblank = 2u },
+		BidirLoopInjection_t{ .lostPresent = []( uint64_t opportunityNs ) { return opportunityNs % 7u == 0u; } },
+		BidirLoopInjection_t{ .jumpAtNs = at, .jumpNs = k_ulLoopVblankNs },
+		BidirLoopInjection_t{ .latency = constant_latency( 20'000'000u ), .presentsOnlyAtComposites = true },
+		BidirLoopInjection_t{ .vblankNs = k_ulLoop120HzNs, .sourceQuantumNs = k_ulLoop120HzNs },
+	};
+	for ( const LoopCadence_t &cadence : loop_cadences( 12u * k_ulLoopSecondNs ) )
+	{
+		for ( size_t i = 0u; i < injections.size(); i++ )
+		{
+			CAPTURE( cadence.name, i );
+			BidirLoopInjection_t inject = injections[ i ];
+			const BidirLoopResult_t reference = run_bidir_loop( cadence.intervals, inject );
+			CHECK( reference.presentBias.emaNs == 0 );
+			for ( const uint64_t offsetNs : { inject.vblankNs / 3u, inject.vblankNs } )
+			{
+				CAPTURE( offsetNs );
+				inject.displayOffsetNs = offsetNs;
+				const BidirLoopResult_t r = run_bidir_loop( cadence.intervals, inject );
+				REQUIRE( r.presentBias.samples != 0u );
+				CHECK( r.presentBias.emaNs == static_cast<int64_t>( offsetNs ) );
+				CHECK( r.worstBiasErrorNs == 0u );
+				CHECK( r.shown == reference.shown );
+				CHECK( r.events == reference.events );
+				CHECK( r.holeNs == reference.holeNs );
+				CHECK( r.dropped() == reference.dropped() );
+			}
+		}
 	}
 }
 
@@ -2588,7 +3922,7 @@ TEST_CASE( "the bidir window keeps a window of samples, and at least k", "[frame
 	CHECK( dense.sinceNs == 1u );
 }
 
-TEST_CASE( "the bidir ring bound holds the reals the ring can hold", "[framegen][deadline]" )
+TEST_CASE( "the bidir ring bound predicts what the ring holds and moves on overflows", "[framegen][deadline]" )
 {
 	constexpr uint64_t T = 100u;
 	constexpr uint64_t H = k_ulBidirReleaseHoldNs;
@@ -2597,9 +3931,8 @@ TEST_CASE( "the bidir ring bound holds the reals the ring can hold", "[framegen]
 	STATIC_REQUIRE( bidir_ring_reals( 6u ) == 3u );
 	STATIC_REQUIRE( bidir_ring_delay( 3u, 1'000u, T ) == 0u );
 	STATIC_REQUIRE( bidir_ring_delay( 6u, 1'000u, 0u ) == 0u );
-	// One real per vblank until a span is measured; whole vblanks, rounded down.
-	STATIC_REQUIRE( bidir_ring_delay( 6u, 0u, T ) == 3u * T );
-	STATIC_REQUIRE( bidir_ring_delay( 10u, 0u, T ) == 7u * T );
+	// No prediction until k spans are measured; whole vblanks, rounded down.
+	STATIC_REQUIRE( bidir_ring_delay( 6u, 0u, T ) == 0u );
 	STATIC_REQUIRE( bidir_ring_delay( 6u, 3u * T + 99u, T ) == 3u * T );
 	STATIC_REQUIRE( bidir_ring_delay( 6u, 9u * T, T ) == 9u * T );
 
@@ -2618,20 +3951,110 @@ TEST_CASE( "the bidir ring bound holds the reals the ring can hold", "[framegen]
 	CHECK( spacings.span( k_nBidirSpacings ) != 0u );
 	CHECK( spacings.span( k_nBidirSpacings + 1u ) == 0u );
 
-	// The bound in force falls at once and rises only after the measured bound
-	// stayed above it for the hold; a dip restarts the hold.
-	constexpr BidirRingBound_t bound = { .delayNs = 5u * T };
-	STATIC_REQUIRE( hold_bidir_ring_bound( bound, 3u * T, 10u ).delayNs == 3u * T );
-	STATIC_REQUIRE( hold_bidir_ring_bound( bound, 5u * T, 10u ).aboveSinceNs == 0u );
-	constexpr BidirRingBound_t above = hold_bidir_ring_bound( bound, 9u * T, 10u );
-	STATIC_REQUIRE( above.delayNs == 5u * T );
-	STATIC_REQUIRE( above.aboveSinceNs == 10u );
-	STATIC_REQUIRE( hold_bidir_ring_bound( above, 8u * T, 9u + H ).delayNs == 5u * T );
-	STATIC_REQUIRE( hold_bidir_ring_bound( above, 8u * T, 10u + H ).delayNs == 8u * T );
-	STATIC_REQUIRE( hold_bidir_ring_bound( above, 8u * T, 10u + H ).aboveSinceNs == 0u );
-	constexpr BidirRingBound_t dipped = hold_bidir_ring_bound( above, 5u * T, 20u );
-	STATIC_REQUIRE( dipped.aboveSinceNs == 0u );
-	STATIC_REQUIRE( hold_bidir_ring_bound( hold_bidir_ring_bound( dipped, 9u * T, 30u ), 9u * T, 10u + H ).delayNs == 5u * T );
+	// A front leaves forced only ahead of its due window.
+	STATIC_REQUIRE( bidir_front_forced( 1'000u + T, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_front_forced( 1'000u + T / 2u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_front_forced( 1'000u - T, 1'000u, T ) );
+
+	constexpr uint64_t W = k_ulBidirWindowNs;
+	constexpr uint64_t D = 7u * T;
+	constexpr size_t C = 6u;
+	// Until the first translation the predicted bound sets it.
+	STATIC_REQUIRE( update_bidir_ring_bound( {}, 0u, 0u, 5u * T, C, 10u, T ).delayNs == 5u * T );
+
+	// The overflows within D of the newest one are that overflow; none counts
+	// without a translation. The newest k are kept.
+	BidirRingBound_t bound;
+	CHECK( observe_bidir_ring_overflow( bound, 1'000u, 0u ).overflowNs.back() == 0u );
+	bound = observe_bidir_ring_overflow( bound, 1'000u, D );
+	bound = observe_bidir_ring_overflow( bound, 1'000u + D - 1u, D );
+	bound = observe_bidir_ring_overflow( bound, 1'000u + D, D );
+	CHECK( bound.overflowNs == std::array<uint64_t, k_uBidirEnvelopeSamples>{ 0u, 1'000u, 1'000u + D } );
+	CHECK( bound.quietSinceNs == 1'000u + D );
+	CHECK( bound.delayNs == 0u );
+
+	// A prediction alone never moves an established bound.
+	CHECK( update_bidir_ring_bound( {}, D, D, 3u * T, C, 1'000u, T ).delayNs == 0u );
+	// An overflow within a window lowers it at once to a prediction below the D
+	// in force (the translation's, else the envelope's), and is spent; not to a
+	// prediction at or above it, nor after the window.
+	const BidirRingBound_t one = observe_bidir_ring_overflow( {}, 1'000u, D );
+	const BidirRingBound_t predicted = update_bidir_ring_bound( one, D, 9u * T, 4u * T, C, 1'001u, T );
+	CHECK( predicted.delayNs == 4u * T );
+	CHECK( predicted.overflowNs == std::array<uint64_t, k_uBidirEnvelopeSamples>{} );
+	CHECK( predicted.quietSinceNs == 1'001u );
+	CHECK( update_bidir_ring_bound( one, D, 9u * T, D, C, 1'001u, T ).delayNs == 0u );
+	CHECK( update_bidir_ring_bound( one, D, 9u * T, 4u * T, C, 1'000u + W, T ).delayNs == 0u );
+
+	// Fewer than k overflows never lower it a vblank, nor do k spread over more
+	// than a window.
+	CHECK( update_bidir_ring_bound( bound, D, D, D, C, 1'000u + 2u * D, T ).delayNs == 0u );
+	BidirRingBound_t spread;
+	for ( const uint64_t atNs : { uint64_t{ 1'000u }, 1'000u + W / 2u, 1'001u + W } )
+		spread = observe_bidir_ring_overflow( spread, atNs, D );
+	CHECK( update_bidir_ring_bound( spread, D, D, D, C, 1'001u + W, T ).delayNs == 0u );
+
+	// k within a window lower it a vblank below the D in force at once, and are
+	// spent.
+	bound = observe_bidir_ring_overflow( bound, 1'000u + 2u * D, D );
+	const BidirRingBound_t fallen = update_bidir_ring_bound( bound, D, 9u * T, D, C, 1'000u + 3u * D, T );
+	CHECK( fallen.delayNs == D - T );
+	CHECK( fallen.overflowNs == std::array<uint64_t, k_uBidirEnvelopeSamples>{} );
+	CHECK( fallen.quietSinceNs == 1'000u + 3u * D );
+	CHECK( update_bidir_ring_bound( fallen, D - T, 9u * T, D, C, 1'000u + 3u * D + 1u, T ).delayNs == D - T );
+	CHECK( update_bidir_ring_bound( bound, T, D, D, C, 1'000u + 3u * D, T ).delayNs == 0u );
+
+	// A hold without an overflow in which every plan left two entries free
+	// raises it a vblank; reaching the envelope's D it bounds nothing. A deeper
+	// queue blocks the rise until the next overflow, and an overflow restarts
+	// the hold: a hold with room after it raises the bound again.
+	const uint64_t quietNs = fallen.quietSinceNs;
+	CHECK( update_bidir_ring_bound( fallen, D - T, 9u * T, D, C, quietNs + H - 1u, T ).delayNs == D - T );
+	const BidirRingBound_t risen = update_bidir_ring_bound( fallen, D - T, 9u * T, D, C, quietNs + H, T );
+	CHECK( risen.delayNs == D );
+	CHECK( risen.quietSinceNs == quietNs + H );
+	CHECK( update_bidir_ring_bound( fallen, D - T, D, D, C, quietNs + H, T ).delayNs == 0u );
+	BidirRingBound_t deep = fallen;
+	deep.deepestQueue = C - 1u;
+	CHECK( update_bidir_ring_bound( deep, D - T, 9u * T, D, C, quietNs + 10u * H, T ).delayNs == D - T );
+	const BidirRingBound_t interrupted = observe_bidir_ring_overflow( deep, quietNs + H / 2u, D - T );
+	CHECK( interrupted.deepestQueue == 0u );
+	CHECK( update_bidir_ring_bound( interrupted, D - T, 9u * T, D, C, quietNs + H, T ).delayNs == D - T );
+	CHECK( update_bidir_ring_bound( interrupted, D - T, 9u * T, D, C, quietNs + H / 2u + H, T ).delayNs == D );
+
+	// A source k_uBidirRingReleaseFactor times slower than when the bound was
+	// set releases the latch: the rise goes on a vblank per hold.
+	BidirRingBound_t latched = observe_bidir_ring_overflow( {}, 1'000u, D );
+	latched = update_bidir_ring_bound( latched, D, 9u * T, 2u * T, C, 1'001u, T );
+	REQUIRE( latched.delayNs == 2u * T );
+	CHECK( latched.predictedAtSetNs == 2u * T );
+	latched.deepestQueue = C - 1u;
+	const uint64_t heldNs = 1'001u + H;
+	CHECK( update_bidir_ring_bound( latched, 2u * T, 9u * T, 6u * T - 1u, C, heldNs, T ).delayNs == 2u * T );
+	const BidirRingBound_t released = update_bidir_ring_bound( latched, 2u * T, 9u * T, 6u * T, C, heldNs, T );
+	CHECK( released.delayNs == 3u * T );
+	CHECK( released.predictedAtSetNs == 2u * T );
+	CHECK( update_bidir_ring_bound( released, 3u * T, 9u * T, 6u * T, C, heldNs + H, T ).delayNs == 4u * T );
+}
+
+TEST_CASE( "present tags carry the display time and bidir learns only from reals on their slot", "[framegen][deadline]" )
+{
+	constexpr uint64_t T = 100u;
+	// The bias applies at the tag only, and 0 stays no target.
+	constexpr DisplayChainTimingState_t timing = { .presentBias = { .emaNs = -30, .samples = 9u } };
+	STATIC_REQUIRE( display_target_ns( 1'000u, timing ) == 970u );
+	STATIC_REQUIRE( display_target_ns( 1'000u, {} ) == 1'000u );
+	STATIC_REQUIRE( display_target_ns( 0u, timing ) == 0u );
+	STATIC_REQUIRE( display_target_ns( 10u, timing ) == 0u );
+	STATIC_REQUIRE( display_target_ns( 1'000u, { .presentBias = { .emaNs = 30 } } ) == 1'030u );
+	// A real is on its slot within half a vblank of it, either way.
+	STATIC_REQUIRE( bidir_real_on_slot( 1'000u, 1'000u, T ) );
+	STATIC_REQUIRE( bidir_real_on_slot( 1'050u, 1'000u, T ) );
+	STATIC_REQUIRE( bidir_real_on_slot( 950u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 1'051u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 949u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 900u, 1'000u, T ) );
+	STATIC_REQUIRE_FALSE( bidir_real_on_slot( 1'100u, 1'000u, T ) );
 }
 
 TEST_CASE( "the bidir delay derives from the envelope", "[framegen][deadline]" )
@@ -2863,7 +4286,7 @@ TEST_CASE( "the bidir plan step establishes, re-establishes and admits by one ru
 	CHECK( first.reestablish == BidirReestablish_t::Established );
 	CHECK( first.state.pairLatency.valueNs == 200u );
 	CHECK( first.state.epoch.delayNs == 3u * T );
-	CHECK( first.state.ringBound.delayNs == 3u * T );
+	CHECK( first.state.ringBound.delayNs == 0u );	// no span measured yet: nothing bounds D
 	CHECK( first.state.epoch.endpoint_display_time( opp - 100u ) == opp + 200u );
 	CHECK( first.state.grid.D0 == opp );
 	CHECK( first.state.grid.W0 == opp - 30u );
@@ -2983,33 +4406,43 @@ TEST_CASE( "the bidir plan step moves D at once to protect and after a hold to r
 		CHECK_FALSE( step.previous.queue );
 		CHECK( step.current.idealNs == opp - 350u + 5u * T );
 		CHECK( step.current.targetNs == opp + 4u * T );
-		// The ring bound in force caps it: a bound of 4T lengthens to 4T only.
+		// The ring bound in force caps it: a bound of 4T, moved just now,
+		// lengthens to 4T only.
 		BidirTimelineState_t capped = rising;
-		capped.ringBound = { .delayNs = 4u * T };
+		capped.ringBound = { .delayNs = 4u * T, .quietSinceNs = opp };
 		CHECK( plan_bidir_step( capped, in ).state.epoch.delayNs == 4u * T );
 	}
 
-	// A held D beyond the ring bound shortens at once to it: the ring of a
-	// smaller capacity holds 3T. A larger ring raises the bound back only after
-	// it measured above it for the hold.
+	// A held D beyond the predicted bound stands until the ring overflows; an
+	// overflow within a window then shortens it at once to the prediction (3T:
+	// spans of 350 hold three reals). After a hold without an overflow, in
+	// which every plan left room, the bound rises a vblank, and a vblank per
+	// hold after that.
 	{
-		const BidirTimelineState_t held = established_state( 500u, 700u );
-		const BidirPlanStep_t shortened = plan_bidir_step( held,
-			step_inputs( empty, step_real( 2u, opp - 400u ), step_real( 3u, opp - 350u ), opp, 6u ) );
+		BidirTimelineState_t held = established_state( 500u, 0u );
+		for ( uint64_t i = 1u; i <= 3u; i++ )
+			held.window.push( { .atNs = opp - 400u + i, .sourceSpanNs = 350u, .recordSpanNs = 350u } );
+		const BidirPlanInputs_t in = step_inputs( empty, step_real( 2u, opp - 400u ), step_real( 3u, opp - 350u ), opp, 6u );
+		const BidirPlanStep_t kept = plan_bidir_step( held, in );
+		REQUIRE( kept.planned );
+		CHECK( kept.reestablish == BidirReestablish_t::Kept );
+		CHECK( kept.state.epoch.delayNs == 5u * T );
+
+		held.ringBound = observe_bidir_ring_overflow( held.ringBound, opp - 10u, 5u * T );
+		const BidirPlanStep_t shortened = plan_bidir_step( held, in );
 		REQUIRE( shortened.planned );
 		CHECK( shortened.reestablish == BidirReestablish_t::Shortened );
 		CHECK( shortened.state.epoch.delayNs == 3u * T );
 		CHECK( shortened.state.pairLatency.valueNs == 350u );
 
 		BidirTimelineState_t state = shortened.state;
-		uint64_t atNs = opp;
 		for ( uint32_t i = 1u; i <= 3u; i++ )
 		{
-			atNs = opp + i * H / 2u;
+			const uint64_t atNs = opp + i * H / 2u;
 			const BidirPlanStep_t step = plan_bidir_step( state,
 				step_inputs( empty, step_real( 2u + i, atNs - 400u ), step_real( 3u + i, atNs - 350u ), atNs, 10u ) );
 			REQUIRE( step.planned );
-			CHECK( step.state.epoch.delayNs == ( i < 3u ? 3u * T : 5u * T ) );
+			CHECK( step.state.epoch.delayNs == ( i < 2u ? 3u * T : 4u * T ) );
 			state = step.state;
 		}
 	}
@@ -5643,4 +7076,206 @@ TEST_CASE( "composite seqs change nothing on live and generated paints", "[frame
 			CHECK( actual.forced_carrier() == 0u );
 		}
 	}
+}
+
+// Decision inputs recorded on the nested headless host (2048x1280@120,
+// GravityMark 200k on NVIDIA, checked x2 presented on the 890M; 70fefeec plus
+// temporary logging). Times are relative to the decision's now. In every case
+// the learned present bias (about -3.4 to -3.6 ms) has moved the slot's wake
+// onto the provisional raw-vblank start bound, so no rung fits the remaining
+// time, although each mature cost is below 1 ms of an 8.33 ms refresh.
+namespace
+{
+
+struct RecordedCausalDecision_t
+{
+	uint64_t wakeNs;
+	uint64_t startNs; // provisional start estimate (0 = corrected anchor)
+	uint64_t targetNs;
+	std::array<LadderRungCost_t, 3> rungs;
+};
+
+constexpr uint64_t k_ulRecordedIntervalNs = 8'333'333u;
+
+constexpr std::array<RecordedCausalDecision_t, 3> k_recordedFalseDegrades = { {
+	// degrade-settle 0->2, site real-frame decision
+	{ 4'678'000u, 4'674'000u, 9'395'000u,
+		{ { { 682'000u, 2498u }, { 861'000u, 3u }, { 644'000u, 204u } } } },
+	// degrade-settle 0->2, anchor-correction replan (corrected anchor)
+	{ 520'000u, 0u, 4'570'000u,
+		{ { { 515'000u, 2109u }, { 861'000u, 3u }, { 601'000u, 115u } } } },
+	// degrade-fit 0->1: the cold rung was probed with 3 us of budget
+	{ 4'870'000u, 4'867'000u, 9'771'000u,
+		{ { { 807'000u, 483u }, { 0u, 0u }, { 0u, 0u } } } },
+} };
+
+constexpr uint64_t recorded_remaining_budget_ns( const RecordedCausalDecision_t &d )
+{
+	return d.wakeNs > d.startNs ? deadline_budget_ns( d.wakeNs - d.startNs ) : 0u;
+}
+
+constexpr uint64_t recorded_nested_slot_budget_ns( const RecordedCausalDecision_t &d )
+{
+	// The bias shifts target and wake equally, so the recorded pair carries the
+	// raw grid's wake lead.
+	return causal_shortfall_slot_budget_ns( false, 0u, DisplayGrid_t{
+		.D0 = d.targetNs, .W0 = d.wakeNs, .T = k_ulRecordedIntervalNs } );
+}
+
+constexpr DisplayGrid_t k_nestedTestGrid = {
+	.D0 = 100'000'000u, .W0 = 97'000'000u, .T = 8'000'000u };
+
+} // namespace
+
+TEST_CASE( "causal shortfall reference: native keeps its budget, nested uses the wake lead",
+	"[framegen][deadline][nested][reference-wiring]" )
+{
+	STATIC_REQUIRE( compositor_wake_lead_ns( 100'000'000u, 97'000'000u ) == 3'000'000u );
+	STATIC_REQUIRE( compositor_wake_lead_ns( 97'000'000u, 100'000'000u ) == 0u );
+	// Native: its own commit budget, never the nested reference.
+	STATIC_REQUIRE( causal_shortfall_slot_budget_ns( true, 123u, k_nestedTestGrid ) == 123u );
+	// Nested: one refresh interval less the raw grid's wake lead, at 85 %.
+	STATIC_REQUIRE( causal_shortfall_slot_budget_ns( false, 0u, k_nestedTestGrid )
+		== deadline_budget_ns( 5'000'000u ) );
+	// A wake lead of a whole interval or more leaves no reference.
+	STATIC_REQUIRE( causal_shortfall_slot_budget_ns( false, 0u, DisplayGrid_t{
+		.D0 = 100'000'000u, .W0 = 91'000'000u, .T = 8'000'000u } ) == 0u );
+}
+
+// rendervulkan.cpp is not compiled by any test: pin only its call into the
+// seams above, so the behaviour stays defined (and tested) in the headers.
+TEST_CASE( "the renderer classifies causal shortfalls through the shared seams",
+	"[framegen][deadline][nested][reference-wiring]" )
+{
+	const std::string source = framegen_read_source( FRAMEGEN_RENDERVULKAN_SOURCE_PATH );
+	REQUIRE_FALSE( source.empty() );
+	const auto statements = [&]( std::string_view start, std::string_view end )
+	{
+		return framegen_source_statements( source, framegen_canonical( start ), end );
+	};
+	// The renderer passes its own native flag, native budget and raw grid.
+	CHECK( statements( "const uint64_t ulShortfallSlotBudgetNs =", ";" )
+		== std::vector<std::string>{ framegen_canonical(
+			"const uint64_t ulShortfallSlotBudgetNs ="
+			" gamescope::framegen::causal_shortfall_slot_budget_ns("
+			" bNativeKmsTiming, ulNativeSlotBudgetNs, rawGrid );" ) } );
+	// The classifier and the rung selection receive that reference, not the
+	// native budget.
+	CHECK( statements( "switch ( gamescope::framegen::causal_shortfall_action(", "{" )
+		== std::vector<std::string>{ framegen_canonical(
+			"switch ( gamescope::framegen::causal_shortfall_action("
+			" bDegradeForPriorMiss, result.ulCostNs, result.uSamples,"
+			" ulRemainingBudgetNs, ulShortfallSlotBudgetNs,"
+			" g_framegenHistory.nDegradeHold ) ) {" ) } );
+	CHECK( statements( "FramegenCausalRungSelection_t rung = framegen_select_causal_rung(", ";" )
+		== std::vector<std::string>{ framegen_canonical(
+			"FramegenCausalRungSelection_t rung = framegen_select_causal_rung("
+			" plan, now, ulPlainWakeNs, commitPlan.earlyCommit,"
+			" ulNativeSlotBudgetNs, ulShortfallSlotBudgetNs );" ) } );
+	// A phase-only skip returns at once: it writes no rung, hold or recovery
+	// evidence.
+	CHECK( statements( "case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly:", ";" )
+		== std::vector<std::string>{ framegen_canonical(
+			"case gamescope::framegen::CausalShortfallAction_t::SkipPhaseOnly: return result;" ) } );
+}
+
+TEST_CASE( "nested late-phase decisions are not ladder capacity evidence",
+	"[framegen][deadline][recovery][nested]" )
+{
+	for ( const RecordedCausalDecision_t &d : k_recordedFalseDegrades )
+	{
+		const LadderRungCost_t current = d.rungs[ 0 ];
+		const uint64_t remainingNs = recorded_remaining_budget_ns( d );
+		const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
+
+		// The window collapsed for every mature rung, so the old nested path
+		// (no slot reference) took this as capacity evidence and degraded.
+		for ( const LadderRungCost_t &rung : d.rungs )
+		{
+			if ( rung.samples >= k_uDeadlineMinSamples )
+				CHECK_FALSE( deadline_cost_fits( rung.costNs, d.wakeNs, 0u, d.startNs ) );
+		}
+		CHECK( causal_shortfall_action( false, current.costNs, current.samples,
+			remainingNs, 0u, 0u ) == CausalShortfallAction_t::Degrade );
+
+		// A normally planned nested slot holds the rung several times over.
+		CHECK( slotNs > 2'500'000u );
+		CHECK( current.costNs * 3u < slotNs );
+		CHECK( causal_shortfall_action( false, current.costNs, current.samples,
+			remainingNs, slotNs, 0u ) == CausalShortfallAction_t::SkipPhaseOnly );
+	}
+}
+
+TEST_CASE( "nested slot reference still degrades on real capacity evidence",
+	"[framegen][deadline][recovery][nested]" )
+{
+	const RecordedCausalDecision_t &d = k_recordedFalseDegrades[ 0 ];
+	const uint64_t remainingNs = recorded_remaining_budget_ns( d );
+	const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
+
+	// A mature rung which cannot fit even a normally planned slot degrades.
+	CHECK( causal_shortfall_action( false, slotNs + 1u, k_uDeadlineMinSamples,
+		remainingNs, slotNs, 0u ) == CausalShortfallAction_t::Degrade );
+	// ...after the post-degradation hold.
+	CHECK( causal_shortfall_action( false, slotNs + 1u, k_uDeadlineMinSamples,
+		remainingNs, slotNs, 2u ) == CausalShortfallAction_t::SkipHeld );
+	// A deadline miss the hysteresis judged to degrade bypasses both skips.
+	CHECK( causal_shortfall_action( true, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
+		remainingNs, slotNs, 2u ) == CausalShortfallAction_t::Degrade );
+	// An immature cost is never classified as phase-only.
+	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs,
+		k_uDeadlineMinSamples - 1u, remainingNs, slotNs, 0u )
+		== CausalShortfallAction_t::Degrade );
+	// No slot reference (lead >= interval) keeps the previous behaviour.
+	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
+		remainingNs, 0u, 0u ) == CausalShortfallAction_t::Degrade );
+	// Phase-only outranks the post-degradation hold, as on the native path.
+	CHECK( causal_shortfall_action( false, d.rungs[ 0 ].costNs, d.rungs[ 0 ].samples,
+		remainingNs, slotNs, 2u ) == CausalShortfallAction_t::SkipPhaseOnly );
+}
+
+TEST_CASE( "a nested phase-only shortfall is skipped even when a cheaper rung fits",
+	"[framegen][deadline][recovery][nested]" )
+{
+	// Review counterexample: T = 8 ms, wake lead 3 ms, bias -3.5 ms. The current
+	// rung (1.5 ms) misses the 1.275 ms provisional window while a cheaper one
+	// (0.3 ms) would fit. The ladder must not learn from it: committing the
+	// cheaper rung would bring back the false degradation and its back-off
+	// ratchet. Whether such slots are still generated (by the anchor-correction
+	// replan) is a measured gate, not a ladder decision.
+	const uint64_t slotNs = causal_shortfall_slot_budget_ns( false, 0u, k_nestedTestGrid );
+	CHECK( causal_shortfall_action( false, 1'500'000u, k_uDeadlineMinSamples,
+		deadline_budget_ns( 1'500'000u ), slotNs, 0u )
+		== CausalShortfallAction_t::SkipPhaseOnly );
+}
+
+TEST_CASE( "false nested degradations inside probation ratchet the recovery back-off",
+	"[framegen][deadline][recovery][nested]" )
+{
+	// Recovered 2 -> 0, then a recorded false degradation 100 decisions later
+	// (inside the 225-decision probation), repeated. Each one doubles the
+	// back-off until the one-minute cap: the pattern seen in the logs
+	// (backoff 360 -> 720 -> 1440 -> 2700).
+	const RecordedCausalDecision_t &d = k_recordedFalseDegrades[ 0 ];
+	const uint64_t remainingNs = recorded_remaining_budget_ns( d );
+	const uint64_t slotNs = recorded_nested_slot_budget_ns( d );
+
+	const auto replay = [&]( uint64_t slotReferenceNs )
+	{
+		RecoveryState_t state;
+		for ( int cycle = 0; cycle < 6; cycle++ )
+		{
+			state = commit_ladder_recovery( state );
+			for ( int decision = 0; decision < 100; decision++ )
+				state = advance_ladder_recovery_decision( state, true );
+			if ( causal_shortfall_action( false, d.rungs[ 0 ].costNs,
+					d.rungs[ 0 ].samples, remainingNs, slotReferenceNs, 0u )
+				== CausalShortfallAction_t::Degrade )
+				state = note_ladder_recovery_degradation( state );
+		}
+		return state;
+	};
+
+	CHECK( replay( 0u ).backoffDecisions == k_uDeadlineRecoveryMaxBackoffDecisions );
+	CHECK( replay( slotNs ).backoffDecisions == k_uDeadlineRecoveryBaseBackoffDecisions );
 }

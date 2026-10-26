@@ -18,13 +18,13 @@ layout(
 
 vec4 sampleLayer(uint layerIdx, vec2 uv) {
     if ((c_ycbcrMask & (1 << layerIdx)) != 0)
-        return sampleLayer(s_ycbcr_samplers[layerIdx], layerIdx, uv, false);
+        return sampleLayerYcbcr(layerIdx, layerIdx, layerIdx, uv, u_textureSize[layerIdx]);
     return sampleLayer(s_samplers[layerIdx], layerIdx, uv, true);
 }
 
 void main() {
     uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
-    uvec2 outSize = imageSize(dst);
+    uvec2 outSize = outputLogicalSize(u_rotation);
 
     if (coord.x >= outSize.x || coord.y >= outSize.y)
         return;
@@ -36,7 +36,7 @@ void main() {
         outputValue = vec3(1.0f, 0.0f, 0.0f);
 
     if (c_layerCount > 0)
-        outputValue = gaussian_blur(s_samplers[VKR_BLUR_EXTRA_SLOT], 0, vec2(coord), u_blur_radius, true, true).rgb;
+        outputValue = gaussian_blur(VKR_BLUR_EXTRA_SLOT, 0, vec2(coord), u_blur_radius, true, true).rgb;
 
     for (int i = c_blur_layer_count; i < c_layerCount; i++) {
         vec4 layerColor = sampleLayer(i, uv);
@@ -44,8 +44,8 @@ void main() {
     }
 
     outputValue = encodeOutputColor(outputValue);
-    imageStore(dst, ivec2(coord), vec4(outputValue, 0));
+    imageStore(dst, rotateOutputCoord(coord, u_rotation), vec4(outputValue, 0));
 
     if (checkDebugFlag(compositedebug_Markers))
-        compositing_debug(coord);
+        compositing_debug(coord, u_rotation);
 }

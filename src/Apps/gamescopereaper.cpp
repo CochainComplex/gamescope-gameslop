@@ -84,13 +84,6 @@ namespace gamescope
         // Mirror some of the busy work we do in ProcessPreSpawn,
         // in case someone else wants to use this utility.
         Process::ResetSignals();
-        std::array<int, 3> nExcludedFds =
-        {{
-            STDIN_FILENO,
-            STDOUT_FILENO,
-            STDERR_FILENO,
-        }};
-        Process::CloseAllFds( nExcludedFds );
 
         // We typically don't make a new sid, as we want to keep the same stdin/stdout
         // Don't really care about it for pgroup reasons, as processes can leave those.
@@ -139,7 +132,8 @@ namespace gamescope
         {
             // Wait for the primary child to die, then forward the death signal to
             // all of the other children, if we aren't in a PID namespace.
-            Process::WaitForAllChildren( nPrimaryChild );
+            if ( s_bRun )
+                Process::WaitForAllChildren( nPrimaryChild );
 
             if ( bRespawn )
             {
@@ -148,7 +142,8 @@ namespace gamescope
                     s_ReaperLog.infof( "\"%s\" process shut down. Restarting.", argv[ nSubCommandArgc ] );
 
                     nPrimaryChild = Process::SpawnProcess( &argv[ nSubCommandArgc ] );
-                    Process::WaitForAllChildren( nPrimaryChild );
+                    if ( s_bRun )
+                        Process::WaitForAllChildren( nPrimaryChild );
                 }
             }
 

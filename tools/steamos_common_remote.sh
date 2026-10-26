@@ -9,13 +9,15 @@ fi
 
 export STEAMOS_DEVICE_IP="$1"
 export STEAMOS_USER_PASSWORD="${2:-${STEAMOS_USER_PASSWORD:-}}"
-# Path below the remote user's home directory. Override for a different checkout.
-export STEAMOS_REMOTE_REPO="${STEAMOS_REMOTE_REPO:-gamescope_local}"
 
 # Put us in the tools folder...
 export script=$(readlink -f -- "$0")
 
 # Get to the script
 pushd "$(dirname -- "$script")" > /dev/null
+
+export STEAMOS_SOURCE_NAME="$(basename -- "$(readlink -f -- ..)")"
+export STEAMOS_DEVICE_ROOT="/home/steamos/gamescope_local"
+export STEAMOS_DEVICE_PATH="$STEAMOS_DEVICE_ROOT/$STEAMOS_SOURCE_NAME"
 
 source ./steamos_password_helpers.sh

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "gpu_diagnostics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +13,20 @@
 namespace gamescope::framegen
 {
 
-inline constexpr uint32_t k_uFramegenHudMaxLines = 7u;
+// Canonical high-intensity CGA cyan/magenta, mixed as visible ordered pixels.
+// Keep this Bayer order in sync with cs_framegen_hud.comp.
+inline constexpr std::array<uint32_t, 16> k_uFramegenHudCgaBayer = {
+	0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5
+};
+[[nodiscard]] constexpr uint32_t framegen_hud_cga_color(
+	uint32_t x, uint32_t y, uint32_t height )
+{
+	const uint32_t step = std::min( 16u, y * 16u / ( height > 1u ? height - 1u : 1u ) );
+	return k_uFramegenHudCgaBayer[( y % 4u ) * 4u + x % 4u] < step
+		? 0xff55ffu : 0x55ffffu;
+}
+
+inline constexpr uint32_t k_uFramegenHudMaxLines = 8u;
 inline constexpr uint32_t k_uFramegenHudMaxColumns = 72u;
 inline constexpr uint32_t k_uFramegenHudPackedTextWords =
 	( k_uFramegenHudMaxLines * k_uFramegenHudMaxColumns ) / 4u;
@@ -172,6 +186,7 @@ struct FramegenHudSnapshot_t
 	const char *deviceName = "unknown";
 	const char *otherDeviceName = nullptr;
 	const char *renderOrigin = nullptr;
+	GpuDiagnostics gpu;
 	GamescopeFramegenMode mode = GamescopeFramegenMode::Extrapolate;
 	GamescopeFramegenPipeline pipeline = GamescopeFramegenPipeline::Warp;
 	uint32_t multiplier = 2u;
@@ -304,7 +319,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	return "watching";
 }
 
-[[nodiscard]] inline FramegenHudText_t format_framegen_hud(
+[[nodiscard]] inline FramegenHudText_t format_framegen_hud_detailed(
 	uint32_t level, const FramegenHudSnapshot_t &snapshot )
 {
 	FramegenHudText_t result;
@@ -337,26 +352,29 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		snapshot.vrrActive ? "VRR" : "fixed" );
 	framegen_hud_add_line( result, line );
 
-	constexpr size_t k_nFramegenHudDeviceColumnWidth = 19u;
-	char deviceName[k_nFramegenHudDeviceColumnWidth + 1u] = {};
-	framegen_hud_trim_device_name( deviceName, sizeof( deviceName ), snapshot.deviceName );
-	char otherDeviceName[k_nFramegenHudDeviceColumnWidth + 1u] = {};
-	framegen_hud_trim_device_name( otherDeviceName, sizeof( otherDeviceName ),
-		snapshot.otherDeviceName );
-	const char *renderOrigin = "n/a";
-	if ( snapshot.renderOrigin != nullptr && snapshot.renderOrigin[0] != '\0' )
-	{
-		if ( std::strcmp( snapshot.renderOrigin, "linear" ) == 0 )
-			renderOrigin = snapshot.clientBuffersStaged
-				? ( snapshot.otherDeviceName != nullptr ? otherDeviceName : "other-GPU" )
-				: "present-GPU";
-		else
-			renderOrigin = snapshot.renderOrigin;
+	const auto &gpu=snapshot.gpu;
+	const GpuCard *present=gpu.presenter<gpu.cards.size() ? &gpu.cards[gpu.presenter] : nullptr;
+	const GpuCard *render=gpu.renderer<gpu.cards.size() ? &gpu.cards[gpu.renderer] : nullptr;
+	const char *renderName=render ? render->name.c_str() : "unknown";
+	// Old snapshots without hardware inventory retain a clearly tentative hint.
+	if (gpu.cards.empty() && snapshot.renderOrigin) {
+		if (!std::strcmp(snapshot.renderOrigin,"linear"))
+			renderName=snapshot.clientBuffersStaged && snapshot.otherDeviceName
+				? snapshot.otherDeviceName : "unknown (linear buffer)";
+		else renderName=snapshot.renderOrigin;
 	}
-	std::snprintf( line, sizeof( line ),
-		"%-8s %-19s render %-19.19s buffers %s", "present", deviceName,
-		renderOrigin, snapshot.clientBuffersStaged ? "xGPU" : "local" );
-	framegen_hud_add_line( result, line );
+	std::string presentName=present ? present->name : (snapshot.deviceName ? snapshot.deviceName : "unknown");
+	const auto begin=presentName.find_first_not_of(" \t");
+	presentName=begin==std::string::npos ? "unknown" : presentName.substr(begin,presentName.find_last_not_of(" \t")-begin+1);
+	std::snprintf(line,sizeof(line),"%s: %.44s @ %.12s",
+		gpu.scope.rfind("Nested",0)==0 ? "COMPOSE" : "PRESENT",
+		presentName.c_str(),
+		present && !present->pci.empty() ? present->pci.c_str() : "unknown");
+	framegen_hud_add_line(result,line);
+	std::snprintf(line,sizeof(line),"RENDER?: %.34s @ %.12s [%s]",renderName,
+		render && !render->pci.empty() ? render->pci.c_str() : "unknown",
+		snapshot.clientBuffersStaged ? "staged" : "import");
+	framegen_hud_add_line(result,line);
 
 	const char *bidirState = snapshot.bidirActive ? "on"
 		: snapshot.bidirRequested ? "requested(OFF)" : "off";
@@ -364,12 +382,12 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		? ( snapshot.netOnline ? "online" : "blob" )
 		: snapshot.netRequested ? "requested(OFF)" : "off";
 	std::snprintf( line, sizeof( line ),
-		"%-8s bidir:%s  base:%s  net:%s  adapt:%s", "modes",
+		"BIDIR: %s | BASE: %s | NET: %s | ADAPT: %s",
 		bidirState, snapshot.baseLayer ? "on" : "off", netState,
 		snapshot.adapt ? "on" : "off" );
 	if ( snapshot.vrrRequested && !snapshot.vrrActive )
 	{
-		constexpr const char *pszVrrFallback = "  vrr:requested(off)";
+		constexpr const char *pszVrrFallback = " | VRR: requested(off)";
 		if ( std::strlen( line ) + std::strlen( pszVrrFallback )
 			<= k_uFramegenHudMaxColumns )
 		{
@@ -392,15 +410,17 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	framegen_hud_format_steps(
 		generatedSteps, sizeof( generatedSteps ), snapshot.generated );
 	std::snprintf( line, sizeof( line ),
-		"%-8s source %ufps[%s] gen %ufps[%s] repeat %ufps fill %u%%",
-		"rates", gameRate, realSteps, generatedRate, generatedSteps,
+		"SOURCE: %ufps[%s] | GEN: %ufps[%s] | REPEAT: %ufps | FILL: %u%%", gameRate, realSteps, generatedRate, generatedSteps,
 		repeatRate, fillPercent );
+	if (std::strlen(line)>k_uFramegenHudMaxColumns)
+		std::snprintf(line,sizeof(line),"SOURCE: %ufps | GEN: %ufps | REPEAT: %ufps | FILL: %u%%",
+			gameRate,generatedRate,repeatRate,fillPercent);
 	framegen_hud_add_line( result, line );
 
 	char ladderState[24] = {};
 	const char *ladderMode = snapshot.mode == GamescopeFramegenMode::Motion
 		? "motion" : "extrapolate";
-	std::snprintf( line, sizeof( line ), "%-8s %s/%s rung %u/%u  %s", "ladder",
+	std::snprintf( line, sizeof( line ), "QUALITY: %s/%s rung %u/%u | STATE: %s",
 		pipeline_name( snapshot.pipeline ), ladderMode,
 		snapshot.ladderSteps, snapshot.ladderMaxSteps,
 		framegen_hud_ladder_state( ladderState, sizeof( ladderState ), snapshot ) );
@@ -417,7 +437,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	const FramegenHudSparkline_t jitterSparkline = framegen_hud_sparkline(
 		snapshot.pacingSdMsHistory, 4.0 );
 	std::snprintf( line, sizeof( line ),
-		"%-8s hit %u%%  %s   jitter +/-%u.%ums  %s", "pace",
+		"HIT: %u%% %s | JITTER: +/-%u.%ums %s",
 		std::min( snapshot.deadlineHitPercent, 100u ),
 		hitSparkline.data(),
 		sdTenths / 10u, sdTenths % 10u,
@@ -429,7 +449,7 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 		char steps[24] = {};
 		framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
 		std::snprintf( line, sizeof( line ),
-			"%-8s %s . %s steps . profile %s", "net",
+			"LEARN: %s | STEPS: %s | PROFILE: %s",
 			snapshot.netOnline ? "online" : "offline", steps,
 			snapshot.netProfileLoaded ? "loaded" : "none" );
 		framegen_hud_add_line( result, line );
@@ -438,24 +458,131 @@ inline void framegen_hud_format_steps( char *dst, size_t capacity, uint64_t step
 	return result;
 }
 
+// The everyday HUD keeps rates and effective quality visible without the
+// device inventory. Keep the checkout identity and requested-but-inactive features visible.
+[[nodiscard]] inline FramegenHudText_t format_framegen_hud(
+	uint32_t level, const FramegenHudSnapshot_t &snapshot )
+{
+	if ( level != 1u )
+		return format_framegen_hud_detailed( level, snapshot );
+	FramegenHudText_t result;
+	const uint32_t source = static_cast<uint32_t>( std::min<uint64_t>(
+		999u, ( snapshot.real + snapshot.delayedReal ) / 5u ) );
+	const uint32_t generated = static_cast<uint32_t>( std::min<uint64_t>(
+		999u, snapshot.generated / 5u ) );
+	const uint64_t fresh = snapshot.real + snapshot.delayedReal + snapshot.generated;
+	const uint64_t total = fresh + snapshot.repeats;
+	const uint32_t fill = total != 0u ? ( fresh * 100u + total / 2u ) / total : 0u;
+	char line[128] = {};
+	std::snprintf( line, sizeof( line ), "SOURCE: %u fps | GENERATED: %u fps | FILL: %u%%",
+		source, generated, fill );
+	framegen_hud_add_line( result, line );
+	char steps[24] = {}, state[24] = {};
+	framegen_hud_format_steps( steps, sizeof( steps ), snapshot.netTrainedSteps );
+	const char *version = snapshot.version != nullptr ? snapshot.version : "unknown";
+	const char *checkout = std::strchr( version, '+' );
+	checkout = checkout != nullptr ? checkout + 1 : version;
+	// Keep the last 16 characters: a tag-style describe
+	// ("v3.16.1-120-gabcdef123+") must keep its hash and the dirty marker.
+	const size_t checkoutLength = std::strlen( checkout );
+	if ( checkoutLength > 16u )
+		checkout += checkoutLength - 16u;
+	std::snprintf( line, sizeof( line ), "MODE: %s/%s%s x%u %uHz%s | GIT: %s",
+		mode_name( snapshot.mode ), pipeline_name( snapshot.pipeline ),
+		std::strcmp( pipeline_name( snapshot.pipeline ), "spatial" ) == 0 ? "[EXP]" : "",
+		std::clamp( snapshot.multiplier, 2u, 4u ),
+		std::min( 999u, ( snapshot.refreshMilliHz + 500u ) / 1000u ),
+		snapshot.vrrActive ? " VRR" : "", checkout );
+	framegen_hud_add_line( result, line );
+	std::snprintf( line, sizeof( line ), "LEARN: %s%s%s | PROFILE: %s",
+		snapshot.netActive ? ( snapshot.netOnline ? "online " : "frozen " ) : "off",
+		snapshot.netActive ? steps : "", snapshot.netActive ? " steps" : "",
+		snapshot.netProfileLoaded ? "loaded" : "not loaded" );
+	framegen_hud_add_line( result, line );
+	const uint32_t jitter = std::min( snapshot.pacingSdTenthsMs, 9999u );
+	std::snprintf( line, sizeof( line ), "STATE: %s | HIT: %u%% | JITTER: %u.%ums",
+		framegen_hud_ladder_state( state, sizeof( state ), snapshot ),
+		std::min( snapshot.deadlineHitPercent, 100u ), jitter / 10u, jitter % 10u );
+	framegen_hud_add_line( result, line );
+
+	// Keep the original twelve-window plots in the everyday HUD as well.
+	// Reuse the diagnostic scales: deadline hit 0..100%, jitter 0..4 ms.
+	const auto hitHistory = framegen_hud_sparkline( snapshot.deadlineHitHistory, 100.0 );
+	const auto jitterHistory = framegen_hud_sparkline( snapshot.pacingSdMsHistory, 4.0 );
+	std::snprintf( line, sizeof( line ), "HIT: %s | JITTER: %s",
+		hitHistory.data(), jitterHistory.data() );
+	framegen_hud_add_line( result, line );
+	line[0] = '\0';
+	if ( snapshot.netRequested && !snapshot.netActive )
+		framegen_hud_append( line, sizeof( line ), "net:requested(OFF) " );
+	if ( snapshot.bidirRequested && !snapshot.bidirActive )
+		framegen_hud_append( line, sizeof( line ), "bidir:requested(OFF) " );
+	if ( snapshot.vrrRequested && !snapshot.vrrActive )
+		framegen_hud_append( line, sizeof( line ), "vrr:requested(off)" );
+	if ( line[0] ) framegen_hud_add_line( result, line );
+	return result;
+}
+
+// CGA gains breathing room between pixel-font rows. Quiet layouts retain
+// their current geometry. 101 is the CPU-side automatic-opacity sentinel.
+[[nodiscard]] constexpr uint32_t framegen_hud_line_pitch( bool cga ) { return cga ? 11u : 8u; }
+[[nodiscard]] constexpr uint32_t framegen_hud_height( uint32_t lines, bool cga )
+{
+	return lines * framegen_hud_line_pitch( cga ) + 8u;
+}
+[[nodiscard]] constexpr uint32_t framegen_hud_style_flags( bool cga, uint32_t opacity = 101u )
+{
+	return ( cga ? 1u : 0u ) | ( opacity <= 100u ? ( opacity + 1u ) << 8u : 0u );
+}
+// Lettering gets a 1-px dark outline where its backing cannot carry it: always
+// for CGA, and for Quiet/Mallsoft below 10% effective backing opacity (the
+// automatic 14% does not qualify). cs_framegen_hud.comp mirrors this test.
+inline constexpr uint32_t k_uFramegenHudOutlineBelowPercent = 10u;
+[[nodiscard]] constexpr bool framegen_hud_outlined( bool cga, uint32_t opacity = 101u )
+{
+	return cga || ( opacity <= 100u && opacity < k_uFramegenHudOutlineBelowPercent );
+}
+// How far the outline pixels blend toward black (the shader's mix weight):
+// nearly opaque, so the outline survives any scene behind it.
+inline constexpr float k_flFramegenHudOutlineBlend = 0.98f;
+static_assert( k_flFramegenHudOutlineBlend > 0.0f && k_flFramegenHudOutlineBlend <= 1.0f );
+
+// Attribute bit lives in each existing packed character byte; font remains ASCII.
+// A colon separates label/value within each pipe-delimited field. Diagnostic
+// rows without colons retain their first word as the label.
+[[nodiscard]] inline bool framegen_hud_value_column( const char *text, uint32_t column )
+{
+	if (text[column]=='|' || text[column]==' ') return false;
+	uint32_t begin=column, end=column;
+	while (begin>0u && text[begin-1u]!='|') --begin;
+	while (text[end] && text[end]!='|') ++end;
+	while (begin<end && text[begin]==' ') ++begin;
+	for (uint32_t i=begin; i<end; ++i)
+		if (text[i]==':') return column>i;
+	for (uint32_t i=begin; i<end; ++i)
+		if (text[i]==' ') return column>i;
+	return false;
+}
+
 // Scalar-layout UBO consumed by cs_framegen_hud.comp. Text is packed four
-// ASCII bytes per uint; the uint64_t font above is split explicitly so the GPU
+// attributed ASCII bytes per uint (bit 7 marks a value); the uint64_t font above is split explicitly so the GPU
 // ABI is independent of host endianness and uint64 shader support.
 struct alignas( 16 ) FramegenHudUniform_t
 {
 	uint32_t lineCount = 0u;
 	uint32_t widthChars = 0u;
 	uint32_t hdr = 0u;
-	uint32_t reserved = 0u;
+	uint32_t style = 0u; // bit 0: CGA; bits 8..15: opacity+1 (0 = automatic)
 	std::array<uint32_t, k_uFramegenHudMaxLines> lineLengths = {};
 	std::array<uint32_t, k_uFramegenHudPackedTextWords> text = {};
 	std::array<uint32_t, 256> font = {};
 };
 
+static_assert( offsetof( FramegenHudUniform_t, style ) == 12u );
 static_assert( offsetof( FramegenHudUniform_t, lineLengths ) == 16u );
-static_assert( offsetof( FramegenHudUniform_t, text ) == 44u );
-static_assert( offsetof( FramegenHudUniform_t, font ) == 548u );
-static_assert( sizeof( FramegenHudUniform_t ) == 1'584u );
+static_assert( offsetof( FramegenHudUniform_t, text ) == 48u );
+static_assert( offsetof( FramegenHudUniform_t, font ) == 624u );
+static_assert( sizeof( FramegenHudUniform_t ) == 1'648u );
 
 struct FramegenHudPush_t
 {
@@ -472,11 +599,12 @@ struct FramegenHudPush_t
 static_assert( sizeof( FramegenHudPush_t ) == 16u );
 
 [[nodiscard]] inline FramegenHudUniform_t make_framegen_hud_uniform(
-	const FramegenHudText_t &text, bool hdr )
+	const FramegenHudText_t &text, bool hdr, bool cga = false, uint32_t opacity = 101u )
 {
 	FramegenHudUniform_t result;
 	result.lineCount = std::min( text.lineCount, k_uFramegenHudMaxLines );
 	result.hdr = hdr;
+	result.style = framegen_hud_style_flags( cga, opacity );
 	for ( uint32_t line = 0u; line < result.lineCount; line++ )
 	{
 		const uint32_t length = static_cast<uint32_t>( std::min<size_t>(
@@ -487,7 +615,8 @@ static_assert( sizeof( FramegenHudPush_t ) == 16u );
 		{
 			const uint32_t byteIndex = line * k_uFramegenHudMaxColumns + column;
 			result.text[byteIndex / 4u] |=
-				static_cast<uint32_t>( static_cast<uint8_t>( text.lines[line][column] ) )
+				( static_cast<uint32_t>( static_cast<uint8_t>( text.lines[line][column] ) & 0x7fu )
+				  | ( framegen_hud_value_column( text.lines[line].data(), column ) ? 0x80u : 0u ) )
 				<< ( 8u * ( byteIndex % 4u ) );
 		}
 	}
