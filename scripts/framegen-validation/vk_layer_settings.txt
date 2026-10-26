@@ -1,0 +1,7 @@
+khronos_validation.validate_core = true
+khronos_validation.validate_sync = true
+khronos_validation.syncval_submit_time_validation = true
+khronos_validation.custom_stype_list = 1000001003,24
+khronos_validation.message_format_display_application_name = true
+khronos_validation.report_flags = error,warn,perf,info
+khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG

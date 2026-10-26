@@ -72,6 +72,33 @@ test('wlserver_shutdown', find_program('python3'),
 test('vulkan_mapped_memory', find_program('python3'),
 	args: files('test_vulkan_mapped_memory.py'), timeout: 90)
 
+test('vulkan_tmp_images', find_program('python3'),
+	args: files('test_vulkan_tmp_images.py'), timeout: 180)
+
+test('vulkan_sync2', find_program('python3'),
+	args: files('test_vulkan_sync2.py'), timeout: 180)
+
+test_framegen_learning = executable('test_framegen_learning', 'framegen_learning.cpp',
+	include_directories: [srcdir], cpp_args: gamescope_cpp_args + ['-UNDEBUG'])
+test('framegen_learning', test_framegen_learning)
+test('framegen_learning_recording', find_program('python3'),
+	args: files('test_framegen_learning.py'), timeout: 180)
+
+test('ycbcr_samplers', find_program('python3'),
+	args: [files('test_ycbcr_samplers.py'), meson.project_build_root() / 'src' / 'gamescope.p'],
+	depends: [gamescope_exe], timeout: 30)
+
+test('backend_exports', find_program('python3'),
+	args: files('test_backend_exports.py'), timeout: 90)
+
+if pipewire_dep.found()
+	test('pipewire_buffers', find_program('python3'),
+		args: files('test_pipewire_buffers.py'), timeout: 90)
+endif
+
+test('buffer_import', find_program('python3'),
+	args: files('test_buffer_import.py'), timeout: 90)
+
 test('env_gamescope_local', find_program('python3'),
 	args: files('test_env_gamescope_local.py'), timeout: 15)
 

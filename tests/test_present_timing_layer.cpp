@@ -7,6 +7,7 @@
 #include "../layer/VkLayer_FROG_gamescope_wsi.cpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <limits>
 #include <sys/socket.h>
@@ -103,6 +104,12 @@ VkResult VKAPI_CALL present(VkQueue, const VkPresentInfoKHR *info) {
   auto *ids = vkroots::FindInChain<VkPresentId2KHR>(info);
   auto *timings = vkroots::FindInChain<VkPresentTimingsInfoEXT>(info);
   auto *fences = vkroots::FindInChain<VkSwapchainPresentFenceInfoEXT>(info);
+  if (auto *modes = vkroots::FindInChain<VkSwapchainPresentModeInfoEXT>(info)) {
+    REQUIRE(modes->swapchainCount == info->swapchainCount);
+    REQUIRE(modes->swapchainCount > 0);
+    for (uint32_t i = 0; i < modes->swapchainCount; i++)
+      CHECK(modes->pPresentModes[i] == VK_PRESENT_MODE_MAILBOX_KHR);
+  }
   for (uint32_t i = 0; i < info->waitSemaphoreCount; i++)
     refused.waits.push_back(info->pWaitSemaphores[i]);
   for (uint32_t i = 0; i < info->swapchainCount; i++) {
@@ -316,6 +323,174 @@ TEST_CASE("Present timing is advertised only for a timing-capable gamescope serv
   }
 
   GamescopeWSILayer::gamescopeInstances.erase(instance);
+}
+
+namespace {
+struct MaintenanceDriver {
+  uint32_t api = VK_API_VERSION_1_1;
+  bool extension = true;
+  bool feature = true;
+  uint32_t coreCalls = 0;
+  uint32_t khrCalls = 0;
+  bool enabled = false;
+  bool forced = false;
+} maintenance;
+
+void VKAPI_CALL maintenanceProperties(VkPhysicalDevice, VkPhysicalDeviceProperties *properties) {
+  properties->apiVersion = maintenance.api;
+}
+
+VkResult VKAPI_CALL maintenanceExtensions(VkPhysicalDevice, const char *, uint32_t *count, VkExtensionProperties *properties) {
+  std::vector<VkExtensionProperties> extensions;
+  if (maintenance.extension)
+    extensions.push_back({VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME, VK_EXT_SWAPCHAIN_MAINTENANCE_1_SPEC_VERSION});
+  return vkroots::array(extensions, count, properties);
+}
+
+void maintenanceFeatures(VkPhysicalDeviceFeatures2 *features) {
+  if (auto *feature = vkroots::FindInChainMutable<VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT>(features))
+    feature->swapchainMaintenance1 = maintenance.feature;
+}
+
+void VKAPI_CALL maintenanceCore(VkPhysicalDevice, VkPhysicalDeviceFeatures2 *features) {
+  maintenance.coreCalls++;
+  maintenanceFeatures(features);
+}
+
+void VKAPI_CALL maintenanceKHR(VkPhysicalDevice, VkPhysicalDeviceFeatures2 *features) {
+  maintenance.khrCalls++;
+  maintenanceFeatures(features);
+}
+
+VkResult VKAPI_CALL maintenanceCreateDevice(VkPhysicalDevice, const VkDeviceCreateInfo *info,
+                                          const VkAllocationCallbacks *, VkDevice *) {
+  const std::vector<const char *> extensions(info->ppEnabledExtensionNames,
+    info->ppEnabledExtensionNames + info->enabledExtensionCount);
+  maintenance.enabled = GamescopeWSILayer::contains(extensions, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+  if (auto *feature = vkroots::FindInChain<VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT>(info))
+    maintenance.forced = feature->swapchainMaintenance1;
+  // Stop after inspecting the forwarded request; no real device is allocated.
+  return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+PFN_vkVoidFunction VKAPI_CALL maintenanceProc(VkInstance instance, const char *name) {
+  if (std::strcmp(name, "vkGetPhysicalDeviceProperties") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(maintenanceProperties);
+  if (std::strcmp(name, "vkEnumerateDeviceExtensionProperties") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(maintenanceExtensions);
+  if (std::strcmp(name, "vkGetPhysicalDeviceFeatures2") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(maintenanceCore);
+  if (std::strcmp(name, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(maintenanceKHR);
+  if (std::strcmp(name, "vkCreateDevice") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(maintenanceCreateDevice);
+  return getInstanceProc(instance, name);
+}
+}
+
+TEST_CASE("Maintenance injection respects enabled instance dependencies and query aliases", "[present_timing_layer]") {
+  maintenance = {};
+  VkApplicationInfo app{.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_1};
+  std::vector<const char *> extensions{VK_KHR_SURFACE_EXTENSION_NAME,
+    VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME};
+  uint32_t expectedCore = 1;
+  uint32_t expectedKHR = 0;
+  bool expected = true;
+  bool deviceSwapchain = true;
+  bool appInfo = true;
+
+  SECTION("core 1.1") {}
+  SECTION("API 1.0 without properties2 never queries features") {
+    app.apiVersion = VK_API_VERSION_1_0;
+    expected = false;
+    expectedCore = 0;
+  }
+  SECTION("API 1.0 with properties2 uses only KHR") {
+    app.apiVersion = VK_API_VERSION_1_0;
+    extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    expectedCore = 0;
+    expectedKHR = 1;
+  }
+  SECTION("physical API 1.0 without KHR never queries features") {
+    maintenance.api = VK_API_VERSION_1_0;
+    expected = false;
+    expectedCore = 0;
+  }
+  SECTION("physical API 1.0 with KHR uses only KHR") {
+    maintenance.api = VK_API_VERSION_1_0;
+    extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    expectedCore = 0;
+    expectedKHR = 1;
+  }
+  SECTION("an omitted API version defaults to 1.0") {
+    app.apiVersion = 0;
+    expected = false;
+    expectedCore = 0;
+  }
+  SECTION("omitted application info defaults to 1.0") {
+    appInfo = false;
+    expected = false;
+    expectedCore = 0;
+  }
+  SECTION("each missing instance dependency disables injection") {
+    const auto index = GENERATE(0, 1, 2);
+    extensions.erase(extensions.begin() + index);
+    expected = false;
+    expectedCore = 0;
+  }
+  SECTION("driver extension absent") {
+    maintenance.extension = false;
+    expected = false;
+    expectedCore = 0;
+  }
+  SECTION("driver feature absent") {
+    maintenance.feature = false;
+    expected = false;
+  }
+  SECTION("a device without swapchain does not acquire its dependencies") {
+    deviceSwapchain = false;
+    expected = false;
+    expectedCore = 0;
+  }
+
+  const auto instance = reinterpret_cast<VkInstance>(uintptr_t(1201));
+  auto *state = GamescopeWSILayer::gamescopeInstances.create(instance, GamescopeWSILayer::GamescopeInstanceData{});
+  REQUIRE(state);
+  const VkInstanceCreateInfo info{.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = appInfo ? &app : nullptr,
+    .enabledExtensionCount = uint32_t(extensions.size()), .ppEnabledExtensionNames = extensions.data()};
+  state->setVulkanCapabilities(info);
+  vkroots::VkInstanceDispatch instanceDispatch(maintenanceProc, instance, nullptr);
+  vkroots::VkPhysicalDeviceDispatch dispatch(VK_NULL_HANDLE, &instanceDispatch);
+  const char *swapchain = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+  VkLayerDeviceLink link{.pfnNextGetDeviceProcAddr = getDeviceProc};
+  VkLayerDeviceCreateInfo layer{.sType = VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO, .function = VK_LAYER_LINK_INFO,
+    .u = {.pLayerInfo = &link}};
+  const VkDeviceCreateInfo deviceInfo{.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &layer,
+    .enabledExtensionCount = uint32_t(deviceSwapchain), .ppEnabledExtensionNames = &swapchain};
+  VkDevice device{};
+  REQUIRE(GamescopeWSILayer::VkInstanceOverrides::CreateDevice(dispatch, VK_NULL_HANDLE, &deviceInfo, nullptr, &device) == VK_ERROR_INITIALIZATION_FAILED);
+  CHECK(maintenance.enabled == expected);
+  CHECK(maintenance.forced == expected);
+  CHECK(maintenance.coreCalls == expectedCore);
+  CHECK(maintenance.khrCalls == expectedKHR);
+  GamescopeWSILayer::gamescopeInstances.erase(instance);
+}
+
+TEST_CASE("Features2 aliases retain their driver entry point", "[present_timing_layer]") {
+  maintenance = {};
+  vkroots::VkInstanceDispatch instanceDispatch(maintenanceProc, VK_NULL_HANDLE, nullptr);
+  vkroots::VkPhysicalDeviceDispatch dispatch(VK_NULL_HANDLE, &instanceDispatch);
+  VkPhysicalDeviceFeatures2 features{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  SECTION("KHR") {
+    GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceFeatures2KHR(dispatch, VK_NULL_HANDLE, &features);
+    CHECK(maintenance.khrCalls == 1);
+    CHECK(maintenance.coreCalls == 0);
+  }
+  SECTION("core") {
+    GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceFeatures2(dispatch, VK_NULL_HANDLE, &features);
+    CHECK(maintenance.coreCalls == 1);
+    CHECK(maintenance.khrCalls == 0);
+  }
 }
 
 TEST_CASE("Local-only present calibration does not call the driver", "[present_timing_layer]") {
@@ -615,6 +790,18 @@ struct PresentBatch {
   VkResult run() { return GamescopeWSILayer::VkDeviceOverrides::QueuePresentKHR(queue, VK_NULL_HANDLE, &info); }
 };
 
+}
+
+TEST_CASE("Maintenance presents preserve per-swapchain counts and caller chains", "[present_timing_layer][present_batch]") {
+  PresentBatch batch;
+  for (auto *state : batch.states)
+    state->hasSwapchainMaintenance1 = true;
+  CHECK(batch.run() == VK_SUCCESS);
+  CHECK(presented.size() == 2);
+  CHECK(batch.info.swapchainCount == 2);
+  CHECK(batch.info.pNext == &batch.fenceInfo);
+  CHECK(batch.fenceInfo.pNext == &batch.idInfo);
+  CHECK(batch.idInfo.pNext == &batch.timingInfo);
 }
 
 TEST_CASE("Mixed presents preserve the driver's timing request", "[present_timing_layer][present_batch]") {

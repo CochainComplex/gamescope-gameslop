@@ -66,6 +66,14 @@ Which check for which change, in the order to run them:
 | Motion-field or refiner change | Offline evaluators; add the offline gates for a field or output change | A capture and `numpy`; recording frames also needs `gst-launch-1.0` with `pipewiresrc` |
 | A new default, or any field or output change | Blind A/B on all three content classes ([How to judge a setting](#how-to-judge-a-setting)) | The viewer, the same content for A and B, HUD off |
 
+`meson test -C build vulkan_tmp_images --print-errorlogs` exercises the
+production intermediate-image helpers and fallback caller fragments with CPU
+Vulkan fixtures. It checks capability rejection, SDR/PQ/scRGB format changes,
+transactional replacement, retained references and preemptive admission before
+release-point reservation. Both normal and fast-math builds run. It does not
+prove real GPU dispatch, HDR range preservation or native display behavior;
+those require separate GPU and native evidence.
+
 `GAMESCOPE_LOCAL_PREFIX` is the directory holding your locally built
 dependencies (the prefix that `scripts/env-gamescope-local.sh` puts on the
 library and pkg-config paths; its default is `$HOME/.local/gamescope-wayland`).
@@ -125,12 +133,16 @@ Use the same `W`, `H`, `HZ`, `RENDER_DEV`, `PRESENT_DEV` and `CLIENT` on
 
 ## Vulkan validation
 
-Use `VK_LAYER_KHRONOS_validation` with synchronization validation enabled, and
-retain loader output proving which layer library was loaded:
+From the repository root, use the checked-in settings (tested with Vulkan
+Validation Layers 1.4.304) and retain loader output proving which library was
+loaded:
 
 ```bash
 export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+export VK_LAYER_SETTINGS_PATH="$PWD/scripts/framegen-validation"
 export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+export VK_LAYER_DISABLES=
+export VK_LAYER_PRINTF_ONLY_PRESET=0
 export VK_LOADER_DEBUG=layer
 ```
 
@@ -139,7 +151,18 @@ For a private validation-layer installation, set `VK_LAYER_PATH` explicitly to
 its manifest directory; the wrapper also includes the local WSI manifest.
 Record the manifest's library path, layer version, binary hash, enabled checks
 and complete log. A process exit of zero alone is insufficient: require no
-validation errors or synchronization hazards and verify layer activation.
+validation errors, warnings or synchronization hazards. Require the layer's
+startup status to report synchronization validation in `Current Enables` and
+`Current Disables: None`. Missing status or a missing exact instance/device
+library is incomplete evidence, even when the intended environment was correct.
+
+The settings expose warning, performance and informational messages alongside
+errors, including unsupported settings and the active-validation status. They
+use `syncval_submit_time_validation` for checks across submissions. Explicitly
+clearing disables and setting the printf-only preset to zero prevents inherited
+diagnostic configuration from disabling validation. Preserve failed runs and
+their full diagnostics; these settings do not requalify earlier captures or
+establish timing, native or visual-quality results.
 
 Older layers can themselves issue invalid driver queries. In particular, the
 1.3.275 SDK layer omits DRM modifier information in its pre-bind external-memory
@@ -150,9 +173,10 @@ contains that fix. Preserve the failing log when comparing layer versions.
 
 Mesa's private WSI allocation structure also needs its actual type and ABI size
 registered with layers that copy unknown `pNext` structures. On the tested
-x86-64 ABI, `VK_LAYER_CUSTOM_STYPE_LIST=1000001003,24` declares that structure;
-verify the size against the build when using another ABI. This is a declaration
-of the private node, not a reason to disable general parameter validation.
+x86-64 ABI, the checked-in preset's `custom_stype_list = 1000001003,24` declares
+that structure. Verify and adjust its size against the build before using the
+preset on another ABI. This declares the private node; keep general parameter
+validation enabled.
 
 Exercise RGB composition, sampled NV12 input, RGB-to-NV12 capture, replacement
 of capture textures, and both requested DMA-BUF and mapped MemFd paths where
@@ -160,6 +184,40 @@ available. Verify even NV12 allocation extents for odd content dimensions,
 separate logical content dimensions, and clamping of padded edges during
 conversion. Driver-reported plane offsets, pitches and allocation size
 remain authoritative. An allocation-wide raw dump is not a packed NV12 file.
+For NV12 DMA-BUF delivery, verify both plane descriptors against the Vulkan
+layout, including unequal pitches and interplane gaps. A single Y stride does
+not describe the UV plane. Consumers may concatenate separately described
+blocks, so their logical UV offset need not equal the physical FD offset.
+Require non-overlapping active plane ranges and checked buffer bounds; compare
+known color patches after decoding, not just buffer counts or alternating hashes.
+The `ycbcr_samplers` contract inspects the compositor's six compiled SPIR-V
+modules: converted descriptors use literal layer indices, feed local explicit-LOD
+sampling, and never cross function calls as opaque sampler arguments. Filtering
+and color helpers exchange ordinary coordinates and texel values. This catches
+resource-selection regressions that can pass validation yet render differently
+across drivers. Also check actual normal/scaled/blur pixels and moving content on
+each available GPU, including an RGB replacement frame; compiled contracts alone
+do not prove conversion, resource retirement, native presentation or performance.
+The `pipewire_buffers` CPU contract exercises descriptor layout and invalid
+geometry when PipeWire support is built.
+SDL and headless presentation do not require DMA-BUF exports for internal
+textures. `backend_exports` checks that their allocation policy preserves
+explicit capture exports and that completed software uploads use known-ready
+handling after explicit event/timeline precedence. Native DRM, Wayland and
+OpenVR retain their existing backend handoff requirements and need separate
+hardware validation.
+Capture checks using software clients must also establish scene progress:
+reused software buffers need fresh per-commit uploads, while live DMA-BUF
+imports retain memoization. The `buffer_import` contract checks both paths,
+retained snapshot pixels and failed-import retries.
+PipeWire advertises its linear DMA-BUF option only when Vulkan reports support
+for the actual capture format, usage and image flags; otherwise its mapped
+MemFd option remains available. A consumer requiring unsupported DMA-BUF caps
+should fail negotiation rather than receive an invalid export or a mislabeled
+MemFd buffer.
+Mapped capture allocations check this support before image creation. Legacy
+flippable allocations, including nested cursor exports, need separate backend
+validation; a capture pass does not certify those paths.
 
 Run the existing nested SDL smoke cases as well as nested Wayland captures:
 they exercise different device-extension and presentation paths. Native DRM,
@@ -580,6 +638,17 @@ distribution prints 0.000. `src_rec_ms_*` and `rec_flip_ms_*` split
 `src_flip_ms_*` at the latch ([Latency gate](#latency-gate-framegen-on-vs-off)).
 
 Learning fields (`train_recorded`, `train_published`, their `_total` watermarks, `train_saved_total`, `train_online`, `train_skip`, `train_skip_n`, `train_rb_dropped`, `train_rb_rejected`) are documented in [Metrics log fields](framegen-reference.md#metrics-log-fields); these harness gates ignore them.
+
+An online-learning check must also inspect those fields and the saved finite GSFP
+set. Use a private per-run profile, verify the Spatial role/encoding key, and
+compare recorded, published and saved totals after orderly shutdown. Reopen the
+same profile with online learning off and verify its bytes remain unchanged.
+Ordinary foreground progress does not exercise idle training below Learned: that
+requires an actual `idle training submitted` log with the serving pipeline below
+Learned, followed by completed finite publication and clean resource retirement.
+An injected degradation rung can check that execution path, but cannot establish
+natural recovery, physical-display behavior, performance or visual quality.
+Keep the existing OFF-inclusive visual and native evidence gates.
 
 `ring_ovf` counts the bidir queue fronts that the output-ring ceiling forced
 out ahead of their planned slot in the window. Each one is an overflow that
@@ -1759,14 +1828,20 @@ GAMESCOPE_LOCAL_PREFIX=/path/to/the/matching/prefix \
   build/src/gamescope --backend headless -- true
 ```
 
-The guard runs both production constant-velocity warp specializations on
+The guard first round-trips known nonzero R32F bytes through the production
+host-upload barrier and a GPU image, then refills the same upload image and
+repeats the comparison. It logs the actual row pitches. This checks preservation
+through the first PREINITIALIZED transition and subsequent GENERAL uploads;
+ordinary mapped readbacks keep their existing allocation behavior.
+
+The shader cases run both production constant-velocity warp specializations on
 known translation, cut, disagreement and two-motion-boundary inputs at phases
 1/3, 1/2, 2/3, 1 and 1.5. It checks finite output, preservation of current alpha,
 HDR values above one and below zero, analytical translation/cut/fallback
 results, and that the spatial specialization actually affects a boundary.
 It does not duplicate the reconstruction algorithm as its own oracle.
 
-Both Radeon 890M and NVIDIA RTX PRO 500 Blackwell passed: maximum analytical
+Earlier shader-only runs on Radeon 890M and NVIDIA RTX PRO 500 Blackwell passed: maximum analytical
 RGB error 0.0000204 and 228 boundary pixel differences; current alpha preserved.
 These are float-image shader invariants, not an HDR display or native quality
 certification. The full Meson suite passed 79/79, including new policy and

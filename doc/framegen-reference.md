@@ -306,8 +306,19 @@ Tuning and experimental variables (`FB_TOL`, `DEBUG_EVERY`, `NET_LR`, `BIDIR_OCC
 | `GAMESCOPE_FRAMEGEN_HUD_STYLE` | `quiet`/`mallsoft`/`cga`, any case (`quiet`) | HUD appearance at launch. Quiet/Mallsoft use the muted translucent palette; CGA uses cyan-to-magenta ordered pixel dithering with black/white lettering and the same text/graphs. Also set by the menu preset launcher. |
 | `GAMESCOPE_GPU_DIAGNOSTICS` | on/off (off) | Advertises the read-only `gamescope_gpu_diagnostics_v1` Wayland global used by the menu's GPU DETAILS page. Off by default because every Wayland client, games included, could read GPU names, PCI addresses, render nodes, driver strings and the build. Enabling it is logged once; an invalid value is logged and keeps it off. The menu preset launcher sets it. |
 | `GAMESCOPE_FRAMEGEN_NET` | path | Offline weights for the learned refiner: a bare GSFR blob from `scripts/framegen-net-train.py`. It is the starting point for every input encoding the profile has no set for. A per-game profile is rejected here; pass it as `NET_PROFILE`. |
-| `GAMESCOPE_FRAMEGEN_NET_EVERY` | >= 1 (1) | Train on every Nth real frame. Use `2` on an iGPU-class present GPU (pacing stays equal; it played best in the real-game test) and `1` on a desktop card. |
+| `GAMESCOPE_FRAMEGEN_NET_EVERY` | >= 1 (1) | Train on every Nth eligible real pair. Foreground and idle work share one decision per pair; refills and idle polls cannot override a deliberate skip. Use `2` to reduce training frequency on an iGPU-class present GPU. |
 | `GAMESCOPE_FRAMEGEN_NET_PROFILE` | path | Per-game profile the in-situ net loads and, with `NET_ONLINE`, saves. Without `NET_ONLINE` it is served read-only. Give each game its own file. It holds one weight set per input encoding: the composited output in SDR, in HDR10 (PQ), or with colour management off, or the game's base layer by colourspace. A set is only served and trained under its own encoding. Spatial uses a separate role-keyed set inside this same file; the other learned pipelines share the legacy set. Format GSFP v1; any other file, including profiles from builds before 2026-10-17, is ignored and replaced by a fresh profile on the first save. |
+
+With `NET_ONLINE`, requested `learned`/`spatial` modes can also train while the
+serving ladder is below Learned. This optional work requires a dedicated queue,
+completed non-cut foreground training and measured warm CPU/GPU costs. Unknown
+cost, insufficient time, unavailable resources, capture or split-family base-layer
+ingest skips idle work. Scene, encoding and resource changes require fresh warm-up.
+There is no guarantee of background progress under sustained load. Normal ladder
+recovery remains independent of whether learning succeeds; no persistent hold is
+introduced. The profile role/encoding keys and finite-readback checks also apply
+to idle training. `--framegen-debug` logs actual idle submissions and their serving
+pipeline; a requested mode alone does not prove idle training occurred.
 
 #### Advanced and A/B switches
 

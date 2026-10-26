@@ -185,6 +185,8 @@ namespace gamescope
 			return new CBaseBackendFb();
 		}
 
+		virtual bool UsesDmabufForPresentation() const override { return false; }
+
 		virtual bool UsesModifiers() const override
 		{
 			return false;

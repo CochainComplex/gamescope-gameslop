@@ -54,37 +54,6 @@ namespace GamescopeWSILayer {
     return std::ranges::any_of(vec, std::bind_front(std::equal_to{}, lookupValue));
   }
 
-  // Query whether a physical device can actually enable
-  // VK_EXT_swapchain_maintenance1. Some drivers may expose the extension name but
-  // reject vkCreateDevice when the feature is forced on, so require both the
-  // extension and the feature bit before injecting it. This keeps the layer from
-  // blocking NVIDIA-render / AMD-present cross-GPU clients.
-  static bool deviceSupportsSwapchainMaintenance1(
-      const vkroots::VkPhysicalDeviceDispatch &dispatch,
-      VkPhysicalDevice physicalDevice) {
-    uint32_t count = 0;
-    if (dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr) != VK_SUCCESS || count == 0)
-      return false;
-    std::vector<VkExtensionProperties> props(count);
-    if (dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, props.data()) != VK_SUCCESS)
-      return false;
-    const bool bHasExtension = std::ranges::any_of(props, [](const VkExtensionProperties &prop) {
-      return std::string_view(prop.extensionName) == VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
-    });
-    if (!bHasExtension)
-      return false;
-
-    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance1Features = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
-    };
-    VkPhysicalDeviceFeatures2 features2 = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-      .pNext = &maintenance1Features,
-    };
-    dispatch.GetPhysicalDeviceFeatures2(physicalDevice, &features2);
-    return maintenance1Features.swapchainMaintenance1 == VK_TRUE;
-  }
-
   // The globals queue carries the limiter, which only writes an atomic, so
   // any swapchain on the surface may dispatch it.
   static int waylandPumpEvents(wl_display *display, wl_event_queue *queue, wl_event_queue *globalsQueue) {
@@ -594,8 +563,62 @@ namespace GamescopeWSILayer {
     uint32_t appId = 0;
     std::string engineName;
     GamescopeLayerClient::Flags flags = 0;
+    uint32_t apiVersion = VK_API_VERSION_1_0;
+    bool surfaceMaintenance1 = false;
+    bool properties2 = false;
+
+    void setVulkanCapabilities(const VkInstanceCreateInfo &info) {
+      apiVersion = info.pApplicationInfo && info.pApplicationInfo->apiVersion ?
+        info.pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+      std::vector<const char *> extensions;
+      if (info.enabledExtensionCount)
+        extensions.assign(info.ppEnabledExtensionNames, info.ppEnabledExtensionNames + info.enabledExtensionCount);
+      surfaceMaintenance1 = contains(extensions, VK_KHR_SURFACE_EXTENSION_NAME) &&
+        contains(extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+        contains(extensions, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+      properties2 = contains(extensions, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    }
   };
   static vkroots::ObjectMap<VkInstance, GamescopeInstanceData> gamescopeInstances;
+
+  // Driver support alone does not enable instance dependencies or make the core
+  // Features2 entry point legal for an API 1.0 application.
+  static bool deviceSupportsSwapchainMaintenance1(
+      const vkroots::VkPhysicalDeviceDispatch &dispatch,
+      VkPhysicalDevice physicalDevice) {
+    auto instance = gamescopeInstances.find(dispatch.pInstanceDispatch->Instance);
+    if (!instance || !instance->surfaceMaintenance1)
+      return false;
+    VkPhysicalDeviceProperties properties{};
+    dispatch.GetPhysicalDeviceProperties(physicalDevice, &properties);
+    const bool coreFeatures2 = std::min(instance->apiVersion, properties.apiVersion) >= VK_API_VERSION_1_1;
+    if (!coreFeatures2 && !instance->properties2)
+      return false;
+
+    uint32_t count = 0;
+    if (dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr) != VK_SUCCESS || count == 0)
+      return false;
+    std::vector<VkExtensionProperties> props(count);
+    if (dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, props.data()) != VK_SUCCESS)
+      return false;
+    if (!std::ranges::any_of(props, [](const VkExtensionProperties &prop) {
+      return std::string_view(prop.extensionName) == VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+    }))
+      return false;
+
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance1Features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+      .pNext = &maintenance1Features,
+    };
+    if (coreFeatures2)
+      dispatch.GetPhysicalDeviceFeatures2(physicalDevice, &features2);
+    else
+      dispatch.GetPhysicalDeviceFeatures2KHR(physicalDevice, &features2);
+    return maintenance1Features.swapchainMaintenance1 == VK_TRUE;
+  }
 
   struct GamescopeSurfaceData {
     VkInstance instance;
@@ -987,6 +1010,8 @@ namespace GamescopeWSILayer {
           .engineName = engineName,
           .flags   = defaultLayerClientFlags(pCreateInfo->pApplicationInfo, appId),
         });
+        if (state)
+          state->setVulkanCapabilities(createInfo);
 
         // If we know at instance creation time we should disable HDR, force off
         // DXVK_HDR now.
@@ -1039,10 +1064,9 @@ namespace GamescopeWSILayer {
       // compositor-side (via the gamescope_swapchain protocol), so the only thing
       // lost without maintenance1 is an app switching present mode at runtime,
       // which gamescope overrides to MAILBOX anyway.
-      const bool bSupportsSwapchainMaintenance1 =
-        deviceSupportsSwapchainMaintenance1(pDispatch, physicalDevice);
-
       std::vector<const char *> extensions(pCreateInfo->ppEnabledExtensionNames, pCreateInfo->ppEnabledExtensionNames + pCreateInfo->enabledExtensionCount);
+      const bool bSupportsSwapchainMaintenance1 = contains(extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME) &&
+        deviceSupportsSwapchainMaintenance1(pDispatch, physicalDevice);
       if (!driverPresentTiming)
         std::erase_if(extensions, [](const char *extension) { return std::string_view(extension) == VK_EXT_PRESENT_TIMING_EXTENSION_NAME; });
       if (bSupportsSwapchainMaintenance1 && !contains(extensions, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
@@ -1307,11 +1331,10 @@ namespace GamescopeWSILayer {
       return VK_SUCCESS;
     }
 
-    static void GetPhysicalDeviceFeatures2(
+    static void overrideFeatures2(
       const vkroots::VkPhysicalDeviceDispatch & pDispatch,
             VkPhysicalDevice             physicalDevice,
             VkPhysicalDeviceFeatures2*   pFeatures) {
-      pDispatch.GetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
       if (!gamescopeInstances.find(pDispatch.pInstanceDispatch->Instance))
         return;
       if (auto *timing = vkroots::FindInChainMutable<VkPhysicalDevicePresentTimingFeaturesEXT>(pFeatures)) {
@@ -1322,11 +1345,20 @@ namespace GamescopeWSILayer {
       }
     }
 
+    static void GetPhysicalDeviceFeatures2(
+      const vkroots::VkPhysicalDeviceDispatch & pDispatch,
+            VkPhysicalDevice             physicalDevice,
+            VkPhysicalDeviceFeatures2*   pFeatures) {
+      pDispatch.GetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+      overrideFeatures2(pDispatch, physicalDevice, pFeatures);
+    }
+
     static void GetPhysicalDeviceFeatures2KHR(
       const vkroots::VkPhysicalDeviceDispatch & pDispatch,
             VkPhysicalDevice             physicalDevice,
             VkPhysicalDeviceFeatures2*   pFeatures) {
-      GetPhysicalDeviceFeatures2(pDispatch, physicalDevice, pFeatures);
+      pDispatch.GetPhysicalDeviceFeatures2KHR(physicalDevice, pFeatures);
+      overrideFeatures2(pDispatch, physicalDevice, pFeatures);
     }
 
     static VkResult GetPhysicalDeviceSurfacePresentModesKHR(
