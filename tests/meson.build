@@ -50,6 +50,15 @@ test_framegen = executable(
 )
 test('framegen', test_framegen)
 
+test_framegen_capture = executable(
+	'test_framegen_capture',
+	['framegen_capture.cpp', srcdir / 'framegen/capture_file.cpp', srcdir / 'framegen/atomic_file.cpp'],
+	include_directories: [srcdir],
+	dependencies: [catch2_dep],
+	cpp_args: gamescope_cpp_args,
+)
+test('framegen_capture', test_framegen_capture)
+
 test_framegen_deadline = executable(
 	'test_framegen_deadline',
 	['framegen_deadline.cpp'],

@@ -52,6 +52,7 @@
 #include "Utils/SwapchainPolicy.h"
 #include "framegen/adaptation.hpp"
 #include "framegen/atomic_file.hpp"
+#include "framegen/capture_file.hpp"
 #include "framegen/deadline.hpp"
 #include "framegen/dispatch_policy.hpp"
 #include "framegen/hud.hpp"
@@ -11991,6 +11992,15 @@ static void framegen_record_release( const char *pszReason )
 	vk_log.infof( "framegen: dataset capture stopped (%s), readbacks released", pszReason );
 }
 
+// Only called after the consumer has retired the readback's framegen sequence.
+// The view borrows texel storage for the synchronous file write below.
+static gamescope::framegen::CapturePlane framegen_capture_plane( CVulkanTexture *pTexture )
+{
+	if ( pTexture == nullptr )
+		return {};
+	return { pTexture->mappedPixels(), pTexture->width(), pTexture->height(), pTexture->rowPitch() };
+}
+
 // Capture I/O is deliberately out of line: this function is polled by the
 // Vulkan batch recorder, and inlining its cold path bloats the production
 // command-recording footprint even when no GSFD capture is configured.
@@ -12023,36 +12033,18 @@ static __attribute__((noinline)) void framegen_record_consume()
 		return;
 	}
 
-	// Header + tightly packed planes (rows re-packed from the readbacks'
-	// rowPitch): lumaPrev, lumaCur, field (rgba16f), fieldRev (rgba16f).
-	// The trainer (scripts/framegen-net-train.py) parses exactly this.
-	const uint32_t uLumaBpp = g_framegenMotion.lumaFormat == DRM_FORMAT_R16F ? 2u : 8u;
-	const uint32_t uHeader[ 8 ] = {
-		0x44465347u /* 'GSFD' */, 1u,
-		g_framegenMotion.width, g_framegenMotion.height,
-		uLumaBpp, 8u /* field bpp */, 1u /* flags: has reverse field */, 0u,
-	};
-	const uint64_t ulSeq = h.ulNetRecordConsumedSeqNo;
-	bool bOk = output.write( uHeader, sizeof( uHeader ) )
-		&& output.write( &ulSeq, sizeof( ulSeq ) );
-
-	const auto writePlane = [&]( CVulkanTexture *pTex, uint32_t uBytesPerRow )
-	{
-		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
-			|| pTex->width() != g_framegenMotion.width
-			|| pTex->height() != g_framegenMotion.height )
-			return false;
-		const uint8_t *pData = pTex->mappedPixels();
-		if ( pData == nullptr )
-			return false;
-		for ( uint32_t y = 0; bOk && y < pTex->height(); y++ )
-			bOk = output.write( pData + (size_t)y * pTex->rowPitch(), uBytesPerRow );
-		return bOk;
-	};
-	bOk = bOk && writePlane( g_framegenMotion.recLumaPrev.get(), g_framegenMotion.width * uLumaBpp )
-		&& writePlane( g_framegenMotion.recLumaCur.get(), g_framegenMotion.width * uLumaBpp )
-		&& writePlane( g_framegenMotion.recField.get(), g_framegenMotion.width * 8u )
-		&& writePlane( g_framegenMotion.recFieldRev.get(), g_framegenMotion.width * 8u );
+	bool bOk = gamescope::framegen::write_field_capture( output, {
+		.width = g_framegenMotion.width,
+		.height = g_framegenMotion.height,
+		.lumaBytesPerPixel = g_framegenMotion.lumaFormat == DRM_FORMAT_R16F ? 2u : 8u,
+		.sequence = h.ulNetRecordConsumedSeqNo,
+		.planes = {
+			framegen_capture_plane( g_framegenMotion.recLumaPrev.get() ),
+			framegen_capture_plane( g_framegenMotion.recLumaCur.get() ),
+			framegen_capture_plane( g_framegenMotion.recField.get() ),
+			framegen_capture_plane( g_framegenMotion.recFieldRev.get() ),
+		},
+	} );
 	if ( bOk )
 		bOk = output.commit();
 
@@ -12182,43 +12174,29 @@ static void framegen_color_probe_consume()
 		return;
 	}
 
-	const uint32_t uHeader[ 12 ] = {
-		0x46435347u /* 'GSCF' */, 3u,
-		c.width, c.height, c.drmFormat, c.bytesPerPixel, (uint32_t)c.eotf,
-		3u /* flags: exact reference + paired candidates */, 4u /* planes */,
-		(uint32_t)c.pendingSweep, 0u, 0u,
-	};
-	const uint64_t uMetadata[ 8 ] = {
-		c.pendingSeqNo, c.pendingAnchorId, c.pendingReferenceId, c.pendingEndpointId,
-		c.pendingAnchorTimeNs, c.pendingReferenceTimeNs, c.pendingEndpointTimeNs, 0u,
-	};
-	const float flMetadata[ 4 ] = {
-		c.pendingPhase,
-		k_flFramegenColorProbeStrengths[ 0 ],
-		k_flFramegenColorProbeStrengths[ 1 ],
-		k_flFramegenColorProbeStrengths[ 2 ],
-	};
-	bool bOk = output.write( uHeader, sizeof( uHeader ) )
-		&& output.write( uMetadata, sizeof( uMetadata ) )
-		&& output.write( flMetadata, sizeof( flMetadata ) );
-
-	const auto writePlane = [&]( CVulkanTexture *pTex )
-	{
-		const uint32_t uBytesPerRow = c.width * c.bytesPerPixel;
-		if ( pTex == nullptr || pTex->rowPitch() < uBytesPerRow
-			|| pTex->width() != c.width || pTex->height() != c.height )
-			return false;
-		const uint8_t *pData = pTex->mappedPixels();
-		if ( pData == nullptr )
-			return false;
-		for ( uint32_t y = 0; bOk && y < c.height; y++ )
-			bOk = output.write( pData + (size_t)y * pTex->rowPitch(), uBytesPerRow );
-		return bOk;
-	};
-	// Plane order is generated strength 0/0.5/1, then exact real reference.
-	for ( const auto &pReadback : c.generatedReadback )
-		bOk = bOk && writePlane( pReadback.get() );
-	bOk = bOk && writePlane( c.referenceReadback.get() );
+	bool bOk = gamescope::framegen::write_color_capture( output, {
+		.width = c.width,
+		.height = c.height,
+		.drmFormat = c.drmFormat,
+		.bytesPerPixel = c.bytesPerPixel,
+		.eotf = (uint32_t)c.eotf,
+		.sweep = (uint32_t)c.pendingSweep,
+		.sequence = c.pendingSeqNo,
+		.anchorId = c.pendingAnchorId,
+		.referenceId = c.pendingReferenceId,
+		.endpointId = c.pendingEndpointId,
+		.anchorTimeNs = c.pendingAnchorTimeNs,
+		.referenceTimeNs = c.pendingReferenceTimeNs,
+		.endpointTimeNs = c.pendingEndpointTimeNs,
+		.phase = c.pendingPhase,
+		.strengths = { k_flFramegenColorProbeStrengths[ 0 ], k_flFramegenColorProbeStrengths[ 1 ], k_flFramegenColorProbeStrengths[ 2 ] },
+		.planes = {
+			framegen_capture_plane( c.generatedReadback[ 0 ].get() ),
+			framegen_capture_plane( c.generatedReadback[ 1 ].get() ),
+			framegen_capture_plane( c.generatedReadback[ 2 ].get() ),
+			framegen_capture_plane( c.referenceReadback.get() ),
+		},
+	} );
 	if ( bOk )
 		bOk = output.commit();
 
