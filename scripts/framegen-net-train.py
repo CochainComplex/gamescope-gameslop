@@ -45,12 +45,9 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 from framegen_field_reference import bilinear_with_grad as bilinear
+from framegen_net_formats import MAGIC_BLOB, BLOB_VERSION, LAYERS, KSIZE, export
 
 MAGIC_SAMPLE = 0x44465347  # 'GSFD'
-MAGIC_BLOB = 0x52465347    # 'GSFR'
-BLOB_VERSION = 3           # + zero-neutral causal shading-focus output
-LAYERS = ((12, 16), (16, 16), (16, 4))
-KSIZE = 3
 CHARB_EPS = 1e-3
 FLOW_AUX = 0.05     # keep a flow-learning signal where confidence was killed
 LAMBDA_DF = 0.01    # pull the flow residual toward Stage B
@@ -326,20 +323,6 @@ def make_views(samples, idx, rng, crop, count):
         views.append((ff, fr, lp, lc, y0, x0))
         views.append((fr, ff, lc, lp, y0, x0))
     return views
-
-
-def export(params, path):
-    with open(path, "wb") as f:
-        f.write(struct.pack("<3I", MAGIC_BLOB, BLOB_VERSION, len(LAYERS)))
-        for ci, co in LAYERS:
-            f.write(struct.pack("<3I", ci, co, KSIZE))
-        for i in range(1, len(LAYERS) + 1):
-            # Shader layout: [c_out][ky][kx][c_in] — input channels contiguous
-            # so the kernel reads whole vec4 groups.
-            params[f"W{i}"].transpose(0, 2, 3, 1).astype("<f4").tofile(f)
-            params[f"b{i}"].astype("<f4").tofile(f)
-    total = sum(p.size for p in params.values())
-    print(f"exported {total} floats -> {path}")
 
 
 def main():
