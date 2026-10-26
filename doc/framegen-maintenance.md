@@ -345,12 +345,24 @@ neutral-only comparisons can hide changes in the earlier layers.
 
 `scripts/framegen_color_capture.py` owns GSCF v1/v2/v3 admission, metadata
 and packed RGB plane decoding. The color evaluator re-exports the existing
-names and retains scoring, temporal comparisons, optional LPIPS and CLI policy.
+names and retains optional LPIPS and CLI policy; NumPy scoring has the separate
+boundary below.
 Preserve plane/candidate identity, validation order, errors and extra flag-bit
 acceptance. Decode stored code values without guessing a transfer function or
 clipping HDR range; alpha is ignored and nonfinite pixels reach the existing
 scoring policy. Parser changes need exact arrays, metadata and malformed-input
 comparisons, including each supported pixel format and capture version.
+
+`scripts/framegen_color_metrics.py` owns full-color code-value box means, SSIM,
+luminance, per-frame grading and temporal residual-change measurements, with
+evaluator aliases for analysis consumers. It imports only NumPy and `math`.
+Preserve reference-based HDR scaling, reduction order and metric thresholds;
+do not unify these with field-resolution scoring or infer an EOTF transform.
+Per-frame grading sanitizes nonfinite components and reports affected pixels;
+temporal scoring deliberately propagates nonfinite residuals. Sequence ordering
+and homogeneous-set checks remain in the evaluator. Verify exact metrics and
+CLI output, continuity breaks, candidate identity and block partitions. These
+image-quality measurements do not qualify live pacing or input latency.
 
 `scripts/framegen_field_capture.py` owns the existing GSFD v1 sample/dataset
 readers, with trainer aliases for analysis consumers. It imports no trainer,
