@@ -341,6 +341,15 @@ order, ReLU masks, cache ownership and RNG progression (the zero head and biases
 consume no draws). Verify nonzero-head gradients as well as neutral output;
 neutral-only comparisons can hide changes in the earlier layers.
 
+`scripts/framegen_color_capture.py` owns GSCF v1/v2/v3 admission, metadata
+and packed RGB plane decoding. The color evaluator re-exports the existing
+names and retains scoring, temporal comparisons, optional LPIPS and CLI policy.
+Preserve plane/candidate identity, validation order, errors and extra flag-bit
+acceptance. Decode stored code values without guessing a transfer function or
+clipping HDR range; alpha is ignored and nonfinite pixels reach the existing
+scoring policy. Parser changes need exact arrays, metadata and malformed-input
+comparisons, including each supported pixel format and capture version.
+
 ## Validation by change class
 
 **Documentation, launchers, comments:**
