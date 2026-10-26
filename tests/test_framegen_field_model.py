@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import importlib.util
 import io
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -111,6 +112,60 @@ class FieldModelContract(unittest.TestCase):
         result = subprocess.run(temporal, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("GSFD v1 carries no numerical provenance", result.stderr)
+
+    def test_file_loaded_consumers_share_one_independent_core(self):
+        core_only = r'''
+import sys
+sys.path.insert(0, sys.argv[1])
+import framegen_field_reference as core
+assert "framegen_net_train" not in sys.modules
+assert "framegen_net_eval" not in sys.modules
+assert core.Numerics(core.REFERENCE_MODEL).subtexel_bits == 8
+'''
+        consumers = r'''
+import importlib.util
+from pathlib import Path
+import sys
+
+scripts = Path(sys.argv[1])
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, scripts / filename)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+# Exercise each entrypoint's bootstrap independently in a fresh process.
+load("first_consumer_contract", sys.argv[2])
+trainer = load("trainer_contract", "framegen-net-train.py")
+import framegen_field_reference as core
+gate = load("gate_contract", "framegen-field-gate.py")
+temporal = load("temporal_contract", "framegen-temporal-gate.py")
+evaluator = load("evaluator_contract", "framegen-net-eval.py")
+hindsight = load("hindsight_contract", "framegen-hindsight-eval.py")
+assert Path(core.__file__).resolve() == scripts / "framegen_field_reference.py"
+assert gate.Numerics is temporal.G.Numerics is core.Numerics
+assert gate.checked_pair is temporal.G.checked_pair is core.checked_pair
+assert trainer.bilinear is gate.T.bilinear is evaluator.T.bilinear
+assert trainer.bilinear is hindsight.T.bilinear is core.bilinear_with_grad
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+            for first in ("core", "framegen-net-train.py", "framegen-field-gate.py"):
+                program = core_only if first == "core" else consumers
+                with self.subTest(first=first):
+                    result = subprocess.run([sys.executable, "-c", program, str(SCRIPTS), first],
+                                            cwd=directory, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_shared_sampler_preserves_values_and_analytic_gradients(self):
+        image = np.array([[0., 2.], [4., 6.]], np.float32)
+        coordinate = np.array([.25, 1., 2.], np.float32)
+        value, dy, dx = G.T.bilinear(image, coordinate, coordinate)
+        for actual, expected in ((value, [0., 3., 6.]), (dy, [0., 4., 0.]), (dx, [0., 2., 0.])):
+            self.assertEqual(actual.dtype, np.float32)
+            np.testing.assert_array_equal(actual, np.array(expected, np.float32))
+        np.testing.assert_array_equal(G.bilinear(image, coordinate, coordinate), value)
 
 
 if __name__ == "__main__":

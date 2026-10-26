@@ -40,6 +40,12 @@ from pathlib import Path
 
 import numpy as np
 
+# Preserve direct execution and absolute-path imports from analysis consumers.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from framegen_field_reference import bilinear_with_grad as bilinear
+
 MAGIC_SAMPLE = 0x44465347  # 'GSFD'
 MAGIC_BLOB = 0x52465347    # 'GSFR'
 BLOB_VERSION = 3           # + zero-neutral causal shading-focus output
@@ -100,37 +106,6 @@ def load_dataset(data_dir):
     print(f"loaded {len(samples)} samples "
           f"({samples[0][0].shape[1]}x{samples[0][0].shape[0]} field res)")
     return samples
-
-
-# --------------------------------------------------------------------------
-# Bilinear sampling (GL semantics: clamp-to-edge, half-texel centers)
-# --------------------------------------------------------------------------
-
-def bilinear(img, cy, cx):
-    """Sample img at continuous texel coords (cy, cx); returns value and the
-    analytic gradient (d/dcy, d/dcx). Matches texture() with a normalized
-    clamp-to-edge bilinear sampler."""
-    h, w = img.shape
-    fy = cy - 0.5
-    fx = cx - 0.5
-    y0 = np.floor(fy).astype(np.int64)
-    x0 = np.floor(fx).astype(np.int64)
-    wy = (fy - y0).astype(np.float32)
-    wx = (fx - x0).astype(np.float32)
-    y0c = np.clip(y0, 0, h - 1)
-    y1c = np.clip(y0 + 1, 0, h - 1)
-    x0c = np.clip(x0, 0, w - 1)
-    x1c = np.clip(x0 + 1, 0, w - 1)
-    v00 = img[y0c, x0c]
-    v10 = img[y0c, x1c]
-    v01 = img[y1c, x0c]
-    v11 = img[y1c, x1c]
-    top = v00 + wx * (v10 - v00)
-    bot = v01 + wx * (v11 - v01)
-    val = top + wy * (bot - top)
-    dvdx = (1.0 - wy) * (v10 - v00) + wy * (v11 - v01)
-    dvdy = bot - top
-    return val, dvdy, dvdx
 
 
 # --------------------------------------------------------------------------
