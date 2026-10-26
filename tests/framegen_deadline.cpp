@@ -25,6 +25,89 @@
 using Catch::Approx;
 using namespace gamescope::framegen;
 
+TEST_CASE( "deadline grid boundaries reject missing clocks and saturated anchors", "[framegen][deadline]" )
+{
+	const DisplayGrid_t grid = { .D0 = 1'000u, .W0 = 900u, .T = 100u };
+	RealAnchorState_t anchor = { .provisionalTargetNs = 1'000u, .epoch = 1u };
+	CausalPlanOptions_t options = { .gridEpoch = 1u, .sourceTimestampsReliable = false };
+	const CadencePredictorState cadence = { .intervalNs = 400u, .samples = k_uCadencePredictorMinSamples };
+	for ( const DisplayGrid_t invalid : { DisplayGrid_t{ 0u, 900u, 100u },
+		DisplayGrid_t{ 1'000u, 0u, 100u }, DisplayGrid_t{ 1'000u, 900u, 0u } } )
+	{
+		const CausalSlotPlan_t plan = plan_next_causal_slot( invalid, anchor, cadence, options );
+		CHECK_FALSE( plan.admit );
+		CHECK( plan.skipReason == DeadlineSkipReason_t::InvalidGrid );
+		CHECK( plan.targetNs == 0u );
+	}
+	CHECK( grid_index_at_or_after( { 1u, 1u, 0u }, UINT64_MAX ) == 0u );
+	CHECK( grid_index_strictly_after( { 1u, 1u, 0u }, UINT64_MAX ) == 0u );
+	CHECK( plan_next_causal_slot( grid, anchor, {}, options ).skipReason == DeadlineSkipReason_t::NoCadence );
+	anchor.correctedFlipNs = UINT64_MAX;
+	const DisplayGrid_t nearLimit = { UINT64_MAX - 100u, UINT64_MAX - 110u, 100u };
+	const CausalSlotPlan_t saturated = plan_next_causal_slot( nearLimit, anchor, cadence, options );
+	CHECK( saturated.targetNs == UINT64_MAX );
+	CHECK( saturated.wakeNs == UINT64_MAX );
+	CHECK_FALSE( saturated.admit );
+	CHECK_FALSE( saturated.provisional );
+	CHECK( saturated.skipReason == DeadlineSkipReason_t::NoCadence );
+}
+
+TEST_CASE( "bidir selection counts duplicate extrema and skips zero samples across a wrap", "[framegen][deadline]" )
+{
+	BidirWindow_t window;
+	window.first = k_nBidirWindowSamples - 2u;
+	window.count = 5u;
+	const std::array<uint64_t, 5> values = { UINT64_MAX, 0u, 7u, UINT64_MAX, 7u };
+	for ( size_t i = 0u; i < values.size(); i++ )
+		window.samples[ ( window.first + i ) % window.samples.size() ] = {
+			.latencyNs = values[ i ], .sourceSpanNs = values[ i ], .recordSpanNs = values[ i ] };
+	CHECK( window.kth_highest_latency() == 7u );
+	CHECK( window.kth_lowest_span() == UINT64_MAX );
+	window.count = 3u;
+	CHECK( window.kth_highest_latency() == 0u );
+	CHECK( window.kth_lowest_span() == 0u );
+}
+
+TEST_CASE( "bidir quantization retains the larger endpoint ID for a shared target", "[framegen][deadline]" )
+{
+	const DisplayGrid_t grid = { 1'000u, 900u, 100u };
+	const BidirEpoch_t epoch = establish_bidir_epoch( 100u, 1u );
+	// Synthetic reordered IDs characterize the max-ID coalescing rule itself.
+	const std::array endpoints = { BidirEndpoint_t{ 3u, 1u, 1'001u },
+		BidirEndpoint_t{ 7u, 2u, 1'002u }, BidirEndpoint_t{ 5u, 3u, 1'003u } };
+	const BidirPlan_t plan = plan_bidir_slots( grid, epoch, endpoints, 4u, 1u );
+	REQUIRE( plan.validEpoch );
+	REQUIRE( plan.slots.size() == 1u );
+	CHECK( plan.slots[ 0 ].kind == BidirSlotKind_t::RealEndpoint );
+	CHECK( plan.slots[ 0 ].endpointFrameId == 7u );
+	CHECK( plan.slots[ 0 ].targetNs == 1'200u );
+	CHECK( plan.slots[ 0 ].wakeNs == 1'100u );
+	CHECK( plan.slots[ 0 ].phase == 1.0 );
+}
+
+TEST_CASE( "a capped repaint refresh spares an already retired overlay and a new force", "[framegen][deadline][repaint]" )
+{
+	const RepaintRequestState_t state = {
+		.heldForcedRequests = 3u, .refreshMisses = k_uMaxBidirRefreshMisses,
+	};
+	const RepaintIteration_t prev = {
+		.in = { .overlayPending = true, .forcedRequests = 3u },
+		.state = state,
+		.retiredOverlay = true,
+	};
+	const RepaintInputs_t now = {
+		.overlayPending = true, .forcedRequests = 4u, .vblank = true,
+		.bidirActive = true, .bidirQueueDrained = true,
+	};
+	const RepaintStep_t step = step_repaint_requests( state, prev, now );
+	CHECK( step.plan.dropHeld );
+	CHECK( step.plan.forcedDrivesPaint );
+	CHECK_FALSE( step.iteration.retiredOverlay );
+	CHECK_FALSE( step.iteration.retiredForced );
+	CHECK( step.iteration.request_remains() );
+	CHECK( step.state.heldForcedRequests == 0u );
+}
+
 namespace
 {
 
@@ -4378,6 +4461,93 @@ TEST_CASE( "the bidir plan step establishes, re-establishes and admits by one ru
 			BidirQueueEntry_t{ BidirSlotKind_t::RealEndpoint, opp, 1u, opp - 2u * T },
 		};
 		CHECK( sampled( 0u, backlog ) == 0u );
+	}
+}
+
+TEST_CASE( "unplanned bidir pairs still collect independent clock evidence", "[framegen][deadline]" )
+{
+	constexpr uint64_t opp = k_ulStepOpportunityNs;
+	BidirTimelineState_t state = { .gridEpoch = 7u };
+	BidirPlanInputs_t in = step_inputs( {}, step_real( 1u, opp ), step_real( 2u, opp + 100u ), opp, 5u );
+	in.previous.sourceReadyNs = opp - 400u;
+	in.current.sourceReadyNs = opp - 250u;
+	in.nowNs = opp + 100u;
+	const BidirPlanStep_t first = plan_bidir_step( state, in );
+	CHECK_FALSE( first.planned );
+	CHECK( first.state.gridEpoch == 7u );
+	CHECK( first.state.window.count == 1u );
+	CHECK( first.state.window.samples[ 0 ].latencyNs == 0u ); // not recorded before this opportunity
+	CHECK( first.state.window.samples[ 0 ].sourceSpanNs == 0u );
+	CHECK( first.state.sourceSpacings.intervalsNs[ 0 ] == 150u );
+	CHECK( first.state.recordSpacings.intervalsNs[ 0 ] == 100u );
+	CHECK( first.state.plannedAtNs == opp );
+	CHECK( first.state.ringBound.quietSinceNs == opp );
+	CHECK_FALSE( first.current.queue );
+	CHECK( first.admitted.empty() );
+
+	// A catch-up pair at the same opportunity supplies clock spacings, but no
+	// second latency sample. Capacity five samples a disjoint span every two pairs.
+	in.previous = { 2u, opp - 250u, opp + 100u };
+	in.current = { 3u, opp - 100u, opp + 150u };
+	in.nowNs = opp + 175u;
+	const BidirPlanStep_t second = plan_bidir_step( first.state, in );
+	CHECK_FALSE( second.planned );
+	CHECK( second.state.window.count == 2u );
+	CHECK( second.state.window.samples[ 1 ].latencyNs == 0u );
+	CHECK( second.state.window.samples[ 1 ].sourceSpanNs == 300u );
+	CHECK( second.state.window.samples[ 1 ].recordSpanNs == 200u ); // each spacing is at least T
+	CHECK( second.state.sourceSpacings.count == 2u );
+	CHECK( second.state.recordSpacings.count == 2u );
+	CHECK( second.state.pairLatency.valueNs == 0u );
+
+	// A ring with no spare real intervals never samples a span; latency still
+	// belongs to a new opportunity, even while the first window is incomplete.
+	in.previous = { 3u, opp - 100u, opp + 150u };
+	in.current = { 4u, opp + 50u, opp + 200u };
+	in.presenter.opportunityNs = opp + 350u;
+	in.wakeNs = opp + 320u;
+	in.nowNs = opp + 375u;
+	in.presenter.capacity = k_uBidirEnvelopeSamples;
+	const BidirPlanStep_t third = plan_bidir_step( second.state, in );
+	CHECK_FALSE( third.planned );
+	CHECK( third.state.window.samples[ 2 ].latencyNs == 200u );
+	CHECK( third.state.window.samples[ 2 ].sourceSpanNs == 0u );
+	CHECK( third.state.window.samples[ 2 ].recordSpanNs == 0u );
+	CHECK( third.state.sourceSpacings.count == 3u );
+}
+
+TEST_CASE( "invalid bidir pairs preserve evidence before an invalidation can reset it", "[framegen][deadline]" )
+{
+	const BidirTimelineState_t state = established_state();
+	for ( unsigned invalid = 0u; invalid < 5u; invalid++ )
+	{
+		CAPTURE( invalid );
+		BidirPlanInputs_t in = step_inputs( {}, step_real( 1u, k_ulStepOpportunityNs - 200u ),
+			step_real( 2u, k_ulStepOpportunityNs - 100u ) );
+		in.invalidate = true;
+		switch ( invalid )
+		{
+			case 0u: in.presenter.vblankIntervalNs = 0u; break;
+			case 1u: in.previous.sourceReadyNs = 0u; break;
+			case 2u: in.current.sourceReadyNs = in.previous.sourceReadyNs; break;
+			case 3u: in.previous.recordNs = 0u; break;
+			case 4u: in.current.recordNs = in.previous.recordNs - 1u; break;
+		}
+		const BidirPlanStep_t step = plan_bidir_step( state, in );
+		CHECK_FALSE( step.planned );
+		CHECK( step.state.gridEpoch == state.gridEpoch );
+		CHECK( step.state.epoch.valid );
+		CHECK( step.state.epoch.delayNs == state.epoch.delayNs );
+		CHECK( step.state.window.sinceNs == state.window.sinceNs );
+		CHECK( step.state.window.count == state.window.count );
+		CHECK( step.state.sourceSpacings.count == state.sourceSpacings.count );
+		CHECK( step.state.recordSpacings.count == state.recordSpacings.count );
+		CHECK( step.state.pairLatency.valueNs == state.pairLatency.valueNs );
+		CHECK( step.state.ringBound.delayNs == state.ringBound.delayNs );
+		CHECK( step.state.plannedAtNs == state.plannedAtNs );
+		CHECK( step.retargeted.empty() );
+		CHECK( step.droppedRealIds.empty() );
+		CHECK( step.admitted.empty() );
 	}
 }
 
