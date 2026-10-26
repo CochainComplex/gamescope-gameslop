@@ -155,5 +155,8 @@ test('framegen_color_capture', find_program('python3'),
 test('framegen_field_capture', find_program('python3'),
 	args: files('test_framegen_field_capture.py'), timeout: 30)
 
+test('framegen_net_features', find_program('python3'),
+	args: files('test_framegen_net_features.py'), timeout: 30)
+
 test('framegen_nested_smoke', find_program('python3'),
 	args: files('test_framegen_nested_smoke.py'), timeout: 30)

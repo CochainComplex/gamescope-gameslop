@@ -43,7 +43,7 @@ jobs:
               scripts/framegen-field-gate.py scripts/framegen-temporal-gate.py \
               scripts/framegen_field_reference.py scripts/framegen_net_formats.py \
               scripts/framegen_net.py scripts/framegen_color_capture.py \
-              scripts/framegen_field_capture.py
+              scripts/framegen_field_capture.py scripts/framegen_net_features.py
           c++ -std=c++20 -Wall -Wextra -Werror -Isrc \
             tests/test_framegen.cpp src/framegen/atomic_file.cpp \
             -o /tmp/gamescope-framegen-contracts

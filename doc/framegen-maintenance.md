@@ -327,7 +327,8 @@ does not qualify another GPU or turn a failed parity gate into a pass.
 `scripts/framegen_net_formats.py` owns the offline GSFR/GSFP layout constants,
 weight decoding and export. Trainer/evaluator aliases preserve existing callers;
 GSFD dataset parsing stays in its separate reader; training, scoring and CLI
-argument handling remain in the tools. This format leaf imports neither a driver nor the numerical reference.
+argument handling remain in the tools. This format leaf imports neither a driver
+nor the numerical reference.
 Preserve Python's existing admission behavior independently of the C++ runtime:
 bare shape-compatible versions warn without legacy shading migration, bare
 trailing bytes are rejected, and profile sets require the current version.
@@ -336,7 +337,8 @@ Format refactors need exact bytes, array layout and error/stream comparisons.
 `scripts/framegen_net.py` owns the shared NumPy convolution, forward/backward
 passes and initialization for the fixed offline refiner. It imports the existing
 layout constants from the format leaf; trainer aliases preserve analysis callers.
-Keep features, loss, optimizer and CLI policy in the trainer. Preserve expression
+Keep loss, optimizer and CLI policy in the trainer; cropped features/evidence
+have the separate boundary below. Preserve expression
 order, ReLU masks, cache ownership and RNG progression (the zero head and biases
 consume no draws). Verify nonzero-head gradients as well as neutral output;
 neutral-only comparisons can hide changes in the earlier layers.
@@ -359,6 +361,16 @@ is not newly rejected, `load_dataset` skips `ValueError` only, and empty/all-bad
 or truncated-header inputs retain their distinct outcomes. Hindsight's broader
 exception handling remains with that consumer. Reader extraction is not policy
 hardening or a parity improvement.
+
+`scripts/framegen_net_features.py` owns the trainer's cropped twelve-channel
+inputs and evidence gate, retaining trainer aliases for analysis consumers.
+It uses the canonical bilinear sampler and imports no trainer, model, capture
+reader or scoring policy. Preserve casts before crop arithmetic, channel order,
+mode and evidence thresholds/expression order. The evaluator's whole-frame
+builder retains its separate shape, fixed mode and dtype timing; do not unify
+it with the crop builder or merge the distinct SSIM implementations as a source
+refactor. Verify channels, sampler coordinates, gate boundaries and actual
+training/evaluator outputs; exact CPU extraction does not qualify GPU parity.
 
 ## Validation by change class
 
