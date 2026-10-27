@@ -158,6 +158,11 @@ test_swapchain_policy = executable(
 )
 test('swapchain_policy', test_swapchain_policy)
 
+if drm_dep.found()
+	test('drm_output_tf', find_program('python3'),
+		args: files('test_drm_output_tf.py'), timeout: 90)
+endif
+
 test_vblank_grid = executable(
 	'test_vblank_grid',
 	['test_vblank_grid.cpp'],

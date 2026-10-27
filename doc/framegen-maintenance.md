@@ -74,6 +74,14 @@ polling, the connector lock and deferred touch/scroll processing remain in
 interpretation with CPU fakes; SteamVR initialization, overlay lifetime and
 display use need runtime evidence.
 
+`drm_prepare` keeps single-plane eligibility and per-request property forcing in
+immutable local decisions. Single-plane eligibility is computed first; capability
+and output-color enablement guard the output-TF debug switch, and only the enabled
+path reads HDR state. Select one pending transfer-function write, including both
+default paths. `tests/test_drm_output_tf.py` protects this CPU policy, not atomic
+request construction or completion. Foreign-plane unlinking inside `drm_prepare`
+can perform a real commit; preparation is not a pure test-only step.
+
 The `src/framegen` policy and contract headers are deliberately stateless and
 header-only: they add no link boundary to command recording. In particular,
 `scheduling.hpp` owns deterministic cadence confidence, the bounded online
@@ -519,7 +527,12 @@ available coverage. Keep genuine findings; freshness does not mean a clean score
 Regenerate coverage through the relevant tests before ingesting a fresh report
 with `repowise coverage add <report> --strict`. Its measurement revision follows
 the report's modification time, rather than ingestion time. Preserve original
-reports and their timestamps. After committing, verify synchronization against
+reports and their timestamps. In Repowise 0.59, each import replaces the stored
+coverage map: pass every still-applicable report in the same invocation to retain
+coverage and test contexts from other suites. A focused fixture's percentage
+describes its instrumented region, not the entire backend file.
+
+After committing, verify synchronization against
 the new `HEAD`, including pending work and stale-page checks. Keep generated
 databases, pages, coverage reports and local receipts out of commits.
 
