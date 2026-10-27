@@ -123,6 +123,11 @@ if sdl2_dep.found()
 		args: files('test_sdl_events.py'), timeout: 90)
 endif
 
+if openvr_dep.found()
+	test('openvr_init_input', find_program('python3'),
+		args: [files('test_openvr_init_input.py'), '--build-dir', meson.project_build_root()], timeout: 90)
+endif
+
 if pipewire_dep.found()
 	test('pipewire_buffers', find_program('python3'),
 		args: files('test_pipewire_buffers.py'), timeout: 90)

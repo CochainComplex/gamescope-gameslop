@@ -66,6 +66,14 @@ events still advance the timestamp. `tests/test_sdl_events.py` executes the
 production loop with a scripted queue and records actions, including shortcut
 releases before repeat suppression; it does not validate WSI or display timing.
 
+OpenVR's `InitFormatModifiers` discovers optional DMA-BUF capabilities before
+`Init` publishes readiness. The backend retains the borrowed IPC interface and
+modifier cache; the helper owns only temporary enumeration vectors. Input
+polling, the connector lock and deferred touch/scroll processing remain in
+`ProcessVRInput`. `tests/test_openvr_init_input.py` covers query order and keyboard
+interpretation with CPU fakes; SteamVR initialization, overlay lifetime and
+display use need runtime evidence.
+
 The `src/framegen` policy and contract headers are deliberately stateless and
 header-only: they add no link boundary to command recording. In particular,
 `scheduling.hpp` owns deterministic cadence confidence, the bounded online
