@@ -1138,6 +1138,103 @@ static void test_scheduling_policy()
 	CHECK( !degradation_reduces_work( extrapolate4, extrapolate3, 1u, 1u ) );
 }
 
+static void test_deadline_ladder_hold_boundaries()
+{
+	using namespace gamescope::framegen;
+	constexpr uint64_t interval = 10'000'000u;
+	struct Case
+	{
+		uint32_t rung;
+		uint32_t maxSteps;
+		uint64_t costNs;
+		uint32_t samples;
+		bool degradeWithoutHold;
+	};
+	constexpr Case cases[] = {
+		{ 2u, 7u, 8'499'999u, k_uDeadlineMinSamples, false },
+		{ 2u, 7u, 8'500'000u, k_uDeadlineMinSamples, false },
+		{ 2u, 7u, 8'500'001u, k_uDeadlineMinSamples, true },
+		{ 2u, 7u, 0u, k_uDeadlineMinSamples, false },
+		{ 2u, 7u, interval, k_uDeadlineMinSamples - 1u, false },
+		{ 0u, 0u, interval, k_uDeadlineMinSamples, false },
+		{ 7u, 7u, interval, k_uDeadlineMinSamples, false },
+	};
+	for ( const Case &c : cases )
+	{
+		for ( const uint32_t hold : { 0u, 1u, k_uDeadlineHoldFrames, UINT32_MAX } )
+		{
+			const DeadlineLadderEvaluation step = evaluate_deadline_ladder(
+				{ c.rung, hold }, c.maxSteps, c.costNs, c.samples, interval );
+			CHECK( step.state.degradeSteps == c.rung );
+			CHECK( step.state.holdFrames == ( hold > 0u ? hold - 1u : 0u ) );
+			CHECK( step.tryDegrade == ( hold == 0u && c.degradeWithoutHold ) );
+			if ( hold == 1u )
+			{
+				// Draining the last held decision does not also admit a step.
+				// Only the following decision may use the now-unheld budget.
+				const DeadlineLadderEvaluation next = evaluate_deadline_ladder(
+					step.state, c.maxSteps, c.costNs, c.samples, interval );
+				CHECK( next.tryDegrade == c.degradeWithoutHold );
+				CHECK( next.state.degradeSteps == c.rung );
+				CHECK( next.state.holdFrames == 0u );
+			}
+		}
+	}
+}
+
+static void test_fixed_cadence_admission_boundaries()
+{
+	using namespace gamescope::framegen;
+	constexpr uint64_t interval = 10'000'000u;
+	constexpr CadencePredictorState trained = {
+		.intervalNs = interval, .samples = k_uCadencePredictorMinSamples,
+	};
+	constexpr uint64_t source = 100'000'000u;
+	constexpr uint64_t protectedReady = 110'312'500u; // source + interval + T/32
+	struct Case
+	{
+		uint64_t sourceReadyNs;
+		CadencePredictorState cadence;
+		uint64_t nowNs;
+		uint64_t wakeNs;
+		uint64_t periodNs;
+		FixedCadenceAdmission expected;
+	};
+	constexpr FixedCadenceAdmission unavailable = { true, false, false, 0u, 0u, 0u };
+	constexpr Case cases[] = {
+		{ 0u, trained, source, protectedReady + 1u, interval, unavailable },
+		{ source, {}, source, protectedReady + 1u, interval, unavailable },
+		{ source, trained, 0u, protectedReady + 1u, interval, unavailable },
+		{ source, trained, source, 0u, interval, unavailable },
+		{ source, trained, source, protectedReady + 1u, 0u, unavailable },
+		{ source, trained, protectedReady - 1u, protectedReady + 1u, interval,
+			{ false, true, false, 110'000'000u, 312'500u, 1u } },
+		{ source, trained, protectedReady, protectedReady + 1u, interval,
+			{ true, true, true, 110'000'000u, 312'500u, 1u } },
+		{ source, trained, protectedReady + 1u, protectedReady + 2u, interval,
+			{ true, true, true, 110'000'000u, 312'500u, 2u } },
+		{ source, trained, source, protectedReady - 1u, interval,
+			{ true, true, false, 110'000'000u, 312'500u, 0u } },
+		{ source, trained, source, protectedReady, interval,
+			{ true, true, false, 110'000'000u, 312'500u, 0u } },
+		// Warmup still publishes diagnostics; it is not an unavailable input.
+		{ source, { .intervalNs = interval, .samples = k_uCadencePredictorMinSamples - 1u },
+			source, protectedReady + 1u, interval,
+			{ true, false, false, 110'000'000u, 312'500u, 1u } },
+	};
+	for ( const Case &c : cases )
+	{
+		const FixedCadenceAdmission actual = fixed_cadence_admission(
+			c.sourceReadyNs, c.cadence, c.nowNs, c.wakeNs, c.periodNs );
+		CHECK( actual.generateBackup == c.expected.generateBackup );
+		CHECK( actual.trained == c.expected.trained );
+		CHECK( actual.predictionOverdue == c.expected.predictionOverdue );
+		CHECK( actual.predictedReadyNs == c.expected.predictedReadyNs );
+		CHECK( actual.safetyMarginNs == c.expected.safetyMarginNs );
+		CHECK( actual.deadlineHeadroomNs == c.expected.deadlineHeadroomNs );
+	}
+}
+
 static void test_provisional_nested_slot_keep()
 {
 	// The feedback discard keeps a provisional nested slot exactly when its
@@ -1509,6 +1606,8 @@ int main()
 	test_quality_meter();
 	test_temporal_policy();
 	test_scheduling_policy();
+	test_deadline_ladder_hold_boundaries();
+	test_fixed_cadence_admission_boundaries();
 	test_provisional_nested_slot_keep();
 	test_bidir_queue_ordering();
 	test_dispatch_policy();

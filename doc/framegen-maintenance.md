@@ -75,6 +75,12 @@ owner with a proven lifetime. Splitting tightly coupled dispatch helpers merely
 to reduce line count is not an architectural improvement and can hide ordering
 or ownership bugs.
 
+`evaluate_deadline_ladder` drains a nonzero hold and returns before checking
+cost maturity or rung limits. The decision that drains the hold to zero still
+cannot degrade; only the next decision may do so. The renderer keeps the
+pre-drain hold for recovery evaluation, so recovery cannot climb on that last
+held decision either. Preserve both transitions when changing ladder policy.
+
 Repaint request policy in `deadline.hpp` has two temporal stages within
 `step_repaint_requests`: fold the previous iteration's requests and carriers,
 then plan from the current inputs. Fold even when no paint ended: deferred
