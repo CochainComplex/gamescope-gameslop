@@ -59,6 +59,13 @@ Start here, then read the matching class in
 Use symbol names in documentation and reviews. Numeric source-line references
 become wrong whenever the hot path is reorganized.
 
+`CSDLBackend::SDLEventLoop` distinguishes a quiet visibility-retry timeout from
+a failed wait before error logging or back-off. Neither advances the shared
+input timestamp. A successful wait checks cancellation before dispatch; ignored
+events still advance the timestamp. `tests/test_sdl_events.py` executes the
+production loop with a scripted queue and records actions, including shortcut
+releases before repeat suppression; it does not validate WSI or display timing.
+
 The `src/framegen` policy and contract headers are deliberately stateless and
 header-only: they add no link boundary to command recording. In particular,
 `scheduling.hpp` owns deterministic cadence confidence, the bounded online
