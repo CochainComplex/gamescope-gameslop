@@ -760,9 +760,11 @@ struct BidirQueueShedPlan_t
 	uint64_t gridEpoch )
 {
 	BidirPlan_t result;
-	if ( grid.T == 0u || grid.D0 == 0u || grid.W0 == 0u
-		|| !epoch.valid || epoch.epoch == 0u || epoch.epoch != gridEpoch
-		|| endpoints.size() < 2u )
+	if ( grid.T == 0u || grid.D0 == 0u || grid.W0 == 0u )
+		return result;
+	if ( !epoch.valid || epoch.epoch == 0u || epoch.epoch != gridEpoch )
+		return result;
+	if ( endpoints.size() < 2u )
 		return result;
 	result.validEpoch = true;
 	const auto insertSlot = [&result]( BidirSlot_t slot ) {
