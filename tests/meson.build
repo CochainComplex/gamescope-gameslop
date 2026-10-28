@@ -62,6 +62,18 @@ test_framegen_capture = executable(
 )
 test('framegen_capture', test_framegen_capture)
 
+# Interpose only stdio in this isolated CPU test executable. Staging creation,
+# descriptor cleanup, unlink and atomic replacement use the real filesystem.
+test_framegen_atomic_file = executable(
+	'test_framegen_atomic_file',
+	['framegen_atomic_file.cpp', srcdir / 'framegen/atomic_file.cpp', srcdir / 'framegen/capture_file.cpp'],
+	include_directories: [srcdir],
+	dependencies: [catch2_dep],
+	cpp_args: gamescope_cpp_args,
+	link_args: ['-Wl,--wrap=fdopen', '-Wl,--wrap=fwrite', '-Wl,--wrap=fclose'],
+)
+test('framegen_atomic_file', test_framegen_atomic_file)
+
 test_framegen_profile_io = executable(
 	'test_framegen_profile_io',
 	['framegen_profile_io.cpp', srcdir / 'framegen/net_profile_io.cpp'],
