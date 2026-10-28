@@ -476,6 +476,221 @@ TEST_CASE("Maintenance injection respects enabled instance dependencies and quer
   GamescopeWSILayer::gamescopeInstances.erase(instance);
 }
 
+namespace {
+struct SurfaceDriver {
+  VkSurfaceCapabilitiesKHR capabilities{
+    .minImageCount = 3, .maxImageCount = 0,
+    .currentExtent = {640, 480}, .minImageExtent = {64, 64}, .maxImageExtent = {4096, 4096},
+    .maxImageArrayLayers = 2,
+    .supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+    .currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+    .supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+    .supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+  };
+  VkResult result = VK_SUCCESS;
+  VkSurfaceKHR surface{};
+  VkSwapchainCreateInfoKHR creation{};
+  std::vector<VkPresentModeKHR> modes;
+  uint32_t creates = 0;
+  uint32_t acquires = 0;
+  VkAcquireNextImageInfoKHR acquire{};
+} surfaceDriver;
+
+VkResult VKAPI_CALL surfaceCapabilities(VkPhysicalDevice, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *caps) {
+  surfaceDriver.surface = surface;
+  if (surfaceDriver.result == VK_SUCCESS)
+    *caps = surfaceDriver.capabilities;
+  return surfaceDriver.result;
+}
+
+VkResult VKAPI_CALL surfaceCapabilities2(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR *info,
+                                        VkSurfaceCapabilities2KHR *caps) {
+  if (auto *protectedCaps = vkroots::FindInChainMutable<VkSurfaceProtectedCapabilitiesKHR>(caps))
+    protectedCaps->supportsProtected = VK_TRUE;
+  return surfaceCapabilities(VK_NULL_HANDLE, info->surface, &caps->surfaceCapabilities);
+}
+
+VkResult VKAPI_CALL surfaceFormats(VkPhysicalDevice, VkSurfaceKHR, uint32_t *count, VkSurfaceFormatKHR *formats) {
+  const std::array values{VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}};
+  return vkroots::array(values, count, formats);
+}
+
+PFN_vkVoidFunction VKAPI_CALL surfaceContractProc(VkInstance instance, const char *name) {
+  if (std::strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(surfaceCapabilities);
+  if (std::strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilities2KHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(surfaceCapabilities2);
+  if (std::strcmp(name, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(surfaceFormats);
+  return maintenanceProc(instance, name);
+}
+
+VkResult VKAPI_CALL createContractSwapchain(VkDevice, const VkSwapchainCreateInfoKHR *info,
+                                           const VkAllocationCallbacks *, VkSwapchainKHR *) {
+  surfaceDriver.creates++;
+  surfaceDriver.creation = *info;
+  surfaceDriver.creation.pNext = nullptr;
+  if (auto *modes = vkroots::FindInChain<VkSwapchainPresentModesCreateInfoEXT>(info))
+    surfaceDriver.modes.assign(modes->pPresentModes, modes->pPresentModes + modes->presentModeCount);
+  // Inspect the actual forwarded request without allocating driver or protocol objects.
+  return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+VkResult VKAPI_CALL acquireContractImage(VkDevice, const VkAcquireNextImageInfoKHR *info, uint32_t *index) {
+  surfaceDriver.acquires++;
+  surfaceDriver.acquire = *info;
+  *index = 2;
+  return VK_SUBOPTIMAL_KHR;
+}
+
+PFN_vkVoidFunction VKAPI_CALL surfaceContractDeviceProc(VkDevice device, const char *name) {
+  if (std::strcmp(name, "vkCreateSwapchainKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(createContractSwapchain);
+  if (std::strcmp(name, "vkAcquireNextImage2KHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(acquireContractImage);
+  return getDeviceProc(device, name);
+}
+
+struct SurfaceContract {
+  VkInstance instance = reinterpret_cast<VkInstance>(uintptr_t(1301));
+  VkSurfaceKHR surface = fakeHandle<VkSurfaceKHR>(1302);
+  vkroots::VkInstanceDispatch instanceDispatch{surfaceContractProc, instance, nullptr};
+  vkroots::VkPhysicalDeviceDispatch physical{VK_NULL_HANDLE, &instanceDispatch};
+  VkDeviceCreateInfo info{.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+  vkroots::VkDeviceDispatch device{surfaceContractDeviceProc, VK_NULL_HANDLE, VK_NULL_HANDLE, &physical, &info};
+
+  explicit SurfaceContract(bool tracked = true) {
+    surfaceDriver = {};
+    maintenance = {};
+    REQUIRE(GamescopeWSILayer::gamescopeInstances.create(instance, GamescopeWSILayer::GamescopeInstanceData{
+      .apiVersion = VK_API_VERSION_1_1, .surfaceMaintenance1 = true}));
+    if (tracked) {
+      auto *state = GamescopeWSILayer::gamescopeSurfaces.create(surface, GamescopeWSILayer::GamescopeSurfaceData{
+        .instance = instance});
+      REQUIRE(state);
+      state->waylandObjects.limiterState = std::make_shared<GamescopeWSILayer::GamescopeLimiterState>();
+      state->waylandObjects.limiterState->state = 0;
+    }
+  }
+
+  ~SurfaceContract() {
+    GamescopeWSILayer::gamescopeSurfaces.erase(surface);
+    GamescopeWSILayer::gamescopeInstances.erase(instance);
+  }
+};
+}
+
+TEST_CASE("Surface capability queries preserve driver fields and caller chains", "[present_timing_layer][surface_counts]") {
+  const bool tracked = GENERATE(false, true);
+  const bool caps2 = GENERATE(false, true);
+  SurfaceContract fixture(tracked);
+  const auto result = GENERATE(VK_SUCCESS, VK_ERROR_SURFACE_LOST_KHR);
+  surfaceDriver.result = result;
+  VkSurfaceCapabilitiesKHR caps{};
+  caps.minImageCount = 17;
+  if (caps2) {
+    VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,
+      .presentMode = VK_PRESENT_MODE_MAILBOX_KHR};
+    const VkPhysicalDeviceSurfaceInfo2KHR info{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+      .pNext = &mode, .surface = fixture.surface};
+    VkSurfaceProtectedCapabilitiesKHR protectedCaps{.sType = VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR};
+    VkSurfaceCapabilities2KHR output{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+      .pNext = &protectedCaps, .surfaceCapabilities = caps};
+    CHECK(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilities2KHR(
+      fixture.physical, VK_NULL_HANDLE, &info, &output) == result);
+    CHECK(info.pNext == &mode);
+    CHECK(mode.pNext == nullptr);
+    CHECK(mode.presentMode == VK_PRESENT_MODE_MAILBOX_KHR);
+    CHECK(output.pNext == &protectedCaps);
+    CHECK(protectedCaps.pNext == nullptr);
+    CHECK(protectedCaps.supportsProtected == VK_TRUE);
+    caps = output.surfaceCapabilities;
+  } else {
+    CHECK(GamescopeWSILayer::VkInstanceOverrides::GetPhysicalDeviceSurfaceCapabilitiesKHR(
+      fixture.physical, VK_NULL_HANDLE, fixture.surface, &caps) == result);
+  }
+  CHECK(surfaceDriver.surface == fixture.surface);
+  if (result == VK_SUCCESS) {
+    const auto &expected = surfaceDriver.capabilities;
+    CHECK(caps.minImageCount == expected.minImageCount);
+    CHECK(caps.maxImageCount == expected.maxImageCount);
+    CHECK(caps.currentExtent.width == expected.currentExtent.width);
+    CHECK(caps.currentExtent.height == expected.currentExtent.height);
+    CHECK(caps.minImageExtent.width == expected.minImageExtent.width);
+    CHECK(caps.minImageExtent.height == expected.minImageExtent.height);
+    CHECK(caps.maxImageExtent.width == expected.maxImageExtent.width);
+    CHECK(caps.maxImageExtent.height == expected.maxImageExtent.height);
+    CHECK(caps.maxImageArrayLayers == expected.maxImageArrayLayers);
+    CHECK(caps.supportedTransforms == expected.supportedTransforms);
+    CHECK(caps.currentTransform == expected.currentTransform);
+    CHECK(caps.supportedCompositeAlpha == expected.supportedCompositeAlpha);
+    CHECK(caps.supportedUsageFlags == expected.supportedUsageFlags);
+  } else
+    CHECK(caps.minImageCount == 17);
+}
+
+TEST_CASE("Swapchain creation forwards a valid count and maintenance modes without changing the caller", "[present_timing_layer][surface_counts]") {
+  const auto variant = GENERATE(0, 1, 2);
+  SurfaceContract fixture;
+  maintenance.extension = variant != 0;
+  const VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+  VkSwapchainPresentModesCreateInfoEXT modes{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT,
+    .presentModeCount = 1, .pPresentModes = &mode};
+  const VkSwapchainCreateInfoKHR info{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+    .pNext = variant == 2 ? &modes : nullptr, .surface = fixture.surface, .minImageCount = 4,
+    .imageFormat = VK_FORMAT_B8G8R8A8_UNORM, .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+    .imageExtent = {640, 480}, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+    .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+    .presentMode = mode, .clipped = VK_TRUE};
+  const auto original = info;
+  VkSwapchainKHR swapchain{};
+  CHECK(GamescopeWSILayer::VkDeviceOverrides::CreateSwapchainKHR(
+    fixture.device, VK_NULL_HANDLE, &info, nullptr, &swapchain) == VK_ERROR_INITIALIZATION_FAILED);
+  REQUIRE(surfaceDriver.creates == 1);
+  CHECK(surfaceDriver.creation.surface == fixture.surface);
+  CHECK(surfaceDriver.creation.minImageCount == 4);
+  CHECK(surfaceDriver.creation.presentMode == VK_PRESENT_MODE_MAILBOX_KHR);
+  CHECK(surfaceDriver.modes == (variant == 0 ? std::vector<VkPresentModeKHR>{} :
+    std::vector<VkPresentModeKHR>{VK_PRESENT_MODE_MAILBOX_KHR}));
+  CHECK(info.pNext == original.pNext);
+  CHECK(info.flags == original.flags);
+  CHECK(info.surface == original.surface);
+  CHECK(info.minImageCount == original.minImageCount);
+  CHECK(info.imageColorSpace == original.imageColorSpace);
+  CHECK(info.presentMode == original.presentMode);
+  CHECK(modes.pNext == nullptr);
+  CHECK(modes.presentModeCount == 1);
+  CHECK(modes.pPresentModes == &mode);
+  CHECK(mode == VK_PRESENT_MODE_FIFO_KHR);
+}
+
+TEST_CASE("Acquire aliases forward active requests and reject retired swapchains first", "[present_timing_layer][surface_counts]") {
+  const bool retired = GENERATE(false, true);
+  const bool legacy = GENERATE(false, true);
+  SurfaceContract fixture;
+  const auto handle = fakeHandle<VkSwapchainKHR>(1303);
+  auto *state = GamescopeWSILayer::gamescopeSwapchains.create(handle, GamescopeWSILayer::GamescopeSwapchainData{});
+  REQUIRE(state);
+  *state->retired = retired;
+  const VkAcquireNextImageInfoKHR info{.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR,
+    .swapchain = handle, .timeout = 42, .semaphore = fakeHandle<VkSemaphore>(1304), .deviceMask = 1};
+  uint32_t index = 99;
+  const auto result = legacy ? GamescopeWSILayer::VkDeviceOverrides::AcquireNextImageKHR(
+    fixture.device, VK_NULL_HANDLE, handle, info.timeout, info.semaphore, info.fence, &index) :
+    GamescopeWSILayer::VkDeviceOverrides::AcquireNextImage2KHR(fixture.device, VK_NULL_HANDLE, &info, &index);
+  CHECK(result == (retired ? VK_ERROR_OUT_OF_DATE_KHR : VK_SUBOPTIMAL_KHR));
+  CHECK(surfaceDriver.acquires == (retired ? 0 : 1));
+  CHECK(index == (retired ? 99 : 2));
+  if (!retired) {
+    CHECK(surfaceDriver.acquire.swapchain == handle);
+    CHECK(surfaceDriver.acquire.timeout == info.timeout);
+    CHECK(surfaceDriver.acquire.semaphore == info.semaphore);
+    CHECK(surfaceDriver.acquire.fence == info.fence);
+    CHECK(surfaceDriver.acquire.deviceMask == info.deviceMask);
+  }
+  GamescopeWSILayer::gamescopeSwapchains.erase(handle);
+}
+
 TEST_CASE("Features2 aliases retain their driver entry point", "[present_timing_layer]") {
   maintenance = {};
   vkroots::VkInstanceDispatch instanceDispatch(maintenanceProc, VK_NULL_HANDLE, nullptr);
