@@ -5,6 +5,8 @@
 #include "framegen/color_probe.hpp"
 
 #include <array>
+#include <cerrno>
+#include <csignal>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -13,6 +15,10 @@
 #include <limits>
 #include <string>
 #include <vector>
+
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace gamescope::framegen;
 
@@ -75,6 +81,155 @@ struct PaddedPlanes
 };
 
 } // namespace
+
+TEST_CASE( "Atomic replacement publishes complete bytes while an old reader keeps its snapshot", "[framegen_capture][atomic_file]" )
+{
+	CaptureFiles files;
+	const auto path = files.directory / "profile.bin";
+	const std::vector<uint8_t> original{ 1, 0, 2, 255, 3 };
+	const std::vector<uint8_t> replacement{ 0, 241, 4 };
+	{
+		std::ofstream seed( path, std::ios::binary );
+		seed.write( reinterpret_cast<const char *>( original.data() ), original.size() );
+		REQUIRE( seed.good() );
+	}
+	// Do not pre-read: cached stream bytes could conceal an in-place rewrite.
+	std::ifstream oldReader( path, std::ios::binary );
+	REQUIRE( oldReader.is_open() );
+	AtomicOutputFile output( path );
+	REQUIRE( output.is_open() );
+	REQUIRE( output.write( nullptr, 0 ) );
+	REQUIRE( output.write( replacement.data(), replacement.size() ) );
+	REQUIRE( read_file( path ) == original );
+	REQUIRE( output.commit() );
+	REQUIRE_FALSE( output.is_open() );
+	REQUIRE( output.error() == 0 );
+	REQUIRE( read_file( path ) == replacement );
+	const std::vector<uint8_t> oldBytes{ std::istreambuf_iterator<char>( oldReader ),
+		std::istreambuf_iterator<char>() };
+	REQUIRE( oldBytes == original );
+	REQUIRE_FALSE( output.write( replacement.data(), replacement.size() ) );
+	REQUIRE_FALSE( output.commit() );
+	REQUIRE( output.error() == EBADF );
+	REQUIRE( read_file( path ) == replacement );
+	REQUIRE( std::distance( std::filesystem::directory_iterator( files.directory ),
+		std::filesystem::directory_iterator() ) == 1 );
+}
+
+TEST_CASE( "An invalid atomic write poisons publication and immediately discards staging", "[framegen_capture][atomic_file]" )
+{
+	CaptureFiles files;
+	const auto path = files.directory / "profile.bin";
+	const std::vector<uint8_t> original{ 17, 0, 42 };
+	{
+		std::ofstream seed( path, std::ios::binary );
+		seed.write( reinterpret_cast<const char *>( original.data() ), original.size() );
+		REQUIRE( seed.good() );
+	}
+	AtomicOutputFile output( path );
+	REQUIRE( output.write( original.data(), 1 ) );
+	REQUIRE_FALSE( output.write( nullptr, 1 ) );
+	REQUIRE( output.error() == EINVAL );
+	REQUIRE_FALSE( output.write( original.data(), original.size() ) );
+	REQUIRE_FALSE( output.write( nullptr, 0 ) );
+	REQUIRE_FALSE( output.commit() );
+	REQUIRE_FALSE( output.is_open() );
+	REQUIRE( output.error() == EINVAL );
+	REQUIRE( read_file( path ) == original );
+	REQUIRE( std::distance( std::filesystem::directory_iterator( files.directory ),
+		std::filesystem::directory_iterator() ) == 1 );
+	REQUIRE_FALSE( output.commit() );
+	REQUIRE( output.error() == EINVAL ); // EBADF must not replace the first error.
+}
+
+TEST_CASE( "Atomic rename failure preserves the destination and a fresh writer can recover", "[framegen_capture][atomic_file]" )
+{
+	CaptureFiles files;
+	const auto path = files.directory / "profile.bin";
+	REQUIRE( std::filesystem::create_directory( path ) );
+	{
+		std::ofstream sentinel( path / "keep" );
+		sentinel << "old";
+		REQUIRE( sentinel.good() );
+	}
+	const std::vector<uint8_t> replacement{ 7, 8, 9 };
+	{
+		AtomicOutputFile output( path );
+		REQUIRE( output.write( replacement.data(), replacement.size() ) );
+		REQUIRE_FALSE( output.commit() );
+		REQUIRE_FALSE( output.is_open() );
+		REQUIRE( output.error() != 0 );
+		REQUIRE( std::filesystem::is_directory( path ) );
+		REQUIRE( read_file( path / "keep" ) == std::vector<uint8_t>{ 'o', 'l', 'd' } );
+		REQUIRE( std::distance( std::filesystem::directory_iterator( files.directory ),
+			std::filesystem::directory_iterator() ) == 1 );
+	}
+	REQUIRE( std::filesystem::remove_all( path ) == 2 );
+	AtomicOutputFile recovered( path );
+	REQUIRE( recovered.write( replacement.data(), replacement.size() ) );
+	REQUIRE( recovered.commit() );
+	REQUIRE( recovered.error() == 0 );
+	REQUIRE( read_file( path ) == replacement );
+}
+
+TEST_CASE( "A real filesystem write failure cannot publish a partial atomic file", "[framegen_capture][atomic_file]" )
+{
+	CaptureFiles files;
+	const auto path = files.directory / "profile.bin";
+	const std::vector<uint8_t> original{ 21, 0, 43 };
+	{
+		std::ofstream seed( path, std::ios::binary );
+		seed.write( reinterpret_cast<const char *>( original.data() ), original.size() );
+		REQUIRE( seed.good() );
+	}
+	// Only the child changes its limit/signal disposition. Both a buffered close
+	// failure and an immediate fwrite failure must preserve the published file.
+	for ( size_t size : { size_t{ 1 }, size_t{ 65536 } } )
+	{
+		const pid_t child = fork();
+		if ( child == 0 )
+		{
+			struct sigaction ignore{};
+			ignore.sa_handler = SIG_IGN;
+			sigemptyset( &ignore.sa_mask );
+			struct rlimit limit{};
+			if ( sigaction( SIGXFSZ, &ignore, nullptr ) != 0 || getrlimit( RLIMIT_FSIZE, &limit ) != 0 )
+				_exit( 1 );
+			limit.rlim_cur = 0;
+			if ( setrlimit( RLIMIT_FSIZE, &limit ) != 0 )
+				_exit( 2 );
+			int result = 0;
+			{
+				AtomicOutputFile output( path );
+				if ( !output.is_open() )
+					result = 3;
+				else
+				{
+					const std::vector<uint8_t> bytes( size, 0xab );
+					(void)output.write( bytes.data(), bytes.size() );
+					if ( output.commit() || output.error() != EFBIG || output.is_open() )
+						result = 4;
+					if ( std::distance( std::filesystem::directory_iterator( files.directory ),
+						std::filesystem::directory_iterator() ) != 1 )
+						result = 5;
+				}
+			} // Destruction must run before _exit; inherited test state must not.
+			_exit( result );
+		}
+		REQUIRE( child >= 0 );
+		int status = 0;
+		pid_t waited;
+		do
+			waited = waitpid( child, &status, 0 );
+		while ( waited < 0 && errno == EINTR );
+		REQUIRE( waited == child );
+		REQUIRE( WIFEXITED( status ) );
+		REQUIRE( WEXITSTATUS( status ) == 0 );
+		REQUIRE( read_file( path ) == original );
+		REQUIRE( std::distance( std::filesystem::directory_iterator( files.directory ),
+			std::filesystem::directory_iterator() ) == 1 );
+	}
+}
 
 TEST_CASE( "Color probes retain the exact held-out frame before the endpoint", "[framegen_capture]" )
 {

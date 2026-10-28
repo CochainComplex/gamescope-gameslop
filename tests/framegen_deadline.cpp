@@ -13,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -24,6 +25,173 @@
 
 using Catch::Approx;
 using namespace gamescope::framegen;
+
+TEST_CASE( "signed presentation corrections saturate instead of wrapping absolute clocks", "[framegen][deadline]" )
+{
+	constexpr int64_t lo = std::numeric_limits<int64_t>::min();
+	constexpr int64_t hi = std::numeric_limits<int64_t>::max();
+	constexpr uint64_t half = uint64_t{ 1 } << 63;
+	const struct { uint64_t time; int64_t bias; uint64_t applied; uint64_t removed; } cases[] = {
+		{ 100u, 25, 125u, 75u },
+		{ 100u, -25, 75u, 125u },
+		{ 0u, 1, 1u, 0u },
+		{ 0u, -1, 0u, 1u },
+		{ UINT64_MAX, 1, UINT64_MAX, UINT64_MAX - 1u },
+		{ UINT64_MAX, -1, UINT64_MAX - 1u, UINT64_MAX },
+		{ half - 1u, lo, 0u, UINT64_MAX },
+		{ half, lo, 0u, UINT64_MAX },
+		{ UINT64_MAX, lo, half - 1u, UINT64_MAX },
+		{ UINT64_MAX, hi, UINT64_MAX, half },
+	};
+	for ( const auto &c : cases )
+	{
+		CAPTURE( c.time, c.bias );
+		CHECK( apply_present_bias_ns( c.time, c.bias ) == c.applied );
+		CHECK( remove_present_bias_ns( c.time, c.bias ) == c.removed );
+	}
+	CHECK( signed_ns_magnitude( lo ) == half );
+	CHECK( signed_ns_delta( UINT64_MAX, 0u ) == hi );
+	CHECK( signed_ns_delta( 0u, UINT64_MAX ) == -hi );
+	CHECK( saturating_add_signed_ns( hi - 1, 2 ) == hi );
+	CHECK( saturating_add_signed_ns( lo + 1, -2 ) == lo );
+	CHECK( saturating_add_signed_ns( lo, hi ) == -1 );
+	CHECK( saturating_add_signed_ns( hi, lo ) == -1 );
+	// Zero is a missing-target sentinel only at the grid/tag boundary.
+	const auto grid = apply_present_bias( { 0u, 0u, 100u }, 25 );
+	CHECK( grid.D0 == 0u );
+	CHECK( grid.W0 == 0u );
+	CHECK( grid.T == 100u );
+}
+
+TEST_CASE( "stale and duplicate flip feedback cannot train the causal bias twice", "[framegen][deadline]" )
+{
+	const RealAnchorState_t anchor = {
+		.realFrameId = 9u, .sourceReadyNs = 900u, .provisionalTargetNs = 1'000u,
+		.provisionalBiasNs = 20, .epoch = 3u,
+	};
+	const PresentBiasState_t bias = { .emaNs = 20, .samples = k_uPresentBiasWarmupSamples };
+	for ( const auto [id, flip] : { std::pair{ 0u, 1'080u }, std::pair{ 8u, 1'080u },
+		std::pair{ 10u, 1'080u }, std::pair{ 9u, 0u } } )
+	{
+		CAPTURE( id, flip );
+		const auto rejected = apply_flip_feedback( anchor, bias, id, flip, 100u, 1'000u );
+		CHECK_FALSE( rejected.matched );
+		CHECK_FALSE( rejected.discardProvisional );
+		CHECK_FALSE( rejected.anchor.correctedFlipNs );
+		CHECK( rejected.anchor.realFrameId == 9u );
+		CHECK( rejected.anchor.sourceReadyNs == 900u );
+		CHECK( rejected.anchor.provisionalTargetNs == 1'000u );
+		CHECK( rejected.anchor.provisionalBiasNs == 20 );
+		CHECK( rejected.anchor.epoch == 3u );
+		CHECK( rejected.presentBias.emaNs == 20 );
+		CHECK( rejected.presentBias.samples == k_uPresentBiasWarmupSamples );
+	}
+	const auto accepted = apply_flip_feedback( anchor, bias, 9u, 1'080u, 100u, 1'000u );
+	REQUIRE( accepted.matched );
+	CHECK( accepted.anchor.correctedFlipNs == 1'080u );
+	CHECK( accepted.residualNs == 80 );
+	CHECK( accepted.presentBias.emaNs == 30 );
+	CHECK( accepted.presentBias.samples == k_uPresentBiasWarmupSamples + 1u );
+	const auto duplicate = apply_flip_feedback( accepted.anchor, accepted.presentBias,
+		9u, 1'080u, 100u, 1'000u );
+	CHECK( duplicate.matched );
+	CHECK( duplicate.anchor.correctedFlipNs == 1'080u );
+	CHECK( duplicate.presentBias.emaNs == 30 );
+	CHECK( duplicate.presentBias.samples == k_uPresentBiasWarmupSamples + 1u );
+	CHECK_FALSE( duplicate.discardProvisional );
+}
+
+TEST_CASE( "a negative display bias keeps causal targets and admission in their own clock domains", "[framegen][deadline]" )
+{
+	const DisplayGrid_t raw = { 10'000'000u, 9'000'000u, 1'000'000u };
+	const auto biased = apply_present_bias( raw, -200'000 );
+	const RealAnchorState_t anchor = {
+		.realFrameId = 9u, .sourceReadyNs = 8'000'000u, .provisionalTargetNs = 9'800'000u,
+		.provisionalBiasNs = -200'000, .epoch = 3u,
+	};
+	const CadencePredictorState cadence = { .intervalNs = 2'000'000u, .samples = k_uCadencePredictorMinSamples };
+	const CausalPlanOptions_t options = { .nowNs = 9'000'000u, .gridEpoch = 3u, .presentBiasNs = -200'000 };
+	const auto plan = plan_next_causal_slot( biased, anchor, cadence, options );
+	REQUIRE( plan.admit );
+	CHECK( plan.provisional );
+	CHECK( biased.D0 == 9'800'000u );
+	CHECK( biased.W0 == 8'800'000u );
+	CHECK( anchor.provisional_start_estimate() == 10'000'000u );
+	CHECK( plan.targetNs == 10'800'000u );
+	CHECK( plan.wakeNs == 9'800'000u );
+	CHECK( plan.phase == 0.5 );
+	CHECK( remove_present_bias_ns( plan.wakeNs, options.presentBiasNs ) == 10'000'000u );
+	// Protected arrival at 9.9 ms beats the raw 10 ms wake, but not the biased
+	// 9.8 ms wake. This row detects using display time for source admission.
+	auto earlyAnchor = anchor;
+	earlyAnchor.sourceReadyNs = 7'650'000u;
+	const auto safeReal = plan_next_causal_slot( biased, earlyAnchor, cadence, options );
+	CHECK_FALSE( safeReal.admit );
+	CHECK( safeReal.skipReason == DeadlineSkipReason_t::NextRealSafelyDue );
+}
+
+TEST_CASE( "deadline misses expire at the rolling decision boundary including hitch decisions", "[framegen][scheduling]" )
+{
+	constexpr uint32_t window = k_uDeadlineMissWindowDecisions;
+	for ( bool hitchBetween : { false, true } )
+		for ( uint32_t separation : { window - 1u, window, window + 1u } )
+		{
+			CAPTURE( hitchBetween, separation );
+			auto step = evaluate_deadline_miss_hysteresis( {}, true, false,
+				500u, k_uDeadlineMinSamples, 1'000u );
+			REQUIRE( step.skip );
+			REQUIRE_FALSE( step.degrade );
+			for ( uint32_t decision = 1u; decision < separation; decision++ )
+			{
+				step = evaluate_deadline_miss_hysteresis( step.state, hitchBetween, hitchBetween,
+					500u, k_uDeadlineMinSamples, 1'000u );
+				CHECK_FALSE( step.degrade );
+				CHECK( step.skip == hitchBetween );
+			}
+			step = evaluate_deadline_miss_hysteresis( step.state, true, false,
+				500u, k_uDeadlineMinSamples, 1'000u );
+			CHECK( step.degrade == ( separation == window - 1u ) );
+			CHECK( step.skip == ( separation >= window ) );
+			CHECK( deadline_miss_count( step.state.recentMisses ) == ( separation < window ? 2u : 1u ) );
+		}
+}
+
+TEST_CASE( "a bounded cadence hitch requests backups then recovers without losing mature confidence", "[framegen][scheduling]" )
+{
+	constexpr uint64_t T = 10'000'000u;
+	CadencePredictorState state = { .intervalNs = T, .samples = UINT32_MAX };
+	state = update_cadence_predictor( state, 100'000'000u );
+	CHECK( state.intervalNs == 11'250'000u ); // 100 ms is clamped to the 2x sample bound.
+	CHECK( state.trendNs == 156'250 );
+	CHECK( state.lateErrorNs == 10'000'000u );
+	CHECK( state.samples == UINT32_MAX );
+	const auto missing = update_cadence_predictor( state, 0u );
+	CHECK( missing.intervalNs == state.intervalNs );
+	CHECK( missing.trendNs == state.trendNs );
+	CHECK( missing.lateErrorNs == state.lateErrorNs );
+	CHECK( missing.samples == UINT32_MAX );
+	const auto admission = []( const CadencePredictorState &cadence, uint64_t source ) {
+		return fixed_cadence_admission( source, cadence, source + 1u, source + 12'000'000u, T );
+	};
+	const auto protectedHitch = admission( state, 1'000'000'000u );
+	CHECK( protectedHitch.trained );
+	CHECK( protectedHitch.generateBackup );
+	CHECK_FALSE( protectedHitch.predictionOverdue );
+	CHECK( protectedHitch.deadlineHeadroomNs == 0u );
+	for ( uint32_t sample = 1u; sample <= 128u; sample++ )
+		state = update_cadence_predictor( state, T );
+	// Exact integer-filter recovery, not a wall-clock or universal jitter budget.
+	CHECK( state.intervalNs == 10'000'152u );
+	CHECK( state.trendNs == -17 );
+	CHECK( state.lateErrorNs == 26u );
+	CHECK( state.samples == UINT32_MAX );
+	const auto recovered = admission( state, 2'280'000'000u );
+	CHECK( recovered.trained );
+	CHECK_FALSE( recovered.generateBackup );
+	CHECK_FALSE( recovered.predictionOverdue );
+	CHECK( recovered.safetyMarginNs == 312'526u );
+	CHECK( recovered.deadlineHeadroomNs == 1'687'339u );
+}
 
 TEST_CASE( "deadline grid boundaries reject missing clocks and saturated anchors", "[framegen][deadline]" )
 {

@@ -745,6 +745,48 @@ static void test_adaptation_policy()
 	CHECK( incompleteHistogram->fbP75 == -1.0f );
 }
 
+static void test_adaptation_hysteresis_boundaries()
+{
+	using namespace gamescope::framegen;
+	const struct { float residual; bool active; bool expected; } cases[] = {
+		{ k_flAdaptationResidualRelaxEnter, false, true },
+		{ std::nextafter( k_flAdaptationResidualRelaxEnter, 1.0f ), false, false },
+		{ std::nextafter( k_flAdaptationResidualRelaxExit, 0.0f ), true, true },
+		{ k_flAdaptationResidualRelaxExit, true, false },
+	};
+	for ( const auto &c : cases )
+	{
+		// Equal sample and prior EMA isolate the actual hysteresis boundary.
+		AdaptationState state = { .residualEma = c.residual, .fbP75Ema = 2.0f,
+			.fbTolerance = 1.25f, .fbRelaxationActive = c.active };
+		const AdaptationMeasurement measurement = { .residual = c.residual, .noise = -1.0f, .fbP75 = 2.0f };
+		update_adaptation_state( state, measurement, 0.75f, false );
+		CHECK( state.fbRelaxationActive == c.expected );
+		CHECK( state.fbTolerance == ( c.expected ? 1.375f : 1.0f ) );
+	}
+}
+
+static void test_adaptation_live_pin_and_release()
+{
+	using namespace gamescope::framegen;
+	AdaptationState state = { .residualEma = 1.0f / 32.0f, .noiseEma = 1.0f / 128.0f,
+		.fbP75Ema = 2.0f, .fbTolerance = 2.5f, .fbRelaxationActive = true };
+	const AdaptationMeasurement measurement = {
+		.residual = 1.0f / 64.0f, .noise = 1.0f / 64.0f, .fbP75 = 1.5f,
+	};
+	update_adaptation_state( state, measurement, 1.0f, true );
+	CHECK( state.fbTolerance == -1.0f );
+	CHECK( !state.fbRelaxationActive );
+	// Manual tolerance does not stop observing the scene or adapting agreement.
+	CHECK( state.residualEma == 15.0f / 512.0f );
+	CHECK( state.noiseEma == 9.0f / 1024.0f );
+	CHECK( state.fbP75Ema == 1.9375f );
+	CHECK( state.agreementOffset == 0.052734375f );
+	update_adaptation_state( state, measurement, 1.0f, false );
+	CHECK( state.fbRelaxationActive );
+	CHECK( state.fbTolerance == 1.125f ); // Rise from the manual base, not stale 2.5.
+}
+
 static void test_quality_meter()
 {
 	using namespace gamescope::framegen;
@@ -1360,6 +1402,17 @@ static void test_push_constant_encoding()
 	CHECK( train.sliceBase == 8u );
 	CHECK( train.flags == 7u );
 	CHECK( train.historyTimeScale == 0.5f );
+	// Shader bits 1/2/4 have separate authority; all-on alone misses bit swaps.
+	for ( uint32_t flags = 0u; flags < 8u; flags++ )
+	{
+		const FramegenMotionNetTrainPush_t individual( 7u, 8u,
+			( flags & 1u ) != 0u, ( flags & 2u ) != 0u, ( flags & 4u ) != 0u, 0.5f );
+		CHECK( individual.flags == flags );
+		CHECK( individual.seed == 7u );
+		CHECK( individual.sliceBase == 8u );
+		CHECK( individual.mode == 0.0f );
+		CHECK( individual.historyTimeScale == 0.5f );
+	}
 }
 
 static void test_query_ring_selection()
@@ -1459,6 +1512,38 @@ static void test_metrics_distribution()
 	CHECK( std::is_trivially_copyable<MetricsLatencyDistribution>::value );
 	latency = {};
 	CHECK( latency.n == 0 && latency.p95() == 0.0 && latency.max == 0.0 );
+}
+
+static void test_metrics_moments_ignore_histogram_saturation()
+{
+	using namespace gamescope::framegen;
+	const auto measured = []( auto distribution ) {
+		for ( uint64_t ns : { 20'000'000u, 22'000'000u, 22'000'000u, 24'000'000u } )
+			distribution.add( ns );
+		CHECK( distribution.n == 4u );
+		CHECK( distribution.sum == 88.0 );
+		CHECK( distribution.sumSquares == 1944.0 );
+		CHECK( distribution.min == 20.0 );
+		CHECK( distribution.max == 24.0 );
+		CHECK( distribution.average() == 22.0 );
+		CHECK_NEAR( distribution.stddev(), std::sqrt( 2.0 ), 1e-12 );
+		return distribution;
+	};
+	// Histogram clipping must not hide the mean or population standard deviation.
+	const auto narrow = measured( MetricsDistribution{} );
+	CHECK( narrow.p50() == 16.0 );
+	CHECK( narrow.p95() == 16.0 );
+	const auto intervals = measured( MetricsLatencyDistribution{} );
+	CHECK( intervals.p50() == 22.25 );
+	CHECK( intervals.p95() == 24.25 );
+	const auto source = measured( MetricsSourceLatencyDistribution{} );
+	CHECK( source.p50() == 23.0 );
+	CHECK( source.p95() == 25.0 );
+	MetricsLatencyDistribution steady;
+	for ( int i = 0; i < 4; i++ )
+		steady.add( 4'000'000u );
+	CHECK( steady.average() == 4.0 );
+	CHECK( steady.stddev() == 0.0 );
 }
 
 static void test_metrics_source_latency_distribution()
@@ -1603,6 +1688,8 @@ int main()
 	test_atomic_output_file();
 	test_numeric_settings_contract();
 	test_adaptation_policy();
+	test_adaptation_hysteresis_boundaries();
+	test_adaptation_live_pin_and_release();
 	test_quality_meter();
 	test_temporal_policy();
 	test_scheduling_policy();
@@ -1614,6 +1701,7 @@ int main()
 	test_push_constant_encoding();
 	test_query_ring_selection();
 	test_metrics_distribution();
+	test_metrics_moments_ignore_histogram_saturation();
 	test_metrics_source_latency_distribution();
 	test_net_learning_metrics();
 	test_fault_injection_grammar();
