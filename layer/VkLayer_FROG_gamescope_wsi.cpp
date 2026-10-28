@@ -873,6 +873,111 @@ namespace GamescopeWSILayer {
     return std::ranges::any_of(extensions, [&](const auto &extension) { return name == extension.extensionName; });
   }
 
+  struct SwapchainImageCounts {
+    uint32_t minimum;
+    uint32_t maximum;
+    bool compatible = true;
+
+    bool contains(uint32_t count) const {
+      return count >= minimum && (!maximum || count <= maximum);
+    }
+
+    uint32_t preferredMinimum() const {
+      const uint32_t preferred = std::max(minimum, getMinImageCount());
+      return maximum ? std::min(preferred, maximum) : preferred;
+    }
+  };
+
+  // Counts are shared above/below the layer. Advertising P < the driver's M
+  // would permit more outstanding acquired images (S-P) than it guarantees
+  // progress for (S-M). Keep a conservative legacy/MAILBOX interval, since
+  // creation may inject a MAILBOX-only maintenance1 mode list.
+  static VkResult querySwapchainImageCounts(
+      const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice,
+      VkSurfaceKHR surface, const VkSurfaceCapabilitiesKHR &legacy,
+      SwapchainImageCounts &counts, bool modeSpecific = true) {
+    counts = {legacy.minImageCount, legacy.maxImageCount};
+    std::vector<VkPresentModeKHR> modes;
+    VkResult result = enumerateValues(
+      std::bind_front(&vkroots::VkPhysicalDeviceDispatch::GetPhysicalDeviceSurfacePresentModesKHR, &dispatch),
+      modes, physicalDevice, surface);
+    if (result != VK_SUCCESS)
+      return result;
+    counts.compatible = std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+    auto instance = gamescopeInstances.find(dispatch.pInstanceDispatch->Instance);
+    if (!counts.compatible || !modeSpecific || !instance || !instance->surfaceMaintenance1)
+      return VK_SUCCESS;
+
+    const VkSurfacePresentModeEXT mode{.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT,
+      .presentMode = VK_PRESENT_MODE_MAILBOX_KHR};
+    const VkPhysicalDeviceSurfaceInfo2KHR info{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+      .pNext = &mode, .surface = surface};
+    VkSurfaceCapabilities2KHR caps{.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+    result = dispatch.GetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, &info, &caps);
+    if (result != VK_SUCCESS)
+      return result;
+    const uint32_t minimum = std::max(counts.minimum, caps.surfaceCapabilities.minImageCount);
+    const uint32_t maximum = !counts.maximum ? caps.surfaceCapabilities.maxImageCount :
+      !caps.surfaceCapabilities.maxImageCount ? counts.maximum :
+      std::min(counts.maximum, caps.surfaceCapabilities.maxImageCount);
+    counts.compatible = !maximum || minimum <= maximum;
+    // No common interval: keep valid legacy query results, but refuse creation.
+    if (counts.compatible) {
+      counts.minimum = minimum;
+      counts.maximum = maximum;
+    }
+    return VK_SUCCESS;
+  }
+
+  static VkResult queryFallbackImageCounts(
+      const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice,
+      VkSurfaceKHR selectedSurface, SwapchainImageCounts &counts, bool modeSpecific) {
+    // The application's support query covered the public surface, not this
+    // private XCB fallback. Establish support before querying its capabilities.
+    uint32_t familyCount = 0;
+    dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount, nullptr);
+    VkBool32 supported = VK_FALSE;
+    for (uint32_t family = 0; family < familyCount && !supported; ++family) {
+      const VkResult result = dispatch.GetPhysicalDeviceSurfaceSupportKHR(physicalDevice, family, selectedSurface, &supported);
+      if (result != VK_SUCCESS)
+        return result;
+    }
+    if (!supported)
+      return VK_ERROR_INITIALIZATION_FAILED;
+    VkSurfaceCapabilitiesKHR legacy{};
+    const VkResult result = dispatch.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, selectedSurface, &legacy);
+    if (result != VK_SUCCESS)
+      return result;
+    return querySwapchainImageCounts(dispatch, physicalDevice, selectedSurface, legacy, counts, modeSpecific);
+  }
+
+  static VkResult validateSwapchainImageCounts(
+      const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice,
+      VkSurfaceKHR publicSurface, VkSurfaceKHR selectedSurface, uint32_t count,
+      bool modeSpecific) {
+    VkSurfaceCapabilitiesKHR legacy{};
+    VkResult result = dispatch.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, publicSurface, &legacy);
+    if (result != VK_SUCCESS)
+      return result;
+    SwapchainImageCounts advertised{};
+    result = querySwapchainImageCounts(dispatch, physicalDevice, publicSurface, legacy, advertised);
+    if (result != VK_SUCCESS)
+      return result;
+    if (!advertised.compatible || count < advertised.preferredMinimum() || !advertised.contains(count))
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    if (selectedSurface == publicSurface)
+      return VK_SUCCESS;
+
+    SwapchainImageCounts selected{};
+    result = queryFallbackImageCounts(dispatch, physicalDevice, selectedSurface, selected, modeSpecific);
+    if (result != VK_SUCCESS)
+      return result;
+    // A larger requested count alone cannot repair a weaker public allowance.
+    return selected.compatible && selected.minimum <= advertised.preferredMinimum() && selected.contains(count) ?
+      VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
+  }
+
   static bool presentTimingSupported(const vkroots::VkPhysicalDeviceDispatch &dispatch,
                                       VkPhysicalDevice physicalDevice,
                                       const std::vector<VkExtensionProperties> *knownExtensions = nullptr) {
@@ -1272,7 +1377,12 @@ namespace GamescopeWSILayer {
 
         pSurfaceCapabilities->currentExtent = rect->extent;
       }
-      pSurfaceCapabilities->minImageCount = getMinImageCount();
+      SwapchainImageCounts counts{};
+      res = querySwapchainImageCounts(pDispatch, physicalDevice, surface, *pSurfaceCapabilities, counts);
+      if (res != VK_SUCCESS)
+        return res;
+      pSurfaceCapabilities->minImageCount = counts.preferredMinimum();
+      pSurfaceCapabilities->maxImageCount = counts.maximum;
 
       return VK_SUCCESS;
     }
@@ -1315,7 +1425,25 @@ namespace GamescopeWSILayer {
 
         pSurfaceCapabilities->surfaceCapabilities.currentExtent = rect->extent;
       }
-      pSurfaceCapabilities->surfaceCapabilities.minImageCount = getMinImageCount();
+      const auto *mode = vkroots::FindInChain<VkSurfacePresentModeEXT>(pSurfaceInfo);
+      const bool shared = mode && (mode->presentMode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR ||
+                                  mode->presentMode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR);
+      if (!shared) {
+        // The virtual FIFO/IMMEDIATE modes all create MAILBOX downstream. Use
+        // the same count policy as the legacy public query, not FIFO's counts.
+        VkSurfaceCapabilitiesKHR legacy = pSurfaceCapabilities->surfaceCapabilities;
+        if (mode) {
+          const VkResult res = pDispatch.GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, pSurfaceInfo->surface, &legacy);
+          if (res != VK_SUCCESS)
+            return res;
+        }
+        SwapchainImageCounts counts{};
+        const VkResult res = querySwapchainImageCounts(pDispatch, physicalDevice, pSurfaceInfo->surface, legacy, counts);
+        if (res != VK_SUCCESS)
+          return res;
+        pSurfaceCapabilities->surfaceCapabilities.minImageCount = counts.preferredMinimum();
+        pSurfaceCapabilities->surfaceCapabilities.maxImageCount = counts.maximum;
+      }
       if (auto *timing = vkroots::FindInChainMutable<VkPresentTimingSurfaceCapabilitiesEXT>(pSurfaceCapabilities)) {
         // Only bypassing swapchains reach the compositor's timing path.
         const bool supported = !gamescopeSurface->isWayland() && gamescopeSurface->canBypassXWayland() &&
@@ -1635,6 +1763,12 @@ namespace GamescopeWSILayer {
         }
       }
 
+      // Shared-present ownership cannot be emulated by the ordinary MAILBOX
+      // path. Retire oldSwapchain above even when refusing the new request.
+      if (pCreateInfo->presentMode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR ||
+          pCreateInfo->presentMode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
       if (gamescopeSurface->flags & GamescopeLayerClient::Flag::ForceSwapchainExtent) {
         if (!gamescopeSurface->isWayland()) {
           auto rect = xcb::getWindowRect(gamescopeSurface->connection, gamescopeSurface->window);
@@ -1656,7 +1790,6 @@ namespace GamescopeWSILayer {
       const bool bSupportsSwapchainMaintenance1 =
         deviceSupportsSwapchainMaintenance1(*pDispatch.pPhysicalDeviceDispatch, pDispatch.PhysicalDevice);
 
-      // We yolo to 3 min images always in Gamescope WSI, regardless of the underlying implementation.
       // Anyway, deal with present modes passed in...
       // As in CreateDevice: no patcher at all unless it inserts its struct.
       std::optional<vkroots::ChainPatcher<VkSwapchainPresentModesCreateInfoEXT>> presentModePatcher;
@@ -1682,6 +1815,12 @@ namespace GamescopeWSILayer {
       if (getEnsureMinImageCount())
         minImageCount = std::max(getMinImageCount(), minImageCount);
       swapchainInfo.minImageCount = minImageCount;
+
+      const VkResult countResult = validateSwapchainImageCounts(*pDispatch.pPhysicalDeviceDispatch,
+        pDispatch.PhysicalDevice, pCreateInfo->surface, swapchainInfo.surface,
+        minImageCount, bSupportsSwapchainMaintenance1);
+      if (countResult != VK_SUCCESS)
+        return countResult;
 
       fprintf(stderr, "[Gamescope WSI] Creating swapchain for xid: 0x%0x - oldSwapchain: %p - provided minImageCount: %u - minImageCount: %u - format: %s - colorspace: %s - flip: %s\n",
         gamescopeSurface->window,

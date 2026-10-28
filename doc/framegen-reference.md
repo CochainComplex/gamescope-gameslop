@@ -343,6 +343,19 @@ tuning and experimental values.
 
 ### Developer and validation
 
+The WSI layer's `GAMESCOPE_WSI_MIN_IMAGE_COUNT` (default `3`) is a preferred
+minimum within a nonempty ordinary legacy/MAILBOX interval. If those intervals
+do not overlap, queries retain valid legacy bounds and creation is refused;
+otherwise the advertised minimum covers the downstream requirements and does
+not exceed a finite maximum.
+The existing `vk_wsi_override_min_image_count` and `vk_x11_override_min_image_count`
+aliases retain their precedence below it. `GAMESCOPE_WSI_ENSURE_MIN_IMAGE_COUNT`
+(default off) additionally raises a creation request to the configured value;
+if that exceeds a finite driver maximum, creation is refused rather than
+overriding the limit. Creation also validates the selected route's acquisition
+guarantees.
+These controls set image capacity, not a measured queue depth or latency target.
+
 These exist for testing. For the `RECORD_COLOR` family and the validation
 workflow, see [`framegen-testing.md`](framegen-testing.md).
 
