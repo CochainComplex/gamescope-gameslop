@@ -1427,7 +1427,8 @@ measured and gated. Measured headless on two GPUs, with GravityMark at 1M
 asteroids and with Xonotic, on debug and optimized builds alike: framegen on adds
 about 2 ms from source to flip over framegen off, at p50 and at p95.
 
-All of it sits after the latch. Framegen off with composition forced
+In those runs, the added cost sits after the first compositor present attempt.
+Framegen off with composition forced
 (`--force-composition`, the `composite_force` convar) matches framegen on, so the
 cost is the full composite that both backends force for every real frame while
 framegen is on (`src/Backends/WaylandBackend.cpp` and
@@ -1436,16 +1437,31 @@ framegen is on (`src/Backends/WaylandBackend.cpp` and
 ### Measuring it
 
 With `GAMESCOPE_FRAMEGEN_METRICS=1`, four fields on each
-`framegen-metrics:` line split `src_flip_ms_*` at the latch:
+`framegen-metrics:` line split `src_flip_ms_*` at the first compositor present
+attempt for that real-frame identity:
 
 | Fields | Interval |
 |---|---|
-| `src_rec_ms_p50`, `src_rec_ms_p95` | Source ready to the first paint or latch of that real frame |
-| `rec_flip_ms_p50`, `rec_flip_ms_p95` | Latch to the actual flip |
+| `src_rec_ms_p50`, `src_rec_ms_p95` | Software-observed source readiness to the first compositor present attempt |
+| `rec_flip_ms_p50`, `rec_flip_ms_p95` | First compositor present attempt to the backend-reported flip/completion timestamp |
+
+The record boundary is `vulkan_framegen_begin_present`, before the backend's
+`Present` call, which can still defer or fail. Repeated attempts for the same
+real-frame identity keep the first record timestamp. This is separate from
+`commit_t::latch_time`, which records admission of a ready commit; a ready FIFO
+commit can wait for earlier commits and an eligible vblank before admission.
+Both source and record timestamps use the compositor's monotonic CPU clock.
+
+The output endpoint depends on the backend. On the SDL/Vulkan-swapchain path it
+is host-observed present-wait completion, not physical scanout. These histograms
+include live real frames with valid correlated presentation feedback; they do
+not describe every queued commit. Percentiles are window summaries: adding the
+two stage medians does not reconstruct the median of `src_flip_ms_*`.
 
 They are recorded with framegen off too, so the same fields compare off with on.
-With framegen on, the difference shows in `rec_flip_ms_*`; `src_rec_ms_*` does not
-move.
+In the workloads above, the difference shows in `rec_flip_ms_*` while
+`src_rec_ms_*` stays stable. Check admission and FIFO queue residence separately
+when another workload shows a large source-to-record interval.
 
 The showcase reports the end-to-end percentiles as `lat_p50` and `lat_p95` for
 every run, `off` included, so one session shows the cost as the difference
