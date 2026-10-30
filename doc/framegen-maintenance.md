@@ -508,21 +508,30 @@ an image-quality gain that introduces cadence misses is not a net improvement.
 
 Run repository analysis outside timing and A/B campaigns, using their shared
 campaign lock. Check the actual checkout and preserve unrelated edits first.
-When incremental updates leave stale pages or incomplete analysis, reconcile the
-configured repository and persist a whole-repository health run:
+Refresh the configured repository and persist a whole-repository health run:
 
 ```sh
-repowise update --no-workspace --full --yes --docs --no-agents --no-cost-tracking
+repowise update --no-workspace --docs --no-agents
 repowise health --no-workspace --recompute
-repowise doctor --no-workspace --quick --format json
-repowise status --format json
+repowise doctor --no-workspace --format json
+repowise status --no-workspace --format json
 repowise doc-drift --no-workspace --check --format json
+repowise coverage status
 ```
+
+Inspect cascade-budget and stale-page warnings. Use the reported cascade scope
+or `repowise generate --stale` for remaining selected model pages; reserve
+`repowise update --full` for an incomplete index or generation-selection
+reconciliation. The full doctor checks SQL/vector/full-text synchronization and
+MCP startup; `--quick` omits those checks and cannot establish full synchronization.
 
 In Repowise 0.59, the unfiltered default-table health recomputation persists its
 results; JSON or file-filtered recomputation only reports them. Verify stored
 health through MCP as well as CLI output, including the analyzed revision and
 available coverage. Keep genuine findings; freshness does not mean a clean score.
+Full rescoring can change contextual/history deductions without source changes;
+compare the same scope and counting mode. Unanalysed files and unmeasured
+coverage remain explicit gaps even when no indexing or rescoring is pending.
 
 Regenerate coverage through the relevant tests before ingesting a fresh report
 with `repowise coverage add <report> --strict`. Its measurement revision follows
