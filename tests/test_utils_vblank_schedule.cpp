@@ -182,3 +182,26 @@ TEST_CASE("High nested rates bound a draw lead longer than one interval", "[vbla
 	REQUIRE(next.ulTargetVBlank == 1'001'000'000);
 	REQUIRE(next.ulScheduledWakeupPoint == 1'000'000'000);
 }
+
+TEST_CASE("Fixed-refresh limiter divisors retain integer cap semantics", "[vblank_schedule]") {
+    STATIC_REQUIRE(VBlank::LimiterDivisor(60, 30, true) == 2);
+    STATIC_REQUIRE(VBlank::LimiterDivisor(60, 40, true) == 1);
+    STATIC_REQUIRE(VBlank::LimiterDivisor(60, 30, false) == 0);
+    STATIC_REQUIRE(VBlank::LimiterDivisor(60, 0, true) == 0);
+    STATIC_REQUIRE(VBlank::LimiterDivisor(60, 60, true) == 0);
+    STATIC_REQUIRE(VBlank::LimiterDivisor(60, 120, true) == 0);
+}
+
+TEST_CASE("The next limiter bucket follows the processed display phase", "[vblank_schedule]") {
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(10, 1000, 100, 2) == 1200);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(11, 1100, 100, 2) == 1200);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(12, 1200, 100, 2) == 1400);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(16, 1600, 100, 3) == 1800);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(2, 1000, 100, 1) == 1100);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(0, 0, 100, 2) == 0);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(2, 1000, 0, 2) == 0);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(2, 1000, 100, 0) == 0);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(UINT64_MAX, 1000, 1, 1) == 0);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(2, UINT64_MAX-10, 10, 1) == UINT64_MAX);
+    STATIC_REQUIRE(VBlank::NextLimiterTarget(2, UINT64_MAX-9, 10, 1) == 0);
+}

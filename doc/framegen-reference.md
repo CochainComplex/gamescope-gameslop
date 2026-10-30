@@ -139,6 +139,20 @@ scheduling by default (see the architecture document). The startup log line
 `causal fixed-refresh deadline scheduling active by default` confirms the causal
 path is active.
 
+For nested fixed-refresh causal generation, admission uses the earlier of the
+planned wake and the raw compositor wake. A positive display-time bias does not
+extend the time available to finish generation. Current and recovered rung
+budgets, provisional replacement and the stored learning deadline use that same
+bound. Display targets and interpolation phase retain their bias; native KMS
+commit reservations keep their separate timing policy. The debug causal-slot
+`wake=` value reports the admission bound, not the display target or completion.
+
+The source's fixed-refresh FPS gate also determines whether a real frame can
+use an opportunity. A ready FIFO buffer held by that gate does not suppress an
+earlier generated backup. The compositor supplies a fresh hint for the exact
+base source; unavailable or contradictory source state retains the ordinary
+readiness prediction. Real frames keep presentation priority.
+
 ## Pipelines
 
 The original five pipelines are cumulative: each one includes every layer of the pipelines

@@ -99,6 +99,12 @@ test_framegen_deadline = executable(
 )
 test('framegen_deadline', test_framegen_deadline)
 
+test('framegen_causal_admission', find_program('python3'),
+	args: files('test_framegen_causal_admission.py'), timeout: 180)
+
+test('framegen_real_admission', find_program('python3'),
+	args: files('test_framegen_real_admission.py'), timeout: 180)
+
 test('wlserver_shutdown', find_program('python3'),
 	args: files('test_wlserver_shutdown.py'), timeout: 90)
 

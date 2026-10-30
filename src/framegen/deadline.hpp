@@ -229,6 +229,9 @@ struct CausalPlanOptions_t
 	// Skip a slot displayed at or after the predicted next real frame
 	// (phase >= 1): it would extrapolate past content that is due by then.
 	bool skipAtOrPastNextReal = false;
+	// Raw fixed-refresh opportunity at which this source can next be admitted.
+	// Zero supplies no additional knowledge beyond the source-ready predictor.
+	uint64_t nextRealEligibleVBlankNs = 0;
 };
 
 struct CausalSlotPlan_t
@@ -324,7 +327,15 @@ struct CausalSlotPlan_t
 		result.wakeNs, options.presentBiasNs );
 	const FixedCadenceAdmission admission = fixed_cadence_admission(
 		anchor.sourceReadyNs, cadence, options.nowNs, admissionWakeNs, grid.T );
-	if ( !admission.generateBackup )
+	// A ready FIFO frame can still be held by the compositor's FPS limiter.
+	// Suppress the backup only if that source can also use this opportunity.
+	// Use the same half-cycle identity as queued-slot arbitration: a freshly
+	// estimated grid can move by a few microseconds without changing its slot.
+	if ( !admission.generateBackup
+		&& ( options.nextRealEligibleVBlankNs == 0u
+			|| slot_due_at( apply_present_bias_ns(
+				options.nextRealEligibleVBlankNs, options.presentBiasNs ),
+				result.targetNs, grid.T ) ) )
 	{
 		result.skipReason = DeadlineSkipReason_t::NextRealSafelyDue;
 		return result;

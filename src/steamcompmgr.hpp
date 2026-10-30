@@ -182,6 +182,9 @@ extern MangoappControlRelay_t mangoapp_relay_control( const std::vector<uint32_t
 extern void mangoapp_post_control( uint32_t uMsgType, uint8_t uNoDisplay, bool bStartLogging );
 struct wlr_surface *steamcompmgr_get_server_input_surface( size_t idx );
 wlserver_vk_swapchain_feedback* steamcompmgr_get_base_layer_swapchain_feedback();
+// Read-only compositor-thread hint for the exact recorded FIFO base source.
+// Raw vblank time; zero means its next admission opportunity is unknown.
+uint64_t steamcompmgr_framegen_next_real_eligible_vblank( uint64_t ulBaseCommitID, uint64_t ulRefreshCycle );
 
 Window x11_find_toplevel_for_xid( _XDisplay *dpy, Window xid );
 struct wlserver_x11_surface_info *lookup_x11_surface_info_from_xid( gamescope_xwayland_server_t *xwayland_server, uint32_t xid );

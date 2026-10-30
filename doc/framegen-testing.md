@@ -74,6 +74,38 @@ release-point reservation. Both normal and fast-math builds run. It does not
 prove real GPU dispatch, HDR range preservation or native display behavior;
 those require separate GPU and native evidence.
 
+`meson test -C build framegen_causal_admission --print-errorlogs` executes the
+production causal caller, cost selection, correction predicate and learning
+consumer with controlled CPU state, in normal and fast-math builds. It covers
+raw versus biased wake limits, exact cost boundaries, current/cheaper/recovered
+rungs, cold probes, lazy guards, native reservation controls and the 22 recorded
+negative-bias replacement cases. `tests/framegen_causal_admission.cpp` supplies
+external dependencies; it does not duplicate the production policies. Submission
+is stubbed and the request-to-pending deadline assignment is modeled, so this
+check does not establish GPU completion, display pacing or cross-device safety.
+
+`meson test -C build framegen_real_admission --print-errorlogs` executes the
+compositor's real-admission owner and existing FPS gate with CPU focus/window
+fixtures. The actual fixed-refresh divisor and processed-vblank tracking cover
+repeated/skipped passes, cap and refresh changes, FIFO/mailbox transitions,
+source identity, focus overrides, fades and unknown-state fallback. The VRR
+gate retains its scheduling side effects; the new eligibility lookup is read
+only. These tests use no Wayland server or GPU and do not validate window
+destruction concurrency or native display behavior.
+
+The 2026-10-30 admission checks passed a fresh release build and all 111 Meson
+tests. Matched 40-second nested AMD 890M/RADV controls at 640x480, app 30 FPS and
+output 60 Hz used the same bounded producer and legal four-image FIFO. Across
+six steady windows, original/candidate repeats were 5/15 in the first pair and
+32/8 in the reversed-order pair. The reported source-to-record and source-to-flip
+window medians stayed near 34 ms and 38 ms. These software proxies and the
+opposite pacing results establish neither physical latency nor a performance
+improvement; intermittent pacing remains open. Both fully validation-instrumented
+controls had no recorded Vulkan/synchronization errors, but failed the original
+throughput gate at 0.513 fill. Keep that failure separate from the optimized
+controls and from the CPU decision contracts. The runs did not record actual
+eligibility-hint activation or validate native, VRR, HDR or mixed-device behavior.
+
 `GAMESCOPE_LOCAL_PREFIX` is the directory holding your locally built
 dependencies (the prefix that `scripts/env-gamescope-local.sh` puts on the
 library and pkg-config paths; its default is `$HOME/.local/gamescope-wayland`).
