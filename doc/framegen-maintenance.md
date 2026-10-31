@@ -533,6 +533,14 @@ Full rescoring can change contextual/history deductions without source changes;
 compare the same scope and counting mode. Unanalysed files and unmeasured
 coverage remain explicit gaps even when no indexing or rescoring is pending.
 
+For an unanalysed file, inspect the MCP `get_health` target's `unresolved.reason`
+before refreshing again. Repowise 0.59/analyzer 43 reports
+`language_not_supported` for the Lua files under `scripts/00-gamescope/`;
+they are indexed as Luau but have no code-health dialect. Preserve that unknown
+score rather than excluding the files, changing their language or repeatedly
+reindexing them. Detector-specific performance coverage is a separate scope;
+an empty findings list in either unsupported scope does not mean clean code.
+
 Regenerate coverage through the relevant tests before ingesting a fresh report
 with `repowise coverage add <report> --strict`. Its measurement revision follows
 the report's modification time, rather than ingestion time. Preserve original
@@ -540,6 +548,13 @@ reports and their timestamps. In Repowise 0.59, each import replaces the stored
 coverage map: pass every still-applicable report in the same invocation to retain
 coverage and test contexts from other suites. A focused fixture's percentage
 describes its instrumented region, not the entire backend file.
+
+Keep source-extracted renderer/compositor/backend fixtures as scoped hit maps
+for test selection, outside whole-file coverage denominators. Whole-file
+measurement requires instrumentation of the complete translation unit and
+execution of the relevant integration paths; optional build configurations
+remain explicit limits. Count emitted GCC branch arcs as translation-unit
+instances, rather than claiming a deduplicated source-level branch union.
 
 After committing, verify synchronization against
 the new `HEAD`, including pending work and stale-page checks. Keep generated
