@@ -98,6 +98,13 @@ source identity, focus overrides, fades and unknown-state fallback. The VRR
 gate retains its scheduling side effects; the new eligibility lookup is read
 only. These tests use no Wayland server or GPU and do not validate window
 destruction concurrency or native display behavior.
+The fixture also extracts `framegen_display_interval_ns` from the renderer and
+passes its result to the owner with independently initialized compositor timing.
+It covers 60/240 Hz rounding, agreeing 120/59.94 Hz controls, nested/output
+selection, genuine mode changes and the converter's 232/233 mHz width boundary.
+Representable periods use the compositor's existing rounded conversion; tiny
+positive rates retain their original wide period and nonpositive rates retain
+the renderer fallback. Exact phase checks and native/VRR exclusions remain.
 
 The 2026-10-30 admission checks passed a fresh release build and all 111 Meson
 tests. Matched 40-second nested AMD 890M/RADV controls at 640x480, app 30 FPS and
@@ -111,6 +118,30 @@ controls had no recorded Vulkan/synchronization errors, but failed the original
 throughput gate at 0.513 fill. Keep that failure separate from the optimized
 controls and from the CPU decision contracts. The runs did not record actual
 eligibility-hint activation or validate native, VRR, HDR or mixed-device behavior.
+
+The 2026-10-31 renderer/compositor conversion regression failed 13 of 193 CPU
+checks in both compiler modes before the fix, then passed all 193. At 60 Hz,
+the renderer's floored 16,666,666 ns disagreed with the compositor's rounded
+16,666,667 ns, keeping the exact-period admission hint unknown. Reusing the
+existing conversion restores agreement without tolerances or relaxed guards.
+Two matched normal-binary pairs, in opposite orders, used the same nested
+AMD 890M/RADV, 640x480, app-30/output-60, checked-2x, four-image N1 workload:
+
+| Order | Baseline/candidate repeat counters | Median window SD ms | Median window fill |
+|---|---|---|---|
+| Baseline, candidate | 279 / 1 | 6.627 / 0.0585 | 0.8365 / 1.000 |
+| Candidate, baseline | 428 / 2 | 7.509 / 0.0465 | 0.7695 / 1.000 |
+
+These are counter sums and medians of six reported windows, not physical
+presentation counts or pooled percentiles. Both candidate normal and short
+validation runs passed the original throughput gate; the baseline runs failed
+it. Separate validation checks found no recorded Vulkan/API/synchronization
+errors. The source-to-flip window median remained near 37 ms. Client present-wait
+CPU maxima were 49.74/65.64 ms in the forward pair and 49.59/49.95 ms in the
+reverse pair, so tail-latency improvement is not established. Native DRM/VRR/HDR,
+mixed-device behavior, physical input latency and visual quality remain untested.
+Both candidate captures retain settling outliers in window 3 (SD 2.267/1.910 ms
+and 51/25 discards); that window remains included in every reported comparison.
 
 `GAMESCOPE_LOCAL_PREFIX` is the directory holding your locally built
 dependencies (the prefix that `scripts/env-gamescope-local.sh` puts on the

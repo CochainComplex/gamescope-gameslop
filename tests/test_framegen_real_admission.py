@@ -36,7 +36,7 @@ def definition(source, name, parameter=None):
     raise ValueError('unterminated production definition: ' + name)
 
 
-def materialize(root, source_path, output):
+def materialize(root, source_path, output, renderer_source=None):
     source = source_path.read_text()
     provenance = {}
     for part, name, parameter in (
@@ -65,12 +65,18 @@ def materialize(root, source_path, output):
             raise ValueError('ambiguous/missing gate state: ' + pattern)
         declarations.append(matches[0])
     (output/'state.inc').write_text('\n'.join(declarations)+'\n')
+    renderer_source = renderer_source or root/'src/rendervulkan.cpp'
+    line, body = definition(renderer_source.read_text(), 'framegen_display_interval_ns')
+    (output/'period.inc').write_text(f'#line {line} "{renderer_source}"\n'+body)
+    provenance['period'] = {'source': str(renderer_source), 'line': line,
+                            'source_sha256': hashlib.sha256(renderer_source.read_bytes()).hexdigest(),
+                            'sha256': hashlib.sha256(body.encode()).hexdigest()}
     return provenance
 
 
-def execute(root, source, output):
+def execute(root, source, output, renderer_source=None):
     output.mkdir(parents=True, exist_ok=True)
-    provenance = materialize(root, source, output)
+    provenance = materialize(root, source, output, renderer_source)
     fixture = root/'tests/framegen_real_admission.cpp'
     report = {'source': str(source), 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
               'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(),
@@ -106,12 +112,13 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=root/'src/steamcompmgr.cpp')
+    parser.add_argument('--renderer-source', type=Path, default=root/'src/rendervulkan.cpp')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if args.output:
-        return execute(root, args.source.resolve(), args.output.resolve())
+        return execute(root, args.source.resolve(), args.output.resolve(), args.renderer_source.resolve())
     with tempfile.TemporaryDirectory(prefix='framegen-real-admission-') as name:
-        return execute(root, args.source.resolve(), Path(name))
+        return execute(root, args.source.resolve(), Path(name), args.renderer_source.resolve())
 
 
 if __name__ == '__main__':

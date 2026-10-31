@@ -69,6 +69,7 @@ static uint64_t g_SteamCompMgrLimitedAppRefreshCycle = gamescope::mHzToRefreshCy
 #include "gate.inc"
 #include "note.inc"
 #include "owner.inc"
+#include "period.inc"
 
 static constexpr uint64_t rawStart = 1'000'000'000u;
 static uint64_t period() { return gamescope::mHzToRefreshCycle(g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh); }
@@ -402,6 +403,85 @@ static void vrrCases()
     CHECK(state() == mutated);
 }
 
+static void rendererPeriodCases()
+{
+    caseName = "renderer period matches the independently processed compositor";
+    const struct { int nested, output; uint64_t cycle, steps; } cases[] = {
+        {60'000,120'000,16'666'667u,2u},
+        {240'000,60'000,4'166'667u,8u},
+        {120'000,60'000,8'333'333u,4u},
+        {59'940,120'000,16'683'350u,2u},
+        {0,60'000,16'666'667u,2u},
+        {0,240'000,4'166'667u,8u},
+    };
+    for (const auto &row : cases) {
+        setup();
+        g_nNestedRefresh = row.nested;
+        g_nOutputRefresh = row.output;
+        g_SteamCompMgrAppRefreshCycle = period();
+        CHECK(g_SteamCompMgrAppRefreshCycle == row.cycle);
+        // Establish phase through the production pass owner, independently of
+        // the renderer. Index8 is a bucket boundary for each tested30FPS cap.
+        const uint64_t pass = 8u*row.cycle;
+        steamcompmgr_note_vblank_pass(pass,g_SteamCompMgrAppRefreshCycle);
+        const auto before = state();
+        const uint64_t rendererT = framegen_display_interval_ns();
+        CHECK(rendererT == row.cycle);
+        CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT)
+            == pass+row.steps*row.cycle);
+        CHECK(state() == before);
+    }
+
+    caseName = "renderer period retains nonpositive-rate fallback";
+    for (const auto [nested, output] : std::array<std::pair<int,int>,4>{{
+        {0,0}, {-1,60'000}, {0,-1}, {-60'000,120'000},
+    }}) {
+        setup();
+        processed();
+        g_nNestedRefresh = nested;
+        g_nOutputRefresh = output;
+        const uint64_t rendererT = framegen_display_interval_ns();
+        CHECK(rendererT == 8'333'333u);
+        CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT) == 0u);
+    }
+
+    caseName = "renderer conversion retains periods outside the uint32 range";
+    for (int rate : {1,2,232}) {
+        setup();
+        g_nNestedRefresh = rate;
+        CHECK(framegen_display_interval_ns() == 1'000'000'000'000ull/uint64_t(rate));
+    }
+    caseName = "representable renderer period agrees with existing conversion";
+    for (int rate : {233,234,1000,59'940,60'000,120'000,240'000,
+                    std::numeric_limits<int32_t>::max()}) {
+        setup();
+        g_nNestedRefresh = rate;
+        CHECK(framegen_display_interval_ns() == gamescope::mHzToRefreshCycle(rate));
+    }
+}
+
+static void rendererPeriodTransitionCases()
+{
+    caseName = "renderer period preserves real mode-change provenance";
+    setup();
+    processed();
+    const uint64_t previousT = period();
+    g_nNestedRefresh = 120'000;
+    const uint64_t rendererT = framegen_display_interval_ns();
+    CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT) == 0u);
+    g_SteamCompMgrAppRefreshCycle = period();
+    CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT) == 0u);
+    steamcompmgr_note_vblank_pass(rawStart+previousT,g_SteamCompMgrAppRefreshCycle);
+    CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT) > s_ulLastPassVBlank);
+
+    caseName = "renderer period keeps native and VRR hints unknown";
+    backend.native = true;
+    CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT) == 0u);
+    backend.native = false;
+    connector.vrr = true;
+    CHECK(steamcompmgr_framegen_next_real_eligible_vblank(100u,rendererT) == 0u);
+}
+
 int main()
 {
     sharedPolicyCases();
@@ -413,6 +493,8 @@ int main()
     queueCases();
     ownerOverflowCases();
     vrrCases();
+    rendererPeriodCases();
+    rendererPeriodTransitionCases();
     std::printf("CPU production real-admission owner: %u checks, %u failures\n",checks,failures);
     return failures ? 1 : 0;
 }

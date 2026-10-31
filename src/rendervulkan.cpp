@@ -7266,8 +7266,15 @@ static FramegenDormantReason framegen_longest_dormant_reason()
 static uint64_t framegen_display_interval_ns()
 {
 	const int nFramegenRefreshMhz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-	return nFramegenRefreshMhz > 0
-		? 1'000'000'000'000ull / (uint64_t)nFramegenRefreshMhz : 8'333'333ull;
+	if ( nFramegenRefreshMhz <= 0 )
+		return 8'333'333ull;
+
+	// Keep the wide period for rates outside the compositor converter's range.
+	if ( uint64_t( nFramegenRefreshMhz ) <= 1'000'000'000'000ull / std::numeric_limits<uint32_t>::max() )
+		return 1'000'000'000'000ull / uint64_t( nFramegenRefreshMhz );
+
+	// Match the compositor's processed vblank period, including its rounding.
+	return gamescope::mHzToRefreshCycle( nFramegenRefreshMhz );
 }
 
 static uint64_t framegen_commit_lead_override_ns();
