@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -20,7 +21,7 @@ using FramegenEffective_t = EffectiveConfig;
 using FramegenSlotRequest_t = SlotRequest;
 static constexpr uint64_t T = 16'666'667u, R = 1'000'000'000u;
 static constexpr uint64_t wakeLead = 2'000'000u;
-static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = 1'000'000'000u;
+#include "history_gap.inc"
 static constexpr float k_flFramegenMaxForwardStrength = 1.5f;
 static GamescopeFramegenMode g_eFramegenMode = GamescopeFramegenMode::Motion;
 static GamescopeFramegenPipeline g_eFramegenPipeline = GamescopeFramegenPipeline::Checked;
@@ -116,6 +117,8 @@ static bool completed = true, submitSuccess = true;
 static uint64_t clockNs = 0, commitLeadOverride = 0;
 static unsigned completionQueries = 0, submitCalls = 0, admissionSkips = 0;
 static unsigned realEligibilityQueries = 0;
+static unsigned clockQueries = 0, historyInvalidations = 0;
+static std::string_view historyInvalidationReason;
 static uint64_t nextRealEligibleVBlankNs = 0;
 static NetLearningSkip lastSkip = NetLearningSkip::NoSkip;
 static FramegenSlotRequest_t submittedRequest = {};
@@ -126,7 +129,7 @@ static bool vulkan_framegen_vrr_hybrid_active() { return vrr; }
 static bool vulkan_framegen_bidir_active() { return bidir; }
 static bool framegen_recovery_enabled() { return recoverEnabled; }
 static bool framegen_work_completed() { ++completionQueries; return completed; }
-static uint64_t get_time_in_nanos() { return clockNs; }
+static uint64_t get_time_in_nanos() { ++clockQueries; return clockNs; }
 static uint64_t framegen_commit_lead_override_ns() { return commitLeadOverride; }
 static uint64_t framegen_predicted_interval_ns() {
     return predicted_cadence_interval_ns(g_framegenHistory.cadence);
@@ -141,7 +144,11 @@ static uint64_t framegen_predicted_interval_ns() {
 }
 static void framegen_net_note_skip(NetLearningSkip skip) { lastSkip = skip; }
 static void framegen_metrics_note_admission_skip() { ++admissionSkips; }
-static void vulkan_framegen_invalidate_history(const char *) { g_framegenHistory.valid = false; }
+static void vulkan_framegen_invalidate_history(const char *reason) {
+    ++historyInvalidations;
+    historyInvalidationReason = reason;
+    g_framegenHistory.valid = false;
+}
 static void framegen_log_ladder_recovery_blocked(uint32_t,uint32_t) {}
 static void framegen_log_ladder_recovery(uint32_t,uint32_t,uint32_t) {}
 static bool framegen_submit_planned(const FramegenSlotRequest_t *requests,
@@ -197,6 +204,8 @@ static void setup(int64_t bias = 0)
     commitLeadOverride = 0;
     completionQueries = submitCalls = admissionSkips = 0;
     realEligibilityQueries = 0;
+    clockQueries = historyInvalidations = 0;
+    historyInvalidationReason = {};
     nextRealEligibleVBlankNs = 0;
     lastSkip = NetLearningSkip::NoSkip;
     submittedRequest = {};
@@ -444,6 +453,65 @@ static void guardAndLearningCases()
     }
 }
 
+static void idleHistoryCases()
+{
+    caseName = "idle history exact boundary and nonpositive age";
+    setup();
+    const uint64_t now = clockNs;
+    const struct { uint64_t presentNs; bool stale; } cases[] = {
+        {now-k_ulFramegenMaxRealFrameGapNs+1u, false},
+        {now-k_ulFramegenMaxRealFrameGapNs, false},
+        {now-k_ulFramegenMaxRealFrameGapNs-1u, true},
+        {now, false},
+        {now+1u, false},
+    };
+    for (const auto &row : cases) {
+        setup();
+        g_framegenHistory.currentPresentTimeNs = row.presentNs;
+        CHECK(framegen_causal_submit(1u,false) == !row.stale);
+        CHECK(g_framegenHistory.valid == !row.stale);
+        CHECK(historyInvalidations == (row.stale ? 1u : 0u));
+        if (row.stale) {
+            CHECK(historyInvalidationReason == "idle_frame_gap");
+            CHECK(clockQueries == 1u);
+            CHECK(completionQueries == 1u);
+            CHECK(timer.queries == 0u);
+            CHECK(realEligibilityQueries == 0u);
+            CHECK(g_device.reads.empty());
+            CHECK(submitCalls == 0u);
+            CHECK(g_framegenHistory.ulLastPlannedTargetNs == 0u);
+            CHECK(!framegen_causal_submit(1u,false));
+            CHECK(historyInvalidations == 1u);
+            CHECK(completionQueries == 1u);
+            CHECK(clockQueries == 1u);
+            CHECK(timer.queries == 0u);
+        } else {
+            CHECK(historyInvalidationReason.empty());
+            CHECK(submitCalls == 1u);
+        }
+    }
+}
+
+static void idleHistoryGuardCases()
+{
+    caseName = "stale history does not bypass pending and busy guards";
+    for (bool pending : {false,true}) {
+        setup();
+        g_framegenHistory.currentPresentTimeNs = clockNs-k_ulFramegenMaxRealFrameGapNs-1u;
+        if (pending) g_framegenHistory.pending.push_back({});
+        else completed = false;
+        CHECK(!framegen_causal_submit(1u,false));
+        CHECK(g_framegenHistory.valid);
+        CHECK(historyInvalidations == 0u);
+        CHECK(completionQueries == (pending ? 0u : 1u));
+        CHECK(clockQueries == 0u);
+        CHECK(timer.queries == 0u);
+        CHECK(realEligibilityQueries == 0u);
+        CHECK(g_device.reads.empty());
+        CHECK(submitCalls == 0u);
+    }
+}
+
 static AnchorCorrection_t prepareCorrection(int64_t bias, uint64_t cost,
     uint32_t samples = k_uDeadlineMinSamples)
 {
@@ -531,6 +599,8 @@ int main()
     nativeCases();
     realEligibilityCases();
     guardAndLearningCases();
+    idleHistoryCases();
+    idleHistoryGuardCases();
     correctionCases();
     recordedNegativeCases();
     std::printf("CPU production causal fragments: %u checks, %u failures\n",checks,failures);

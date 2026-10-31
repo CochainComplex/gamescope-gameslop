@@ -29,6 +29,8 @@ def between(source, start, end):
 def materialize(renderer, output):
     source = renderer.read_text()
     seams = {
+        'history_gap': ('static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = ',
+                        '// Dedicated-queue idle refill may extrapolate beyond the originally expected'),
         'config': ('static FramegenEffective_t framegen_effective_config( uint32_t nDegradeSteps )',
                    'static size_t framegen_bidir_pending_hard_capacity( uint32_t multiplier )'),
         'commit_plan': ('static gamescope::framegen::FixedRefreshCommitPlan_t\nframegen_plan_fixed_refresh_commit(',

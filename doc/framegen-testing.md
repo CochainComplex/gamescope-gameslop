@@ -79,7 +79,13 @@ production causal caller, cost selection, correction predicate and learning
 consumer with controlled CPU state, in normal and fast-math builds. It covers
 raw versus biased wake limits, exact cost boundaries, current/cheaper/recovered
 rungs, cold probes, lazy guards, native reservation controls and the 22 recorded
-negative-bias replacement cases. `tests/framegen_causal_admission.cpp` supplies
+negative-bias replacement cases. The idle-history cases use the selected
+renderer’s `k_ulFramegenMaxRealFrameGapNs` declaration, including its exact
+boundary and future/equal presentation timestamps. They verify that stale
+history returns before timer, eligibility and cost queries, while pending/busy
+work retains precedence over invalidation. The invalidation stub checks the
+reason and history-validity transition, not GPU-resource retirement.
+`tests/framegen_causal_admission.cpp` supplies
 external dependencies; it does not duplicate the production policies. Submission
 is stubbed and the request-to-pending deadline assignment is modeled, so this
 check does not establish GPU completion, display pacing or cross-device safety.
