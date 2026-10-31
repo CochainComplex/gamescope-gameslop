@@ -533,6 +533,21 @@ or `repowise generate --stale` for remaining selected model pages; reserve
 reconciliation. The full doctor checks SQL/vector/full-text synchronization and
 MCP startup; `--quick` omits those checks and cannot establish full synchronization.
 
+Keep updates and persistent rescoring serial. For SQLite writer contention,
+the supported `--no-cost-tracking` update option isolates cost-tracker writes;
+it skips historical cost rows for that run without changing repository settings.
+An open `serve` connection alone does not establish which writer caused a lock.
+If MCP says indexed uncommitted edits no longer exist after a commit, run a clean
+`repowise update --working-tree --docs --no-agents` to clear the recorded overlay and
+refresh its pages. A commit-only update preserves that overlay in Repowise 0.59.
+
+The installed 0.59 build's `reindex` also embeds tombstoned pages. When the full
+doctor identifies those vectors as orphaned, its supported `--repair` reconciles
+the stores; another reindex recreates them. Its coordinator count includes SQL
+tombstones even though the ID reconciliation excludes them, so the count can
+still report drift after the live IDs agree. Preserve that diagnostic evidence;
+do not delete archived pages or weaken checks to force a green result.
+
 In Repowise 0.59, the unfiltered default-table health recomputation persists its
 results; JSON or file-filtered recomputation only reports them. Verify stored
 health through MCP as well as CLI output, including the analyzed revision and
