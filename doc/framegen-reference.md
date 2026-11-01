@@ -147,6 +147,14 @@ bound. Display targets and interpolation phase retain their bias; native KMS
 commit reservations keep their separate timing policy. The debug causal-slot
 `wake=` value reports the admission bound, not the display target or completion.
 
+A cached Checked correction on a nested output keeps its completed provisional
+frame owned until replacement submission succeeds. After command-buffer closure,
+the replacement must still fit the same measured-cost budget. Cancellation or
+output-pool failure retains the original pixels, phase and target; an invalidated
+history is never restored. This check does not guarantee against delay inside
+driver submission, GPU queueing or completion signalling. Other pipelines and
+native presentation retain their existing correction path.
+
 The source's fixed-refresh FPS gate also determines whether a real frame can
 use an opportunity. A ready FIFO buffer held by that gate does not suppress an
 earlier generated backup. The compositor supplies a fresh hint for the exact

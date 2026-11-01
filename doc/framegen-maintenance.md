@@ -98,6 +98,14 @@ owner with a proven lifetime. Splitting tightly coupled dispatch helpers merely
 to reduce line count is not an architectural improvement and can hide ordering
 or ownership bugs.
 
+`trySubmitFramegenBefore` closes a dedicated-queue cached correction before its
+final budget check. A zero result owns no signal value or query association;
+the renderer must return before publishing GPU-read pins or pending output.
+The correction owner retains the original completed pixels during recording.
+Cancellation restores them only while source/history/grid identity still agrees.
+Keep their baked phase and target; general recording cancellation also needs an
+audit of motion, learning and reservoir publication.
+
 `evaluate_deadline_ladder` drains a nonzero hold and returns before checking
 cost maturity or rung limits. The decision that drains the hold to zero still
 cannot degrade; only the next decision may do so. The renderer keeps the

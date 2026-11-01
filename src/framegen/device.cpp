@@ -1,6 +1,8 @@
 // Frame-generation queue submission and timestamp accounting.
 
 #include "../rendervulkan.hpp"
+#include "../steamcompmgr.hpp"
+#include "deadline.hpp"
 #include "query_ring.hpp"
 
 #include <algorithm>
@@ -41,7 +43,43 @@ uint64_t CVulkanDevice::submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf
 
 	CVulkanCmdBuffer *pRaw = cmdBuffer.get();
 	pRaw->end();
+	return submitFramegenCommands( std::move( cmdBuffer ), ulWaitCompositeSeqNo,
+		nQuerySlot, nLadderRung, nGeneratedCount, bOnlineTraining );
+}
 
+uint64_t CVulkanDevice::trySubmitFramegenBefore( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer,
+	uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung,
+	uint32_t nGeneratedCount, bool bOnlineTraining, uint64_t ulDeadlineNs, uint64_t ulCostNs )
+{
+	if ( !m_bHasFramegenQueue || ulDeadlineNs == 0u || ulCostNs == 0u )
+		return 0u;
+
+	// end() records the final flush barrier too. Include that CPU work in the
+	// admission check; cancellation never allocates a signal value or publishes
+	// a timestamp association. The original completed pixels remain owned by
+	// the caller until this submission succeeds.
+	cmdBuffer->end();
+	if ( !gamescope::framegen::deadline_cost_fits(
+		ulCostNs, ulDeadlineNs, get_time_in_nanos(), 0u ) )
+	{
+		// No GPU work owns this recording. Reuse the existing pool instead of
+		// freeing it and allocating a new command buffer on the next attempt.
+		cmdBuffer->reset();
+		if ( framegenFamilySplit() )
+			m_unusedFramegenCmdBufs.push_back( std::move( cmdBuffer ) );
+		else
+			m_unusedCmdBufs.push_back( std::move( cmdBuffer ) );
+		return 0u;
+	}
+	return submitFramegenCommands( std::move( cmdBuffer ), ulWaitCompositeSeqNo,
+		nQuerySlot, nLadderRung, nGeneratedCount, bOnlineTraining );
+}
+
+uint64_t CVulkanDevice::submitFramegenCommands( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer,
+	uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung,
+	uint32_t nGeneratedCount, bool bOnlineTraining )
+{
+	CVulkanCmdBuffer *pRaw = cmdBuffer.get();
 	const uint64_t nextSeqNo = ++m_framegenSeqNo;
 
 	VkSemaphore waitSemaphores[1] = { m_scratchTimelineSemaphore };

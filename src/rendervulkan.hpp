@@ -1161,6 +1161,10 @@ public:
 	// available they transparently forward to the shared composite path.
 	bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
 	uint64_t submitFramegen( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot = -1, uint32_t nLadderRung = 0, uint32_t nGeneratedCount = 0, bool bOnlineTraining = false );
+	// Dedicated-queue cached correction only. Close the recording, then admit
+	// against the remaining measured budget. Zero publishes no submission or
+	// timeline/query association; budget-expired recordings are reset/recycled.
+	uint64_t trySubmitFramegenBefore( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount, bool bOnlineTraining, uint64_t ulDeadlineNs, uint64_t ulCostNs );
 	void addFramegenDependency( CVulkanCmdBuffer *pCmdBuffer, uint64_t ulFramegenSeqNo );
 	bool hasCompletedFramegen( uint64_t sequence );
 	void waitFramegen( uint64_t sequence );
@@ -1482,6 +1486,9 @@ protected:
 	uint64_t m_ulStagingCopyMaxNs = 0;
 
 private:
+	// Dedicated queue only; cmdBuf has already been ended exactly once.
+	// Keep the ordinary submit path free of an extra call/ownership wrapper.
+	inline __attribute__((always_inline)) uint64_t submitFramegenCommands( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount, bool bOnlineTraining );
 	std::vector<VkExtensionProperties> m_supportedExts;
 	std::jthread m_pipelineThread;
 };

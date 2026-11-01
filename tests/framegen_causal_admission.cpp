@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <tuple>
@@ -63,19 +64,28 @@ static struct Backend {
 static Backend *GetBackend() { return &backend; }
 
 struct FramegenHistory_t {
+    struct TextureIdentity {
+        void *pointer = nullptr;
+        void *get() const { return pointer; }
+        operator void *() const { return pointer; }
+        TextureIdentity &operator=(void *value) { pointer = value; return *this; }
+    };
     struct PendingGenerated_t {
         bool bReal = false;
         uint64_t ulAnchorRealFrameId = 42u;
         bool bProvisional = true;
         std::optional<uint64_t> oTargetVBlankNs;
         uint64_t ulWakeDeadlineNs = 0;
+        std::shared_ptr<int> tex;
+        uint64_t seqNo = 0, frameId = 42u, ulSlotId = 0, ulTargetFlipNs = 0;
+        float phase = 0.0f;
     };
     bool valid = true, bCadenceUsesSourceTime = true, bCausalDeadlineMissed = false;
-    void *previousReal = nullptr, *currentReal = nullptr;
+    TextureIdentity previousReal, currentReal;
     uint64_t currentPresentTimeNs = R, currentFrameId = 42u;
     uint64_t ulLastBaseCommitID = 42u;
     uint64_t ulDeadlineGridIntervalNs = T, ulDeadlineGridEpoch = 1u;
-    uint64_t ulLastPlannedTargetNs = 0, lastCompositeSeqNo = 1u;
+    uint64_t ulLastPlannedTargetNs = 0, lastCompositeSeqNo = 1u, lastFramegenWorkSeqNo = 0;
     uint32_t nDegradeSteps = 0, nDegradeHold = 0, drmFormat = 0;
     RealAnchorState_t causalAnchor;
     CadencePredictorState cadence;
@@ -98,6 +108,18 @@ static const FramegenDispatch_t &framegen_dispatch_for_format(uint32_t) { return
 static bool motionAvailable = true;
 static void *framegen_motion_field() { return motionAvailable ? &dispatch : nullptr; }
 
+static uint64_t clockNs = 0, recordAdvanceNs = 0, closeAdvanceNs = 0;
+static unsigned closedCommands = 0, destroyedCommands = 0, physicalSubmits = 0;
+static unsigned resetCommands = 0, allocatedCommands = 0;
+static uint64_t get_time_in_nanos();
+struct CVulkanCmdBuffer {
+    std::shared_ptr<int> lease;
+    CVulkanCmdBuffer() { ++allocatedCommands; }
+    void end() { ++closedCommands; clockNs += closeAdvanceNs; }
+    void reset() { ++resetCommands; lease.reset(); }
+    ~CVulkanCmdBuffer() { ++destroyedCommands; }
+};
+
 struct CVulkanDevice {
     static constexpr uint32_t kFramegenLadderSlots = 8u;
     std::array<std::array<LadderRungCost_t, 3>, kFramegenLadderSlots> costs = {};
@@ -109,12 +131,41 @@ struct CVulkanDevice {
     uint32_t framegenRungSampleCount(uint32_t rung, uint32_t key) {
         return costs.at(rung).at(key).samples;
     }
+    bool m_bHasFramegenQueue = true;
+    bool hasFramegenQueue() const { return m_bHasFramegenQueue; }
+    uint64_t m_framegenSeqNo = 0;
+    std::vector<std::unique_ptr<CVulkanCmdBuffer>> commands;
+    std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedFramegenCmdBufs, m_unusedCmdBufs;
+    bool split = true;
+    bool framegenFamilySplit() const { return split; }
+    std::unique_ptr<CVulkanCmdBuffer> commandBuffer() {
+        auto &unused = split ? m_unusedFramegenCmdBufs : m_unusedCmdBufs;
+        if (unused.empty()) return std::make_unique<CVulkanCmdBuffer>();
+        auto result = std::move(unused.back());
+        unused.pop_back();
+        return result;
+    }
+    uint64_t submitFramegenCommands(std::unique_ptr<CVulkanCmdBuffer> command,
+        uint64_t, int, uint32_t, uint32_t, bool) {
+        ++physicalSubmits;
+        commands.push_back(std::move(command));
+        return ++m_framegenSeqNo;
+    }
+    uint64_t submitFramegen(std::unique_ptr<CVulkanCmdBuffer> command,
+        uint64_t wait, int slot, uint32_t rung, uint32_t count, bool training) {
+        command->end();
+        return submitFramegenCommands(std::move(command),wait,slot,rung,count,training);
+    }
+    uint64_t trySubmitFramegenBefore(std::unique_ptr<CVulkanCmdBuffer> cmdBuffer,
+        uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung,
+        uint32_t nGeneratedCount, bool bOnlineTraining,
+        uint64_t ulDeadlineNs, uint64_t ulCostNs);
 } g_device;
 static struct Logger { template<class... Args> void infof(const char *, Args...) {} } vk_log;
 static bool FramegenDebugShouldLog(uint64_t &) { return false; }
 static bool enabled = true, causal = true, vrr = false, bidir = false, recoverEnabled = true;
 static bool completed = true, submitSuccess = true;
-static uint64_t clockNs = 0, commitLeadOverride = 0;
+static uint64_t commitLeadOverride = 0;
 static unsigned completionQueries = 0, submitCalls = 0, admissionSkips = 0;
 static unsigned realEligibilityQueries = 0;
 static unsigned clockQueries = 0, historyInvalidations = 0;
@@ -123,6 +174,12 @@ static uint64_t nextRealEligibleVBlankNs = 0;
 static NetLearningSkip lastSkip = NetLearningSkip::NoSkip;
 static FramegenSlotRequest_t submittedRequest = {};
 static FramegenEffective_t submittedEffective = {};
+static bool publishPending = false, outputAvailable = true, invalidateDuringRecord = false;
+static bool expectRetainedOwnership = false;
+static bool recordedCached = true;
+static unsigned replaceSourceDuringRecord = 0;
+static unsigned discarded = 0;
+static std::shared_ptr<int> originalTexture;
 static bool vulkan_framegen_is_enabled() { return enabled; }
 static bool framegen_causal_deadline_enabled() { return causal; }
 static bool vulkan_framegen_vrr_hybrid_active() { return vrr; }
@@ -144,6 +201,7 @@ static uint64_t framegen_predicted_interval_ns() {
 }
 static void framegen_net_note_skip(NetLearningSkip skip) { lastSkip = skip; }
 static void framegen_metrics_note_admission_skip() { ++admissionSkips; }
+static void framegen_metrics_note_discard(size_t count) { discarded += count; }
 static void vulkan_framegen_invalidate_history(const char *reason) {
     ++historyInvalidations;
     historyInvalidationReason = reason;
@@ -151,9 +209,23 @@ static void vulkan_framegen_invalidate_history(const char *reason) {
 }
 static void framegen_log_ladder_recovery_blocked(uint32_t,uint32_t) {}
 static void framegen_log_ladder_recovery(uint32_t,uint32_t,uint32_t) {}
+#include "device_scope.inc"
+#ifdef HAS_BOUNDED_SUBMIT
+#include "device_before.inc"
+#else
+uint64_t CVulkanDevice::trySubmitFramegenBefore(std::unique_ptr<CVulkanCmdBuffer> cmdBuffer,
+    uint64_t, int, uint32_t, uint32_t, bool, uint64_t, uint64_t)
+{
+#include "device_before.inc"
+    ++physicalSubmits;
+    commands.push_back(std::move(cmdBuffer));
+    return nextSeqNo;
+}
+#endif
 static bool framegen_submit_planned(const FramegenSlotRequest_t *requests,
     uint32_t count, uint32_t, const FramegenEffective_t &effective,
-    uint64_t, uint32_t, bool clear, void *, uint64_t target, bool keyed)
+    uint64_t composite, uint32_t, bool clear, void *, uint64_t target, bool keyed,
+    uint64_t = 0u, bool = false, bool boundedCorrection = false)
 {
     ++submitCalls;
     CHECK(count == 1u);
@@ -162,6 +234,53 @@ static bool framegen_submit_planned(const FramegenSlotRequest_t *requests,
     CHECK(target == requests[0].targetFlipNs);
     submittedRequest = requests[0];
     submittedEffective = effective;
+    if (publishPending) {
+        // Only external recording/device effects are faked. The caller,
+        // transaction and end-before-deadline guard come from production.
+        if (expectRetainedOwnership) CHECK(originalTexture.use_count() >= 2);
+        [[maybe_unused]] const bool bBoundCorrection = boundedCorrection;
+        if (invalidateDuringRecord) {
+            vulkan_framegen_invalidate_history("test_record_invalidation");
+        }
+        if (replaceSourceDuringRecord == 1u) g_framegenHistory.previousReal = &dispatch;
+        if (replaceSourceDuringRecord == 2u) g_framegenHistory.currentReal = &dispatch;
+        if (replaceSourceDuringRecord == 3u) g_framegenHistory.currentReal = nullptr;
+#ifdef HAS_BOUNDED_SUBMIT
+#include "history_guard.inc"
+#else
+        // Baseline recording is opaque. Return an external failure for these
+        // rollback cases instead of executing invalid Vulkan/history states.
+        if (invalidateDuringRecord || replaceSourceDuringRecord) return false;
+#endif
+        if (!outputAvailable || !submitSuccess) return false;
+        auto pCmdBuffer = g_device.commandBuffer();
+        clockNs += recordAdvanceNs;
+        const auto *pRequests = requests;
+        const auto &eff = effective;
+#ifdef HAS_BOUNDED_SUBMIT
+        const bool bReuseMotion = recordedCached, bBidir = bidir, bClearPending = clear;
+        const bool bDeadlineCostKeying = keyed;
+        const uint32_t nRequestCount = count;
+        void *pColorProbe = nullptr;
+        const auto eDeadlineWorkClass = bReuseMotion ? DeadlineWorkClass_t::CachedWarp
+                                                   : DeadlineWorkClass_t::FullPreparationAndWarp;
+#include "record_guard.inc"
+#else
+        (void)pRequests;
+        (void)eff;
+#endif
+        const uint64_t ulWaitCompositeSeqNo = composite;
+        const int nQuerySlot = 0;
+        const uint32_t nCostKey = 2;
+        const bool bNetStateReadback = false, bAdaptProbe = false;
+#include "submit_boundary.inc"
+        auto &entry = g_framegenHistory.pending.emplace_back();
+        entry.seqNo = ulSeqNo;
+        entry.tex = std::make_shared<int>(9);
+        entry.bProvisional = false;
+        entry.phase = requests[0].phase;
+        entry.ulTargetFlipNs = target;
+    }
     return submitSuccess;
 }
 
@@ -171,8 +290,18 @@ static bool framegen_submit_planned(const FramegenSlotRequest_t *requests,
 #include "recovery_capacity.inc"
 #include "recovery_degradation.inc"
 #include "selector.inc"
+#include "caller_decl.inc"
 #include "caller.inc"
 #include "learning_deadline.inc"
+#include "correction_policy.inc"
+#include "replacement.inc"
+
+static void runCorrectionTransaction(const AnchorCorrection_t &correction)
+{
+    const uint64_t ulArrivalGuardNs = cadence_arrival_guard_ns(g_framegenHistory.ulDeadlineGridIntervalNs);
+    struct { struct { uint64_t ulRealFrameId = 42u; } tag; } feedback;
+#include "transaction.inc"
+}
 
 static size_t runCorrection(const AnchorCorrection_t &correction)
 {
@@ -196,9 +325,19 @@ static void setup(int64_t bias = 0)
     g_framegenMotion = {};
     dispatch = {};
     g_device = {};
+    originalTexture.reset();
+    publishPending = invalidateDuringRecord = expectRetainedOwnership = false;
+    outputAvailable = true;
+    recordedCached = true;
+    replaceSourceDuringRecord = 0;
+    recordAdvanceNs = closeAdvanceNs = 0;
+    closedCommands = destroyedCommands = physicalSubmits = discarded = 0;
+    resetCommands = allocatedCommands = 0;
     timer = {};
     backend = {};
     enabled = causal = completed = submitSuccess = recoverEnabled = motionAvailable = true;
+    g_eFramegenMode = GamescopeFramegenMode::Motion;
+    g_eFramegenPipeline = GamescopeFramegenPipeline::Checked;
     vrr = bidir = false;
     clockNs = R+T-wakeLead-1'000'000u;
     commitLeadOverride = 0;
@@ -591,6 +730,206 @@ static void recordedNegativeCases()
     }
 }
 
+static auto pendingKey(const FramegenHistory_t::PendingGenerated_t &entry)
+{
+    return std::tuple(entry.tex.get(),entry.seqNo,entry.frameId,entry.ulSlotId,
+        entry.ulAnchorRealFrameId,entry.bProvisional,entry.phase,
+        entry.ulTargetFlipNs,entry.oTargetVBlankNs,entry.ulWakeDeadlineNs);
+}
+
+static AnchorCorrection_t prepareTransaction()
+{
+    auto correction = prepareCorrection(0,80'000u);
+    g_framegenMotion.uMotionFieldFrameId = g_framegenHistory.currentFrameId;
+    g_framegenHistory.causalAnchor.correctedFlipNs = R;
+    correction.anchor = g_framegenHistory.causalAnchor;
+    originalTexture = std::make_shared<int>(7);
+    auto &entry = g_framegenHistory.pending.front();
+    entry.tex = originalTexture;
+    entry.seqNo = 77u;
+    entry.ulSlotId = 19u;
+    entry.ulTargetFlipNs = R+T;
+    entry.ulWakeDeadlineNs = R+T-wakeLead;
+    entry.phase = 0.375f;
+    g_framegenHistory.ulLastPlannedTargetNs = R+T;
+    publishPending = expectRetainedOwnership = true;
+    return correction;
+}
+
+static void correctionTransactionCases()
+{
+    caseName = "recording or final command closure consumes replacement budget";
+    for (bool duringClose : {false,true}) {
+        const auto correction = prepareTransaction();
+        const auto original = pendingKey(g_framegenHistory.pending.front());
+        if (duringClose) {
+            g_framegenHistory.recovery = {7u,3u,2u,11u,true};
+            g_framegenHistory.nDegradeHold = 4u;
+            g_framegenHistory.causalDeadlineMisses.recentMisses = 2u;
+        }
+        const auto recovery = recoveryKey(g_framegenHistory.recovery);
+        const uint32_t hold = g_framegenHistory.nDegradeHold;
+        const uint32_t misses = g_framegenHistory.causalDeadlineMisses.recentMisses;
+        const uint64_t planned = g_framegenHistory.ulLastPlannedTargetNs;
+        (duringClose ? closeAdvanceNs : recordAdvanceNs) = 1'000'001u;
+        runCorrectionTransaction(correction);
+        CHECK(physicalSubmits == 0u);
+        CHECK(g_device.m_framegenSeqNo == 0u);
+        CHECK(g_framegenHistory.lastFramegenWorkSeqNo == 0u);
+        CHECK(g_device.commands.empty());
+        CHECK(destroyedCommands == 0u);
+        CHECK(resetCommands == 1u);
+        CHECK(g_device.m_unusedFramegenCmdBufs.size() == 1u);
+        CHECK(g_framegenHistory.pending.size() == 1u);
+        if (!g_framegenHistory.pending.empty()) CHECK(pendingKey(g_framegenHistory.pending.front()) == original);
+        CHECK(g_framegenHistory.ulLastPlannedTargetNs == planned);
+        CHECK(recoveryKey(g_framegenHistory.recovery) == recovery);
+        CHECK(g_framegenHistory.nDegradeHold == hold);
+        CHECK(g_framegenHistory.causalDeadlineMisses.recentMisses == misses);
+        CHECK(discarded == 0u);
+    }
+    caseName = "successful cached correction publishes one replacement";
+    auto correction = prepareTransaction();
+    recordAdvanceNs = closeAdvanceNs = 50'000u;
+    runCorrectionTransaction(correction);
+    CHECK(physicalSubmits == 1u);
+    CHECK(closedCommands == 1u);
+    CHECK(g_device.m_framegenSeqNo == 1u);
+    CHECK(g_framegenHistory.pending.size() == 1u);
+    CHECK(!g_framegenHistory.pending.front().bProvisional);
+    CHECK(g_framegenHistory.pending.front().tex != originalTexture);
+    CHECK(originalTexture.use_count() == 1);
+    CHECK(discarded == 1u);
+
+    caseName = "output pool failure retains completed original";
+    correction = prepareTransaction();
+    const auto original = pendingKey(g_framegenHistory.pending.front());
+    outputAvailable = false;
+    runCorrectionTransaction(correction);
+    CHECK(physicalSubmits == 0u);
+    CHECK(closedCommands == 0u);
+    CHECK(g_framegenHistory.pending.size() == 1u);
+    if (!g_framegenHistory.pending.empty()) CHECK(pendingKey(g_framegenHistory.pending.front()) == original);
+    CHECK(discarded == 0u);
+
+    caseName = "actual recording shape changed before command preparation";
+    correction = prepareTransaction();
+    recordedCached = false;
+    runCorrectionTransaction(correction);
+    CHECK(physicalSubmits == 0u);
+    CHECK(closedCommands == 0u);
+    CHECK(g_framegenHistory.pending.size() == 1u);
+    CHECK(g_framegenHistory.pending.front().seqNo == 77u);
+
+    caseName = "invalidation during preparation never resurrects old pixels";
+    correction = prepareTransaction();
+    invalidateDuringRecord = true;
+    runCorrectionTransaction(correction);
+    CHECK(!g_framegenHistory.valid);
+    CHECK(g_framegenHistory.pending.empty());
+    CHECK(physicalSubmits == 0u);
+
+    caseName = "source identity change cannot restore an obsolete pending frame";
+    for (unsigned identity : {1u,2u,3u}) {
+        correction = prepareTransaction();
+        replaceSourceDuringRecord = identity;
+        outputAvailable = false;
+        runCorrectionTransaction(correction);
+        CHECK(g_framegenHistory.valid);
+        CHECK(g_framegenHistory.pending.empty());
+        CHECK(physicalSubmits == 0u);
+        CHECK(closedCommands == 0u);
+    }
+
+    caseName = "selected non-cached rung aborts without consuming prior miss";
+    correction = prepareTransaction();
+    g_framegenHistory.bCausalDeadlineMissed = true;
+    runCorrectionTransaction(correction);
+    CHECK(g_framegenHistory.bCausalDeadlineMissed);
+    CHECK(g_framegenHistory.nDegradeSteps == 0u);
+    CHECK(g_framegenHistory.nDegradeHold == 0u);
+    CHECK(g_framegenHistory.pending.size() == 1u);
+    CHECK(g_framegenHistory.pending.front().seqNo == 77u);
+    CHECK(physicalSubmits == 0u);
+
+    caseName = "busy prior batch leaves ownership untouched";
+    correction = prepareTransaction();
+    completed = false;
+    runCorrectionTransaction(correction);
+    CHECK(submitCalls == 0u);
+    CHECK(g_framegenHistory.pending.front().seqNo == 77u);
+
+    caseName = "other correction paths retain their existing unbounded route";
+    for (unsigned variant=0; variant<5; ++variant) {
+        correction = prepareTransaction();
+        expectRetainedOwnership = false;
+        if (variant==0) { backend.native = true; g_framegenHistory.pending.front().oTargetVBlankNs.reset(); }
+        if (variant==1) g_eFramegenPipeline = GamescopeFramegenPipeline::Guided;
+        if (variant==2) g_framegenMotion.uMotionFieldFrameId = 0u;
+        if (variant==3) g_device.m_bHasFramegenQueue = false;
+        if (variant==4) g_eFramegenMode = GamescopeFramegenMode::Blend;
+        runCorrectionTransaction(correction);
+        CHECK(physicalSubmits == 1u);
+        CHECK(discarded == 1u);
+        CHECK(!g_framegenHistory.pending.front().bProvisional);
+    }
+    // setup resets globals which these explicit unsupported-mode cases changed.
+    g_eFramegenPipeline = GamescopeFramegenPipeline::Checked;
+    g_eFramegenMode = GamescopeFramegenMode::Motion;
+
+}
+
+static void boundedSubmissionCases()
+{
+    caseName = "device deadline equality and one-nanosecond cost boundary";
+    for (uint64_t cost : {85'000u,85'001u}) {
+        setup();
+        const uint64_t deadline = clockNs+200'000u;
+        closeAdvanceNs = 100'000u;
+        const auto seq = g_device.trySubmitFramegenBefore(std::make_unique<CVulkanCmdBuffer>(),1,0,0,2,false,deadline,cost);
+        CHECK((seq != 0u) == (cost == 85'000u));
+        CHECK(physicalSubmits == (cost == 85'000u ? 1u : 0u));
+        CHECK(g_device.m_framegenSeqNo == physicalSubmits);
+        CHECK(closedCommands == 1u);
+    }
+    caseName = "bounded submission rejects missing prerequisites before closure";
+    for (unsigned variant=0; variant<3; ++variant) {
+        setup();
+        uint64_t deadline = clockNs+1'000'000u, cost = 80'000u;
+        if (variant==0) g_device.m_bHasFramegenQueue = false;
+        if (variant==1) deadline = 0u;
+        if (variant==2) cost = 0u;
+        CHECK(g_device.trySubmitFramegenBefore(std::make_unique<CVulkanCmdBuffer>(),1,0,0,2,false,deadline,cost) == 0u);
+        CHECK(closedCommands == 0u);
+        CHECK(physicalSubmits == 0u);
+        CHECK(g_device.m_framegenSeqNo == 0u);
+    }
+    caseName = "repeated cancellation reuses the matching pool without allocation";
+    for (bool split : {false,true}) {
+        setup();
+        g_device.split = split;
+        CVulkanCmdBuffer *identity = nullptr;
+        for (unsigned attempt=0; attempt<4; ++attempt) {
+            auto command = g_device.commandBuffer();
+            CHECK(!command->lease);
+            auto lease = std::make_shared<int>(1);
+            command->lease = lease;
+            if (!identity) identity = command.get();
+            CHECK(command.get() == identity);
+            const auto seq = g_device.trySubmitFramegenBefore(std::move(command),1,0,0,2,false,clockNs,80'000u);
+            CHECK(seq == 0u);
+            CHECK(physicalSubmits == 0u);
+            CHECK(g_device.m_framegenSeqNo == 0u);
+            CHECK(lease.use_count() == 1);
+        }
+        CHECK(resetCommands == 4u);
+        CHECK(destroyedCommands == 0u);
+        CHECK(allocatedCommands == 1u);
+        CHECK(g_device.m_unusedFramegenCmdBufs.size() == (split ? 1u : 0u));
+        CHECK(g_device.m_unusedCmdBufs.size() == (split ? 0u : 1u));
+    }
+}
+
 int main()
 {
     positiveAndBoundaryCases();
@@ -603,6 +942,8 @@ int main()
     idleHistoryGuardCases();
     correctionCases();
     recordedNegativeCases();
+    correctionTransactionCases();
+    boundedSubmissionCases();
     std::printf("CPU production causal fragments: %u checks, %u failures\n",checks,failures);
     return failures ? 1 : 0;
 }

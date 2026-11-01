@@ -87,8 +87,14 @@ work retains precedence over invalidation. The invalidation stub checks the
 reason and history-validity transition, not GPU-resource retirement.
 `tests/framegen_causal_admission.cpp` supplies
 external dependencies; it does not duplicate the production policies. Submission
-is stubbed and the request-to-pending deadline assignment is modeled, so this
-check does not establish GPU completion, display pacing or cross-device safety.
+recording effects and the request-to-pending deadline assignment are modeled.
+The correction transaction, actual recording-shape guard, zero-submission
+publication boundary and device closure/deadline guard execute from source.
+Controlled recording/closure delays test cancellation, retained frame identity
+and ownership, exact budget boundaries, pool failure, source invalidation and
+controller rollback, including same-pool command-buffer reuse after cancellation.
+These CPU fixtures do not prove Vulkan resource retirement,
+GPU queue timing, display pacing or cross-device safety.
 
 `meson test -C build framegen_real_admission --print-errorlogs` executes the
 compositor's real-admission owner and existing FPS gate with CPU focus/window
@@ -142,6 +148,36 @@ reverse pair, so tail-latency improvement is not established. Native DRM/VRR/HDR
 mixed-device behavior, physical input latency and visual quality remain untested.
 Both candidate captures retain settling outliers in window 3 (SD 2.267/1.910 ms
 and 51/25 discards); that window remains included in every reported comparison.
+
+The 2026-11-01 correction transaction passed all 111 Meson tests, including
+731 CPU assertions in each normal/fast-math fixture. Against the saved pre-change
+renderer and device, the expanded fixture fails 97 new assertions per mode.
+GCC coverage measures extracted production fragments only; it does not establish
+whole-renderer coverage or GPU synchronization correctness.
+
+Matched 40-second AB/BA controls against `7ac64a23992d` used AMD 890M/RADV
+Mesa 25.2.8, the same warm 349-file cache, nested 640x480, a 500x500 client,
+app-30/output-60, Checked 2x and four-image FIFO. All four normal captures and
+four separate 12-second validation captures passed their original and all-role
+gates. Each normal capture's predeclared windows 3–7 contains 750 real and
+750 generated frames with zero repeat, discard, slow or late-generated counts;
+window 8 is likewise clean. Startup and partial tails remain included in totals:
+
+| Order | Arm | Whole-run repeat / slow counts | Steady window SD range, ms | Whole-run CPU present-wait p99, ms |
+|---|---|---|---|---|
+| Baseline, candidate | Baseline | 7 / 1 | 0.023–0.049 | 33.304 |
+| Baseline, candidate | Candidate | 6 / 0 | 0.031–0.074 | 33.424 |
+| Candidate, baseline | Candidate | 7 / 0 | 0.025–0.122 | 33.340 |
+| Candidate, baseline | Baseline | 12 / 0 | 0.017–0.053 | 33.374 |
+
+Candidate startup feedback intervals still reach about 50 ms; its second run
+also has an 18.106 ms steady maximum interval. These trials establish neither a
+general pacing cure nor statistical performance equivalence. Present-wait values
+are nearest-rank CPU call durations, not physical/input latency. A separate
+forced-expiry validation probe observed 15 cancellations and reuse of three
+actual command-buffer handles (4/3/8 times); its synthetic deadline and logging
+exclude it from timing comparisons. Native DRM/VRR/HDR, other GPUs, visual
+quality and post-submission readiness misses remain unverified by this campaign.
 
 `GAMESCOPE_LOCAL_PREFIX` is the directory holding your locally built
 dependencies (the prefix that `scripts/env-gamescope-local.sh` puts on the

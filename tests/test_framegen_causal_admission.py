@@ -26,7 +26,7 @@ def between(source, start, end):
     return begin, source[begin:finish]
 
 
-def materialize(renderer, output):
+def materialize(renderer, output, device):
     source = renderer.read_text()
     seams = {
         'history_gap': ('static constexpr uint64_t k_ulFramegenMaxRealFrameGapNs = ',
@@ -44,6 +44,8 @@ def materialize(renderer, output):
         'selector': ('static gamescope::framegen::DeadlineWorkClass_t framegen_causal_work_class(',
                      'static void framegen_record_causal_anchor('),
         'caller': ('static uint64_t framegen_nested_slot_wake_ns(',
+                   'static bool framegen_provisional_slot_replaceable('
+                   if 'static bool framegen_provisional_slot_replaceable(' in source else
                    'static void framegen_apply_live_flip_feedback( const DisplayFeedback_t &feedback )\n{'),
         'learning_deadline': ('static uint64_t framegen_learning_deadline()\n{',
                               'struct FramegenLearningRecording\n'),
@@ -63,7 +65,66 @@ def materialize(renderer, output):
     callback_start = source.index(callback_definition)
     callback_end = source.index('// VRR hybrid slot.', callback_start)
     callback = source[callback_start:callback_end]
-    begin, body = between(callback, '\t\tstd::erase_if( g_framegenHistory.pending,',
+    # Exercise the whole correction/submit transaction, including its final
+    # replan, with controlled recording and queue effects in the fixture.
+    begin, body = between(callback, '\tif ( correction.discardProvisional )', '\n}\n')
+    line = source.count('\n', 0, callback_start+begin) + 1
+    (output/'transaction.inc').write_text(f'#line {line} "{renderer}"\n'+body+'\n')
+    provenance['transaction'] = {'source': str(renderer), 'line': line,
+                                 'sha256': hashlib.sha256(body.encode()).hexdigest()}
+    for name, start, end in (
+        ('correction_policy', 'static bool framegen_provisional_slot_replaceable(',
+         'static std::optional<size_t> framegen_try_corrected_replacement('),
+        ('replacement', 'static std::optional<size_t> framegen_try_corrected_replacement(',
+         callback_definition),
+    ):
+        body = ''
+        if start in source:
+            begin, body = between(source, start, end)
+            line = source.count('\n', 0, begin) + 1
+            provenance[name] = {'source': str(renderer), 'line': line,
+                                'sha256': hashlib.sha256(body.encode()).hexdigest()}
+            body = f'#line {line} "{renderer}"\n'+body
+        (output/(name+'.inc')).write_text(body+'\n')
+    declaration = next(line for line in source.splitlines()
+                       if line.startswith('static bool framegen_causal_submit(') and line.endswith(';'))
+    (output/'caller_decl.inc').write_text(declaration+'\n')
+    device_source = device.read_text()
+    device_start = 'uint64_t CVulkanDevice::trySubmitFramegenBefore('
+    (output/'device_scope.inc').write_text(
+        '#define HAS_BOUNDED_SUBMIT 1\n' if device_start in device_source else '')
+    if device_start in device_source:
+        begin, body = between(device_source, device_start,
+                              'uint64_t CVulkanDevice::submitFramegenCommands(')
+    else:
+        # The baseline's actual dedicated-queue preparation already allocates
+        # its sequence after end(). Supply only fake queue effects afterwards.
+        begin, body = between(device_source, '\tCVulkanCmdBuffer *pRaw = cmdBuffer.get();',
+                              '\n\tVkSemaphore waitSemaphores[1]')
+    line = device_source.count('\n', 0, begin) + 1
+    (output/'device_before.inc').write_text(f'#line {line} "{device}"\n'+body+'\n')
+    provenance['device_before'] = {'source': str(device),
+                                  'sha256': hashlib.sha256(body.encode()).hexdigest()}
+    start = '\t// Only this already-prepared shape has a cancellation boundary'
+    body = ''
+    if start in source:
+        begin, body = between(source, start, '\tconst int nQuerySlot = !bReuseMotion')
+        body = f'#line {source.count(chr(10),0,begin)+1} "{renderer}"\n'+body
+    (output/'record_guard.inc').write_text(body+'\n')
+    start = '\tif ( bBoundCorrection && ( !g_framegenHistory.valid\n'
+    body = ''
+    if start in source:
+        begin, body = between(source, start, '\n\tif ( bClearPending )')
+        body = f'#line {source.count(chr(10),0,begin)+1} "{renderer}"\n'+body
+    (output/'history_guard.inc').write_text(body+'\n')
+    start = ('\tconst uint64_t ulSeqNo = bBoundCorrection' if
+             '\tconst uint64_t ulSeqNo = bBoundCorrection' in source else
+             '\tconst uint64_t ulSeqNo = g_device.submitFramegen( std::move( pCmdBuffer ),')
+    begin, body = between(source, start, '\tconst uint64_t ulSubmitNs = get_time_in_nanos();')
+    (output/'submit_boundary.inc').write_text(f'#line {source.count(chr(10),0,begin)+1} "{renderer}"\n'+body+'\n')
+    provenance['submit_boundary'] = {'source': str(renderer),
+                                   'sha256': hashlib.sha256(body.encode()).hexdigest()}
+    begin, body = between(callback, 'std::erase_if( g_framegenHistory.pending,',
                           '\t\tconst size_t nDiscarded =')
     line = source.count('\n', 0, callback_start+begin) + 1
     (output/'correction.inc').write_text(f'#line {line} "{renderer}"\n'+body+'\n')
@@ -82,9 +143,10 @@ def materialize(renderer, output):
     return provenance
 
 
-def execute(renderer, output):
+def execute(renderer, output, device=None):
     output.mkdir(parents=True, exist_ok=True)
-    provenance = materialize(renderer, output)
+    device = device or ROOT/'src/framegen/device.cpp'
+    provenance = materialize(renderer, output, device)
     report = {'renderer': str(renderer),
               'renderer_sha256': hashlib.sha256(renderer.read_bytes()).hexdigest(),
               'fixture_sha256': hashlib.sha256(FIXTURE.read_bytes()).hexdigest(),
@@ -121,11 +183,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--renderer', type=Path, default=ROOT/'src/rendervulkan.cpp')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--device', type=Path, default=ROOT/'src/framegen/device.cpp')
     args = parser.parse_args()
     if args.output:
-        return execute(args.renderer.resolve(), args.output.resolve())
+        return execute(args.renderer.resolve(), args.output.resolve(), args.device.resolve())
     with tempfile.TemporaryDirectory(prefix='causal-admission-') as directory:
-        return execute(args.renderer.resolve(), Path(directory))
+        return execute(args.renderer.resolve(), Path(directory), args.device.resolve())
 
 
 if __name__ == '__main__':
