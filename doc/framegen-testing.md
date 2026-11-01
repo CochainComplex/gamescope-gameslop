@@ -1031,6 +1031,21 @@ not the responsible compiler thread, universal startup improvement, physical
 input latency or native/cross-vendor equivalence. Scheduling policy and smoke
 harness defaults were unchanged.
 
+An ordering-only follow-up on the same executable and warm-cache AMD route
+used `--framegen-debug` with `GAMESCOPE_FRAMEGEN_DEBUG_EVERY=1`. Both 12-second
+validation and non-validation captures passed their original gates. All five
+non-validation repeat opportunities preceded the second compositor-recorded
+real-frame marker: four before marker 1, one between markers 1 and 2, and none
+afterward. History primed at marker 1; generation was submitted from marker 2
+with zero mature cost samples and selected at the next opportunity. Validation
+reported a different partition (5/4/0), retained separately. Marker 1 preceded
+the client's first Vulkan present in both captures; its underlying content was
+not identified. These traces partition their own repeat counters, not the exact
+six/seven repeats or isolated slow drop in the earlier normal captures. Debug
+adds logging and readiness observations, so this is not a timing comparison.
+Keep every early window and distinguish no-paint decisions from backend feedback
+and physical display repeats; see [Frame counts](framegen-reference.md#frame-counts).
+
 Aggregation:
 
 - Only windows with `w` greater than `warmup` count. The `TOTAL` line is never

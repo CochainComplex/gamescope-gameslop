@@ -541,13 +541,20 @@ legacy logs retain explicitly reported receipt-time comparison.
 | `real` | Real (game) frames presented fresh. |
 | `gen` | Generated frames presented. |
 | `dreal` | Delayed real frames presented (bidirectional mode shows real frames late). 0 outside bidirectional mode. |
-| `rep` | Refresh slots that repeated the previous scanout. |
-| `fill` | `(real + dreal + gen) / (real + dreal + gen + rep)`: the share of presents that carried fresh content. Same definition as the HUD `fill`. |
+| `rep` | Compositor vblank opportunities with no selected paint, plus backend-reported held-image presentations in bidirectional mode. Includes startup opportunities before any client content or usable history; not a count of confirmed physical duplicate presentations. |
+| `fill` | `(real + dreal + gen) / (real + dreal + gen + rep)`: fresh-content share from these counters, including startup opportunities counted by `rep`. Same definition as the HUD `fill`. |
 | `slow` | Queued frames dropped because generation could not complete in time (capacity evidence for the degradation ladder). In a healthy run it stays small. |
 | `disc` | Queued generated frames discarded without being presented (stale predictions after a cut, retargeting or shedding). |
 | `adm` | Generation attempts skipped at admission because the next real frame was safely due, so no backup frame was needed. |
 | `dreal_drop` | Queued delayed real frames dropped in bidirectional mode: the newest frame when a source faster than the display overflows the queue, or the excess of a persistent backlog outside a scene cut. Each is logged. Not a re-prime. |
 | `reprime` | Declared pacing re-primes in the window: scene cuts, hitches, or the bidirectional delay shortening to its ring bound. |
+
+The first metrics window starts when feedback is first drained, even if the
+mailbox is empty. It does not start at the first client frame. Framegen's real
+identities follow compositor window commits or textures; a recorded real frame
+can precede the client's first Vulkan present. For startup attribution, use the
+existing debug selection, history-prime and generation markers together; do not
+join compositor real IDs to client present IDs or infer latency from `rep` alone.
 
 ### Timing and pacing
 
