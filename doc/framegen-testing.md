@@ -997,6 +997,40 @@ process tree. It uses DRM fdinfo engine time on `RENDER_DEV` when the device's
 driver reports it, and the driver's process list (`nvidia-smi`, by pid) when it
 does not. Cleanup signals only processes from the run's own process tree.
 
+Record shader-cache state separately when investigating startup pacing. Giving
+each capture a fresh `XDG_CACHE_HOME` can keep Mesa compilation work active well
+past the first metrics window. Framegen pipelines are precompiled during device
+initialization; `CVulkanDevice::compileAllPipelines` also compiles compositor
+variants on a background thread. Cache-file writes alone do not identify which
+thread stalled or establish GPU execution time.
+
+For a cache-only comparison, keep the optimized executable, client, GPU routing,
+driver libraries, observers and original validation gates identical. Use a fresh
+empty cache for the cold arm and a private copy of one frozen, compatible cache
+snapshot for each warm arm. Preserve its index and entries together, verify the
+exact file set and hashes, and record inherited cache settings; reject overrides
+that redirect or disable the intended cache. Copy before launching any actor,
+keep the source snapshot immutable, and reverse run order. In a code A/B, both
+code arms need the same cache treatment. Keep cold-start results and all early
+windows alongside the declared comparison population; do not increase warm-up
+or weaken a gate after seeing a failure. A harness requiring a validation pair
+must complete that prerequisite before its normal capture can qualify.
+
+On 2026-11-01, two opposite-order cache-only pairs used the same `615b5b1b3`
+production executable on AMD 890M/RADV Mesa 25.2.8, nested 640x480 output,
+500x500 client buffers, app-30/output-60, checked-2x and four-image FIFO with one
+client present wait per frame. Each arm passed its original 12-second all-role
+Vulkan-validation and 35-second normal gates. Empty-cache window-three SD was
+1.905/1.707 ms; copied-cache SD was 0.043/0.079 ms. Across each whole normal run,
+client wait maxima were 66.293/97.171 ms cold and 33.659/33.588 ms warm. Cold
+waits above 34 ms extended to about 13 seconds; neither warm run had such a wait.
+That cutoff selects diagnostic events, not a new acceptance threshold. Both
+warm runs retained first-window repeats (7/6) and discards (13/20), and one had
+a slow drop. This establishes cache-sensitive startup behavior on this route,
+not the responsible compiler thread, universal startup improvement, physical
+input latency or native/cross-vendor equivalence. Scheduling policy and smoke
+harness defaults were unchanged.
+
 Aggregation:
 
 - Only windows with `w` greater than `warmup` count. The `TOTAL` line is never
