@@ -160,6 +160,9 @@ test('buffer_import', find_program('python3'),
 test('env_gamescope_local', find_program('python3'),
 	args: files('test_env_gamescope_local.py'), timeout: 15)
 
+test('framegen_cli', find_program('python3'),
+	args: files('test_framegen_cli.py'), timeout: 30)
+
 test('wayland_fullscreen', find_program('python3'),
 	args: files('test_wayland_fullscreen.py'), timeout: 90)
 

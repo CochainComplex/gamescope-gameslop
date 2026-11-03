@@ -101,6 +101,11 @@ cmd_bench() {
         --framegen-pipeline "$pipeline" -- true 2>/dev/null
 }
 
+# grep counts matching lines and prints zero when there are no matches.
+count_log_matches() {
+    grep -c "$2" "$1" || true
+}
+
 summarize() {
     local log="$1"
     echo
@@ -112,12 +117,12 @@ summarize() {
         echo "  (window didn't render? try a different app, or check the log below)"
     fi
     local real gen_slot repeat batch presented tooslow
-    real=$(grep -c 'vblank slot=real' "$log" || true)
-    gen_slot=$(grep -c 'vblank slot=generated' "$log" || true)
-    repeat=$(grep -c 'vblank slot=repeat' "$log" || true)
-    batch=$(grep -c 'framegen: generated ' "$log" || true)
-    presented=$(grep -c 'framegen: presented generated' "$log" || true)
-    tooslow=$(grep -c 'generation_too_slow' "$log" || true)
+    real=$(count_log_matches "$log" 'vblank slot=real')
+    gen_slot=$(count_log_matches "$log" 'vblank slot=generated')
+    repeat=$(count_log_matches "$log" 'vblank slot=repeat')
+    batch=$(count_log_matches "$log" 'framegen: generated ')
+    presented=$(count_log_matches "$log" 'framegen: presented generated')
+    tooslow=$(count_log_matches "$log" 'generation_too_slow')
     printf '  %-26s %s\n' "vblank slots: real"        "$real"
     printf '  %-26s %s\n' "vblank slots: generated"   "$gen_slot"
     printf '  %-26s %s\n' "vblank slots: repeat"      "$repeat"
@@ -135,6 +140,38 @@ summarize() {
         echo "    - Full log: $log"
     fi
     echo "================================================================="
+}
+
+require_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]] || { echo "error: $2 must be a positive integer" >&2; return 1; }
+}
+
+run_logged_command() {
+    local log="$1" every="$2"
+    shift 2
+    local run_status
+    local -a pipeline_status
+    set +e
+    if [[ -n "${DURATION:-}" ]]; then
+        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" timeout "$DURATION" "$@" 2>&1 | tee "$log"
+        pipeline_status=( "${PIPESTATUS[@]}" )
+    else
+        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" "$@" 2>&1 | tee "$log"
+        pipeline_status=( "${PIPESTATUS[@]}" )
+    fi
+    set -e
+
+    # Launch failures take precedence over tee failures.
+    run_status=${pipeline_status[0]}
+    if (( run_status == 0 && pipeline_status[1] != 0 )); then
+        run_status=${pipeline_status[1]}
+    fi
+
+    summarize "$log"
+    if [[ -n "${DURATION:-}" && "$run_status" -eq 124 ]]; then
+        return 0
+    fi
+    return "$run_status"
 }
 
 cmd_run() {
@@ -163,9 +200,9 @@ cmd_run() {
 
     case "$mode" in extrapolate|motion|blend) ;; *) echo "error: mode must be extrapolate|motion|blend" >&2; exit 1 ;; esac
     case "$pipeline" in warp|checked|learned|predict|guided|spatial) ;; *) echo "error: PIPELINE must be warp|checked|learned|predict|guided|spatial" >&2; exit 1 ;; esac
-    [[ "$refresh" =~ ^[1-9][0-9]*$ ]] || { echo "error: REFRESH must be a positive integer" >&2; return 1; }
-    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || { echo "error: LIMIT must be a positive integer" >&2; return 1; }
-    [[ "$every" =~ ^[1-9][0-9]*$ ]] || { echo "error: DEBUG_EVERY must be a positive integer" >&2; return 1; }
+    require_positive_integer "$refresh" REFRESH
+    require_positive_integer "$limit" LIMIT
+    require_positive_integer "$every" DEBUG_EVERY
     if [[ -n "${DURATION:-}" && ! "$DURATION" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         echo "error: DURATION must be a non-negative number of seconds" >&2; return 1
     fi
@@ -187,28 +224,7 @@ cmd_run() {
         --framegen-debug -- "${app_cmd[@]}"
     )
 
-    local run_status
-    local -a pipeline_status
-    set +e
-    if [[ -n "${DURATION:-}" ]]; then
-        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" timeout "$DURATION" "${cmd[@]}" 2>&1 | tee "$log"
-        pipeline_status=( "${PIPESTATUS[@]}" )
-    else
-        GAMESCOPE_FRAMEGEN_DEBUG_EVERY="$every" "${cmd[@]}" 2>&1 | tee "$log"
-        pipeline_status=( "${PIPESTATUS[@]}" )
-    fi
-    set -e
-
-    run_status=${pipeline_status[0]}
-    if (( run_status == 0 && pipeline_status[1] != 0 )); then
-        run_status=${pipeline_status[1]}
-    fi
-
-    summarize "$log"
-    if [[ -n "${DURATION:-}" && "$run_status" -eq 124 ]]; then
-        return 0
-    fi
-    return "$run_status"
+    run_logged_command "$log" "$every" "${cmd[@]}"
 }
 
 case "${1:-}" in

@@ -34,7 +34,7 @@ Test, A/B and training tools, plus the shared launcher library. Terms: GSFD is t
 
 | Script | Purpose | Details |
 |---|---|---|
-| `test-framegen.sh` | Drive compositor-side frame generation for testing; `gpus` lists the GPUs and their `vendor:device` IDs | [Maintenance: validation](../doc/framegen-maintenance.md#validation-by-change-class) |
+| `test-framegen.sh` | Drive compositor-side frame generation for testing; `gpus` lists the GPUs and their `vendor:device` IDs. `python3 tests/test_framegen_cli.py` checks arguments, failure statuses and summaries without a GPU | [Maintenance: validation](../doc/framegen-maintenance.md#validation-by-change-class) |
 | `framegen-launch-common.sh` | Library of shared argument and environment checks; sourced by the launchers, not run directly | n/a |
 | `framegen-nested-smoke.py` | Nested runtime smoke and fault-injection harness | [Testing: smoke harness](../doc/framegen-testing.md#smoke-harness-setup-and-options) |
 | `framegen-showcase.sh` | Visible showcase and end-to-end A/B judge (`--baseline`, `--compare`) | [Testing: showcase](../doc/framegen-testing.md#end-to-end-showcase-and-baseline-compare) |
