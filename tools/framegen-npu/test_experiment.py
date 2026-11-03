@@ -1,6 +1,7 @@
 """CPU-only contracts. No accelerator or optional SDK required."""
 
 import argparse
+from collections import namedtuple
 import copy
 import importlib.util
 import json
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -44,6 +46,8 @@ def worker_fixture(root):
 
 
 class FakeBackend:
+    contract = backends.RAW_HEAD_CONTRACT
+
     def __init__(self, outputs):
         self.outputs = iter(outputs)
 
@@ -68,11 +72,16 @@ def blocked(*_):
     # One long native call defers Python signal handlers, like an SDK compile.
     hashlib.pbkdf2_hmac('sha256', b'x', b'y', 1_000_000_000)
 class CpuOnlyBackend:
+    contract = backends.RAW_HEAD_CONTRACT
     def probe(self):
         return {{'available': True}}
     def load(self, *_):
         if {phase!r} == 'load':
             blocked()
+    def run(self, features):
+        return features
+    def evidence(self):
+        return {{'test_only': True}}
 backends.BACKENDS['amd-vitis'] = CpuOnlyBackend
 backends.inventory = lambda: []
 backends.measure = blocked
@@ -94,6 +103,145 @@ experiment.supervise(argparse.Namespace(**{vars(args)!r}))
 
 
 class Contracts(unittest.TestCase):
+    @staticmethod
+    def public_backend_api():
+        scripts = Path(__file__).resolve().parents[2] / 'scripts'
+        with mock.patch.object(sys, 'path', [str(scripts), *sys.path]):
+            return importlib.import_module('framegen_backend')
+
+    def test_public_contract_and_binding_cross_helper_module_boundary(self):
+        public = self.public_backend_api()
+        self.assertIsNot(public.Contract, backends.contract_api.Contract)
+        self.assertIsNot(public.Binding, backends.contract_api.Binding)
+        required = public.requirements_for(public.PROFILES['npu_raw_head'])
+        for adapter in (backends.AmdOrt, backends.IntelOpenVino):
+            public.require_contract(adapter.contract, required)
+
+        class Owner:
+            def __init__(self):
+                self.received = []
+
+            def run(self, features):
+                self.received.append(features)
+                return features
+
+            def evidence(self):
+                return {'test_only': True}
+
+        owner = Owner()
+        execute, evidence = owner.run, owner.evidence
+        binding = public.bind_backend(owner, backends.AmdOrt.contract, required,
+                                      execute=execute, evidence=evidence)
+        self.assertIs(binding.owner, owner)
+        self.assertIs(binding.execute, execute)
+        self.assertIs(binding.evidence, evidence)
+        features = np.ones((2, 1, 1, 2, 2), np.float32)
+        features[1] *= 2
+        result = backends.measure(binding, features, features, 1, 0, 0)
+        self.assertEqual(result['calls'], 2)
+        self.assertEqual(len(owner.received), 4)
+        for offset in (0, 2):
+            self.assertTrue(np.shares_memory(owner.received[offset], features))
+            self.assertIs(owner.received[offset], owner.received[offset + 1])
+
+    def test_measure_rejects_cross_loader_malformed_and_wrong_operation_cold(self):
+        public = self.public_backend_api()
+        contract = public.PROFILES['npu_raw_head']
+        reordered = namedtuple('ReorderedContract', reversed(public.Contract._fields))(*reversed(contract))
+        malformed = (
+            None,
+            tuple(contract),
+            SimpleNamespace(**contract.as_dict()),
+            reordered,
+            contract._replace(size=True),
+            contract._replace(abi=contract.abi + 1),
+            contract._replace(reserved=1),
+            contract._replace(operation=public.VALUES['GSC_OP_TRAINING']),
+            contract._replace(execution=public.VALUES['GSC_EXEC_ASYNC']),
+        )
+        execute = mock.Mock(side_effect=AssertionError('invalid binding executed'))
+        features = np.ones((2, 1, 1, 2, 2), np.float32)
+        features[1] *= 2
+        for value in malformed:
+            with self.subTest(contract=value), self.assertRaises(ValueError):
+                backends.measure(SimpleNamespace(contract=value, execute=execute, evidence=lambda: {}),
+                                 features, features, 1, 0, 0)
+        for callbacks in ({'execute': None, 'evidence': lambda: {}},
+                          {'execute': execute, 'evidence': None},
+                          {'execute': execute}):
+            with self.subTest(callbacks=callbacks), self.assertRaises(ValueError):
+                backends.measure(SimpleNamespace(contract=contract, **callbacks), features, features, 1, 0, 0)
+        execute.assert_not_called()
+
+    def test_npu_rejects_training_async_and_exact_device_before_sdk_construction(self):
+        values = backends.contract_api.VALUES
+        base = backends.RAW_HEAD_REQUIREMENTS
+        requests = (
+            base._replace(operation=values['GSC_OP_TRAINING']),
+            base._replace(execution=values['GSC_EXEC_ASYNC']),
+            base._replace(features=base.features | values['GSC_FEATURE_EXACT_DEVICE']),
+        )
+
+        class Backend:
+            contract = backends.RAW_HEAD_CONTRACT
+
+            def __init__(self):
+                raise AssertionError('SDK constructor reached before capability rejection')
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = worker_fixture(Path(directory))
+            for request in requests:
+                with self.subTest(request=request), \
+                        mock.patch.dict(backends.BACKENDS, {'amd-vitis': Backend}), \
+                        mock.patch.object(backends, 'RAW_HEAD_REQUIREMENTS', request):
+                    with self.assertRaises(ValueError):
+                        E.run_worker(args)
+
+    def test_bound_session_keeps_original_methods_and_feature_objects(self):
+        class Backend:
+            contract = backends.RAW_HEAD_CONTRACT
+
+            def __init__(self):
+                self.received = []
+                self.evidence_calls = 0
+
+            def run(self, features):
+                self.received.append(features)
+                return features
+
+            def evidence(self):
+                self.evidence_calls += 1
+                return {'test_only': True}
+
+        backend = Backend()
+        binding = backends.bind_session(backend)
+        self.assertIs(binding.owner, backend)
+        self.assertIs(binding.execute.__self__, backend)
+        self.assertIs(binding.execute.__func__, Backend.run)
+        self.assertIs(binding.evidence.__self__, backend)
+        self.assertIs(binding.evidence.__func__, Backend.evidence)
+        feature = np.ones((1, 1, 2, 2), np.float32)
+        self.assertIs(binding.execute(feature), feature)
+        self.assertIs(backend.received.pop(), feature)
+        features = np.stack((feature, feature * 2))
+        original_require = backends.contract_api.require_contract
+
+        def cold_require(contract, required):
+            self.assertFalse(backend.received, 'capability negotiation after inference began')
+            return original_require(contract, required)
+
+        with mock.patch.object(backends.contract_api, 'require_contract',
+                               side_effect=cold_require) as negotiated:
+            result = backends.measure(binding, features, features, 2, 0, 0)
+        negotiated.assert_called_once_with(binding.contract, backends.RAW_HEAD_REQUIREMENTS)
+        self.assertEqual(result['calls'], 4)
+        self.assertEqual(backend.evidence_calls, 1)
+        self.assertEqual(len(backend.received), 6)
+        for offset in (0, 3):
+            self.assertTrue(np.shares_memory(backend.received[offset], features))
+            self.assertIs(backend.received[offset], backend.received[offset + 1])
+            self.assertIs(backend.received[offset], backend.received[offset + 2])
+
     def test_termination_preserves_nohup_and_restores_handlers(self):
         previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
         term = signal.getsignal(signal.SIGTERM)
@@ -151,6 +299,8 @@ class Contracts(unittest.TestCase):
 
     def test_compiled_cache_survives_parity_failure_and_warm_load_failure(self):
         class Backend:
+            contract = backends.RAW_HEAD_CONTRACT
+
             def probe(self):
                 return {'available': True}
 
@@ -158,6 +308,12 @@ class Contracts(unittest.TestCase):
                 states.append(json.loads((cache / 'state.json').read_text())['status'])
                 if fail_load[0]:
                     raise RuntimeError('warm load interrupted')
+
+            def run(self, features):
+                return features
+
+            def evidence(self):
+                return {'test_only': True}
 
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -170,6 +326,10 @@ class Contracts(unittest.TestCase):
                 result = json.loads(Path(args.result).read_text())
                 self.assertEqual(result['cache_state_before'], 'cold')
                 self.assertIn('load_ms', result)
+                self.assertEqual(result['backend_contract'], backends.RAW_HEAD_CONTRACT.as_dict())
+                self.assertIsInstance(measure.call_args.args[0], backends.contract_api.Binding)
+                initial_cache = json.loads((root / 'cache' / result['cache_key'] / 'state.json').read_text())
+                self.assertNotIn('backend_contract', initial_cache['identity'])
                 measure.side_effect = backends.ParityError(.25, 0, 0)
                 with self.assertRaises(backends.ParityError):
                     E.run_worker(args)
@@ -453,6 +613,7 @@ class Contracts(unittest.TestCase):
     def test_failed_compile_cache_is_not_reused(self):
         class BrokenBackend:
             calls = 0
+            contract = backends.RAW_HEAD_CONTRACT
 
             def probe(self):
                 return {'available': True, 'runtime': 'test-only'}

@@ -4,6 +4,14 @@ from pathlib import Path
 import json
 import time
 
+from common import module
+
+# This SDK-free leaf is loaded only with the helper's adapter module. Neither
+# importing these contracts nor inspecting capabilities imports a vendor SDK.
+contract_api = module('framegen_backend')
+RAW_HEAD_CONTRACT = contract_api.PROFILES['npu_raw_head']
+RAW_HEAD_REQUIREMENTS = contract_api.requirements_for(RAW_HEAD_CONTRACT)
+
 
 def inventory():
     """Linux accelerator nodes are hints, never proof of executable support."""
@@ -27,6 +35,7 @@ def inventory():
 class AmdOrt:
     name = 'amd-vitis'
     provider = 'VitisAIExecutionProvider'
+    contract = RAW_HEAD_CONTRACT
 
     def __init__(self):
         import onnxruntime as ort
@@ -70,6 +79,7 @@ class AmdOrt:
 
 class IntelOpenVino:
     name = 'intel-openvino'
+    contract = RAW_HEAD_CONTRACT
 
     def __init__(self):
         import openvino as ov
@@ -110,9 +120,23 @@ class ParityError(RuntimeError):
                        'atol': atol, 'rtol': rtol}
 
 
+def bind_session(backend):
+    """Bind loaded SDK methods once; execute remains the original callable."""
+    return contract_api.bind_backend(backend, backend.contract, RAW_HEAD_REQUIREMENTS,
+                                     execute=backend.run, evidence=backend.evidence)
+
+
 def measure(backend, features, reference, runs, atol, rtol):
     """Raw-head parity only: not a field, image-quality or gameplay gate."""
     import numpy as np
+    # Keep direct fake-adapter callers compatible through the same cold path.
+    binding = backend if hasattr(backend, 'execute') else bind_session(backend)
+    # Wire-compatible bindings may come from a separately loaded copy of the
+    # SDK-free module. Negotiate structurally once, never in the call loop.
+    contract_api.require_contract(getattr(binding, 'contract', None), RAW_HEAD_REQUIREMENTS)
+    execute, evidence = getattr(binding, 'execute', None), getattr(binding, 'evidence', None)
+    if not callable(execute) or not callable(evidence):
+        raise ValueError('NPU binding requires execution and evidence callbacks')
     if np.allclose(reference, np.zeros_like(reference), atol=atol, rtol=rtol):
         raise RuntimeError('reference cannot distinguish zero output at these tolerances')
     if np.allclose(reference, reference[0:1], atol=atol, rtol=rtol):
@@ -122,7 +146,7 @@ def measure(backend, features, reference, runs, atol, rtol):
         x, ref = features[direction], reference[direction]
         for i in range(runs + 1):  # one untimed warmup per direction
             start = time.perf_counter()
-            y = np.asarray(backend.run(x))
+            y = np.asarray(execute(x))
             elapsed = (time.perf_counter() - start) * 1000
             if y.shape != ref.shape or not np.isfinite(y).all():
                 raise RuntimeError('invalid NPU output shape or non-finite values')
@@ -136,4 +160,4 @@ def measure(backend, features, reference, runs, atol, rtol):
             'call_ms_p50': float(np.percentile(times, 50)),
             'call_ms_p99': float(np.percentile(times, 99)),
             'call_ms_max': max(times), 'max_abs_error': max(errors),
-            'atol': atol, 'rtol': rtol, 'evidence': backend.evidence()}
+            'atol': atol, 'rtol': rtol, 'evidence': evidence()}

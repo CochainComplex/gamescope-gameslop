@@ -30,6 +30,18 @@ in games, live weight publication, motion priors, masks, classifier policy,
 Vulkan/dma-buf transport, quantization or model hot swapping. CPU learning and NPU
 inference are separate stages. This does not offload today's GPU online updates.
 
+The adapters share the SDK-free backend capability contract in
+[`scripts/framegen_backend.py`](../../scripts/framegen_backend.py). Their
+`npu_raw_head` profile advertises blocking raw-head inference with host tensors
+and execution-evidence checks. It does not advertise training, resident state,
+asynchronous submission or exact-device selection. The worker validates this
+contract before constructing an SDK adapter, then binds the loaded adapter's
+original execution/evidence methods once. Inference adds no forwarding wrapper,
+tensor copy or capability check; Intel's existing result-ownership copy remains.
+The result receipt records `backend_contract` separately from cache identity.
+Capability metadata does not prove execution: provider/kernel evidence remains
+mandatory, and SDK loading stays confined to the supervised helper process.
+
 ## CPU contracts
 
 ```bash

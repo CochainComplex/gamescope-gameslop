@@ -1,0 +1,4 @@
+option('hip_training', type: 'feature', value: 'disabled',
+  description: 'Build the optional current-framegen HIP training plugin')
+option('hip_arch', type: 'string', value: '',
+  description: 'Explicit HIP offload target, e.g. gfx1150; required for the plugin')

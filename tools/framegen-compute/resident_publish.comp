@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "framegen/training_report.h"
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Input { float inputValues[]; };
+layout(std430, binding = 1) readonly buffer Gradients { float gradients[]; };
+layout(std430, binding = 2) buffer State { uint stateWords[]; };
+layout(push_constant) uniform Push {
+    uint epochLo, epochHi, key, step, attempt, previousAcceptedStep;
+    uint reserved0, reserved1;
+} p;
+
+bool metricValid(uint bits) {
+    return (bits & 0x7f800000u) != 0x7f800000u
+        && ((bits & 0x80000000u) == 0u || (bits & 0x7fffffffu) == 0u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= GSC_REPORT_PARAMETERS) return;
+    uint at = GSC_REPORT_WORD_OFFSET;
+    uint badState = stateWords[at + GSC_REPORT_INVALID_STATE_AT];
+    uint badServed = stateWords[at + GSC_REPORT_INVALID_SERVED_AT];
+    uint accepted = stateWords[at + GSC_REPORT_ACCEPTED_AT];
+    bool healthy = badState == 0u && badServed == 0u;
+    bool valid = (p.epochLo != 0u || p.epochHi != 0u) && p.step != 0u && p.attempt != 0u
+        && p.previousAcceptedStep != 0xffffffffu && p.previousAcceptedStep + 1u == p.step
+        && p.reserved0 == 0u && p.reserved1 == 0u
+        && stateWords[at + GSC_REPORT_MAGIC_AT] == GSC_REPORT_MAGIC
+        && stateWords[at + GSC_REPORT_VERSION_AT] == GSC_REPORT_VERSION
+        && stateWords[at + GSC_REPORT_PARAMETERS_AT] == GSC_REPORT_PARAMETERS
+        && stateWords[at + GSC_REPORT_COVERAGE_AT] == GSC_REPORT_PARAMETERS
+        && badState <= 4u * GSC_REPORT_PARAMETERS && badServed <= GSC_REPORT_PARAMETERS
+        && stateWords[at + GSC_REPORT_CHANGED_AT] <= GSC_REPORT_PARAMETERS
+        && metricValid(stateWords[at + GSC_REPORT_MAX_ABS_AT])
+        && metricValid(stateWords[at + GSC_REPORT_MAX_DELTA_AT])
+        && stateWords[at + GSC_REPORT_EPOCH_LO_AT] == p.epochLo
+        && stateWords[at + GSC_REPORT_EPOCH_HI_AT] == p.epochHi
+        && stateWords[at + GSC_REPORT_KEY_AT] == p.key
+        && stateWords[at + GSC_REPORT_STEP_AT] == p.step
+        && stateWords[at + GSC_REPORT_ATTEMPT_AT] == p.attempt
+        && accepted <= 1u && (accepted != 0u) == healthy
+        && stateWords[at + GSC_REPORT_ACCEPTED_STEP_AT] == (healthy ? p.step : p.previousAcceptedStep);
+    for (uint word = GSC_REPORT_RESERVED_AT; word < GSC_REPORT_WORDS; ++word)
+        valid = valid && stateWords[at + word] == 0u;
+    bool publish = valid && healthy;
+    // No dispatch exposes candidate weights until this whole copy completes.
+    // Reject/malformed restores fast,m,v,EMA AND served, never just the heads.
+    for (uint row = 0u; row < 5u; ++row) {
+        uint candidate = GSC_REPORT_CANDIDATE_OFFSET + row * GSC_REPORT_PARAMETERS + i;
+        uint backup = GSC_REPORT_BACKUP_OFFSET + row * GSC_REPORT_PARAMETERS + i;
+        if (publish) stateWords[backup] = stateWords[candidate];
+        else stateWords[candidate] = stateWords[backup];
+    }
+}

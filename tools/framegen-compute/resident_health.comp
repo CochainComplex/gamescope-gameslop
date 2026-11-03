@@ -1,0 +1,87 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "framegen/training_report.h"
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Input { float inputValues[]; };
+layout(std430, binding = 1) readonly buffer Gradients { float gradients[]; };
+layout(std430, binding = 2) buffer State { uint stateWords[]; };
+layout(push_constant) uniform Push {
+    uint epochLo, epochHi, key, step, attempt, previousAcceptedStep;
+    uint reserved0, reserved1;
+} p;
+
+shared uint coverage[64], invalidState[64], invalidServed[64];
+shared uint changed[64], maxAbsBits[64], maxDeltaBits[64];
+
+bool finiteBits(uint bits) { return (bits & 0x7f800000u) != 0x7f800000u; }
+
+void main() {
+    uint li = gl_LocalInvocationIndex;
+    uint count = 0u, badState = 0u, badServed = 0u, changedCount = 0u;
+    uint maxAbs = 0u, maxDelta = 0u;
+    for (uint i = li; i < GSC_REPORT_PARAMETERS; i += 64u) {
+        ++count;
+        for (uint row = 0u; row < 4u; ++row)
+            if (!finiteBits(stateWords[row * GSC_REPORT_PARAMETERS + i])) ++badState;
+        uint served = stateWords[4u * GSC_REPORT_PARAMETERS + i];
+        uint accepted = stateWords[9u * GSC_REPORT_PARAMETERS + i];
+        // Counts changed representations, including signed-zero changes.
+        if (served != accepted) ++changedCount;
+        if (!finiteBits(served)) {
+            ++badServed;
+        } else {
+            maxAbs = max(maxAbs, served & 0x7fffffffu);
+            uint delta = GSC_REPORT_MAX_FINITE_BITS;
+            if (finiteBits(accepted)) {
+                delta = floatBitsToUint(uintBitsToFloat(served) - uintBitsToFloat(accepted)) & 0x7fffffffu;
+                // Diagnostic saturation must not reject an otherwise finite
+                // candidate merely because subtracting finite endpoints overflows.
+                if (!finiteBits(delta)) delta = GSC_REPORT_MAX_FINITE_BITS;
+            }
+            maxDelta = max(maxDelta, delta);
+        }
+    }
+    coverage[li] = count;
+    invalidState[li] = badState;
+    invalidServed[li] = badServed;
+    changed[li] = changedCount;
+    maxAbsBits[li] = maxAbs;
+    maxDeltaBits[li] = maxDelta;
+    barrier();
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (li < stride) {
+            coverage[li] += coverage[li + stride];
+            invalidState[li] += invalidState[li + stride];
+            invalidServed[li] += invalidServed[li + stride];
+            changed[li] += changed[li + stride];
+            maxAbsBits[li] = max(maxAbsBits[li], maxAbsBits[li + stride]);
+            maxDeltaBits[li] = max(maxDeltaBits[li], maxDeltaBits[li + stride]);
+        }
+        barrier();
+    }
+    // Every word has exactly one writer, including reserved fields. No zero
+    // initializer may race another invocation's later report-field store.
+    if (li >= GSC_REPORT_RESERVED_AT && li < GSC_REPORT_WORDS)
+        stateWords[GSC_REPORT_WORD_OFFSET + li] = 0u;
+    if (li == 0u) {
+        uint at = GSC_REPORT_WORD_OFFSET;
+        bool healthy = invalidState[0] == 0u && invalidServed[0] == 0u;
+        stateWords[at + GSC_REPORT_MAGIC_AT] = GSC_REPORT_MAGIC;
+        stateWords[at + GSC_REPORT_VERSION_AT] = GSC_REPORT_VERSION;
+        stateWords[at + GSC_REPORT_PARAMETERS_AT] = GSC_REPORT_PARAMETERS;
+        stateWords[at + GSC_REPORT_COVERAGE_AT] = coverage[0];
+        stateWords[at + GSC_REPORT_INVALID_STATE_AT] = invalidState[0];
+        stateWords[at + GSC_REPORT_INVALID_SERVED_AT] = invalidServed[0];
+        stateWords[at + GSC_REPORT_CHANGED_AT] = changed[0];
+        stateWords[at + GSC_REPORT_MAX_ABS_AT] = maxAbsBits[0];
+        stateWords[at + GSC_REPORT_MAX_DELTA_AT] = maxDeltaBits[0];
+        stateWords[at + GSC_REPORT_EPOCH_LO_AT] = p.epochLo;
+        stateWords[at + GSC_REPORT_EPOCH_HI_AT] = p.epochHi;
+        stateWords[at + GSC_REPORT_KEY_AT] = p.key;
+        stateWords[at + GSC_REPORT_STEP_AT] = p.step;
+        stateWords[at + GSC_REPORT_ATTEMPT_AT] = p.attempt;
+        stateWords[at + GSC_REPORT_ACCEPTED_STEP_AT] = healthy ? p.step : p.previousAcceptedStep;
+        stateWords[at + GSC_REPORT_ACCEPTED_AT] = healthy ? 1u : 0u;
+    }
+}

@@ -365,6 +365,23 @@ tuning and experimental values.
 
 ### Developer and validation
 
+The standalone `framegen-resident-training` experiment has separate controls
+and CSV diagnostics documented in [the compute tool README](../tools/framegen-compute/README.md#resident-vulkan-training-and-compact-diagnostics).
+Its 80-byte report carries model identity, coverage, acceptance, non-finite
+counts and update ranges; the CSV separates submit/wait/collect/snapshot time.
+These are offline tool fields, not compositor options or live metrics. The
+experiment leaves online profile health checks, persistence and defaults intact.
+Its backend capability contract also covers the native HIP training plugin and
+isolated NPU inference adapters, with different typed payloads and state owners.
+Training receipts add `backend_contract` and `backend_contract_source`; the
+resident replay's `--direct-interface` and stderr `direct_interface` field are
+offline controls for measuring cold binding. See the compute tool's
+[common backend contract](../tools/framegen-compute/README.md#common-backend-contract).
+The separate [DLSS 5 NR probe](../tools/framegen-compute/nr/README.md) has offline
+`--disabled`, `--baseline`, `--async` and `--timeout` controls. Its JSON receipt
+records exact device/provenance, raw FP16 validation, successful imports, fresh
+results, network evaluation time and cleanup. These do not add a live DLSS mode.
+
 The WSI layer's `GAMESCOPE_WSI_MIN_IMAGE_COUNT` (default `3`) is a preferred
 minimum within a nonempty ordinary legacy/MAILBOX interval. If those intervals
 do not overlap, queries retain valid legacy bounds and creation is refused;

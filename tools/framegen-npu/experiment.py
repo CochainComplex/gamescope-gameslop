@@ -78,10 +78,14 @@ def worker(args):
 
 def run_worker(args):
     import fcntl
-    from backends import BACKENDS, inventory, measure
+    from backends import (BACKENDS, RAW_HEAD_REQUIREMENTS, bind_session,
+                          contract_api, inventory, measure)
 
     cfg = config(args.config)
-    backend = BACKENDS[cfg['backend']]()
+    backend_type = BACKENDS[cfg['backend']]
+    # Reject unsupported operations before constructing/importing any SDK.
+    contract_api.require_contract(backend_type.contract, RAW_HEAD_REQUIREMENTS)
+    backend = backend_type()
     probe = backend.probe()
     info = {'schema': 1, 'backend': cfg['backend'], 'probe': probe,
             'hardware_hints': inventory(), 'available_is_not_execution': True}
@@ -100,6 +104,8 @@ def run_worker(args):
     features, reference = load_fixture(bundle / 'fixture.npz')
     identity = cache_identity(cfg, probe, info['hardware_hints'], manifest['files']['model.onnx'])
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    # Capability metadata does not participate in probe/cache identity.
+    info['backend_contract'] = backend.contract.as_dict()
     root = Path(args.cache).resolve()
     root.mkdir(parents=True, exist_ok=True)
     cache = root / key
@@ -125,7 +131,8 @@ def run_worker(args):
             # Compilation succeeded independently of the following parity check.
             write_json(state, {'status': 'ready', 'identity': identity, 'compiled': True})
             write_json(Path(args.result), info)
-            measured = measure(backend, features, reference, args.runs, args.atol, args.rtol)
+            binding = bind_session(backend)
+            measured = measure(binding, features, reference, args.runs, args.atol, args.rtol)
         except BaseException as exc:
             reason = str(exc) or type(exc).__name__
             write_json(state, {'status': 'failed', 'identity': identity,
