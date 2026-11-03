@@ -141,9 +141,10 @@ inline constexpr const char *k_pszFramegenHudStyleDefault = "quiet";
 	errno = 0;
 	char *end = nullptr;
 	const unsigned long long parsed = std::strtoull( value, &end, 10 );
-	if ( errno != 0 || end == value || *end != '\0'
-		|| parsed > std::numeric_limits<uint32_t>::max()
-		|| ( !allowZero && parsed == 0 ) )
+	// The leading digit guarantees conversion; reject errors and trailing input.
+	if ( errno != 0 || *end != '\0' )
+		return std::nullopt;
+	if ( parsed > std::numeric_limits<uint32_t>::max() || ( !allowZero && parsed == 0 ) )
 	{
 		return std::nullopt;
 	}

@@ -368,7 +368,7 @@ static std::string build_optstring(const struct option *options)
 {
 	std::string optstring;
 	for (size_t i = 0; options[i].name != nullptr; i++) {
-		if (!options[i].name || !options[i].val)
+		if (!options[i].val)
 			continue;
 
 		assert(optstring.find((char) options[i].val) == std::string::npos);
