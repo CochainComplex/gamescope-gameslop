@@ -11,6 +11,8 @@ generation implementation. The optional training plugin below adds HIP execution
 of the current network's learning operations. The separate
 [DLSS 5 neural-rendering experiment](nr/README.md) provides an offscreen AMD
 runtime probe; it is not a live generation backend or native CUDA provider.
+Its [upstream credits and dependency references](nr/README.md#upstream-projects-and-attribution)
+identify the external runtime and the source portions adapted by the probe.
 
 ## Placement and ownership
 

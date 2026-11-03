@@ -12,6 +12,42 @@ HIP and NVAPI compatibility details. It does not advertise an unimplemented
 universal per-job NR API: upstream's latest-result composition API supplies no
 external-image retirement token, and cannot stand in for Pair/RawHead/training.
 
+## Upstream projects and attribution
+
+The runtime, NGX host, gate, Linux HIP bridge and optimized kernels come from
+[RedDukeDev's DLSS 5 NR AMD Custom](https://github.com/RedDukeDev/dlss5-nr-amd-custom).
+This adapter targets [release 1.3.2](https://github.com/RedDukeDev/dlss5-nr-amd-custom/releases/tag/1.3.2),
+at [revision b5744cf03208f1442d63eeacc48eaf77a6bb4765](https://github.com/RedDukeDev/dlss5-nr-amd-custom/commit/b5744cf03208f1442d63eeacc48eaf77a6bb4765).
+`prepare.py` adds gamescope-specific device and correctness guards to a private
+copy of that project's runtime/harness; it does not implement the NR algorithm.
+The external `nvngx_dlssnr.dll` network is NVIDIA's
+[DLSS neural-rendering technology](https://www.nvidia.com/en-us/geforce/technologies/dlss/),
+supplied separately under its own terms.
+
+| Project | Role in this experiment |
+| --- | --- |
+| [RedDukeDev/ZLUDA](https://github.com/RedDukeDev/ZLUDA), forked from [vosen/ZLUDA](https://github.com/vosen/ZLUDA) | The upstream package's CUDA compatibility provider for AMD. Stock ZLUDA is not a qualified drop-in replacement. |
+| [AMD ROCm/HIP](https://github.com/ROCm/HIP) | HIP 7 runtime used by the Linux bridge and AMD kernels. |
+| [GE-Proton11-7](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-7) | Qualified Wine host and the source of the probe's DXGI/D3D12 DLLs. |
+| [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) | Proton's D3D12-to-Vulkan implementation. |
+| [DXVK](https://github.com/doitsujin/dxvk), [DXGI interop declarations](https://github.com/doitsujin/dxvk/blob/master/src/dxgi/dxgi_interfaces.h) | Vulkan identity-query interface adapted in `presenter_identity.hpp`, under zlib/libpng. Upstream's optional DXVK 3.1.1 bundle is separate from the Proton DLLs used here. |
+| [Khronos Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | SDK declarations copied, with their source headers and hashes, into the private build include tree. |
+
+The upstream game injector is a [RedDukeDev fork](https://github.com/RedDukeDev/OptiScaler/tree/dlss5-nr)
+of [OptiScaler](https://github.com/optiscaler/OptiScaler); this offscreen probe
+uses the runtime harness instead. Upstream's
+[third-party credits](https://github.com/RedDukeDev/dlss5-nr-amd-custom/blob/b5744cf03208f1442d63eeacc48eaf77a6bb4765/THIRD_PARTY.md)
+also acknowledge clshortfuse's RenoDX colour-composition design, Bjorn Ottosson's
+OkLab matrices, and countervolts' d4r super-resolution/command-list components.
+Those credits do not establish that the separate upscaler components execute
+in this NR probe.
+
+[Third-party notices](THIRD_PARTY.md) retain the RedDukeDev and DXVK notices for
+the adapted source portions. Private prepared copies preserve upstream's
+`LICENSE` and `THIRD_PARTY.md`. External models, binaries and their dependencies
+are not included in tracked gamescope source; these references do not change
+their licences or grant redistribution rights for a runtime package.
+
 ## What is implemented
 
 `prepare.py` requires clean upstream tag 1.3.2, revision

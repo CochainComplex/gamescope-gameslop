@@ -2,6 +2,7 @@
 """Prepare a pinned, private NR harness with exact device and raw-output checks.
 
 Does not download, build, execute a runtime or change compositor/upstream files.
+Patch anchors adapt RedDukeDev/dlss5-nr-amd-custom; see README.md and THIRD_PARTY.md.
 """
 import argparse
 import hashlib

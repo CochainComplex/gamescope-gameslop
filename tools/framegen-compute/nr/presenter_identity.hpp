@@ -1,5 +1,7 @@
 // Offscreen Wine/DXVK host only. No compositor or vendor compute SDK dependency.
-// Interop declarations follow DXVK's MIT-licensed src/dxgi/dxgi_interfaces.h.
+// Interop declarations adapt DXVK's src/dxgi/dxgi_interfaces.h (zlib/libpng).
+// https://github.com/doitsujin/dxvk/blob/master/src/dxgi/dxgi_interfaces.h
+// This is a reduced, renamed adapter; see THIRD_PARTY.md for the DXVK notice.
 #pragma once
 
 #include <vulkan_core.h>
