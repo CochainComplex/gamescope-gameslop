@@ -800,6 +800,128 @@ class CampaignContracts(unittest.TestCase):
             with self.subTest(spec=s), self.assertRaises(ValueError):
                 C.validate_spec(s)
 
+    def test_integer_bounds_and_strict_types(self):
+        for value in (0, 1, 0xffffffff):
+            C.integer(value, 0, 0xffffffff)
+        for value in (True, False, 1.0, '1', None, -1, 0x100000000):
+            with self.subTest(value=value), self.assertRaises(ValueError) as error:
+                C.integer(value, 0, 0xffffffff)
+            self.assertEqual(str(error.exception), 'invalid campaign integer')
+
+    def test_validation_keeps_first_error_and_input_object(self):
+        self.assertIs(C.validate_spec(self.spec), self.spec)
+        cases = [
+            ({'config': 'relative', 'runs': 0}, 'campaign paths must be absolute'),
+            ({'runs': True, 'atol': -1}, 'invalid campaign integer'),
+            ({'timeout': 0, 'train_timeout': 1, 'npu_timeout': 1},
+             'invalid campaign integer'),
+            ({'atol': -1, 'benches': []}, 'tolerances must be finite and nonnegative'),
+        ]
+        for changes, message in cases:
+            with self.subTest(changes=changes), self.assertRaises(ValueError) as error:
+                C.validate_spec({**self.spec, **changes})
+            self.assertEqual(str(error.exception), message)
+        spec = copy.deepcopy(self.spec)
+        profile = spec['benches'][0]['profiles'][0]
+        profile.update(name='neutral', net='relative', npu=1)
+        spec['benches'][0]['cpu']['steps'] = 1
+        with self.assertRaises(ValueError) as error:
+            C.validate_spec(spec)
+        self.assertEqual(str(error.exception), 'duplicate/reserved source name')
+
+    def test_identity_tracks_indirect_config_and_rejects_input_aliases(self):
+        self.fixture()
+        config_path = self.root / 'config.json'
+        cfg = json.loads(config_path.read_text())
+        provider = self.root / 'provider.json'
+        provider.write_text('first configuration')
+        cfg.update(config_files=[str(provider)],
+                   provider_options={'config_file': str(provider)})
+        E.write_json(config_path, cfg)
+        before = C.identity(self.spec)
+        self.assertEqual(before['files'][str(provider)], E.digest(provider))
+        provider.write_text('changed configuration')
+        self.assertNotEqual(before, C.identity(self.spec))
+        for files, message in (({}, 'config_files must be a list'),
+                               ([], 'provider config_file must be included in config_files')):
+            E.write_json(config_path, {**cfg, 'config_files': files})
+            with self.subTest(files=files), self.assertRaises(ValueError) as error:
+                C.identity(self.spec)
+            self.assertEqual(str(error.exception), message)
+        E.write_json(config_path, cfg)
+        alias = self.root / 'alias'
+        alias.mkdir()
+        for p in (self.root / 'train').glob('fg_*.bin'):
+            (alias / p.name).symlink_to(p)
+        spec = copy.deepcopy(self.spec)
+        spec['benches'][0]['heldout'] = str(alias)
+        with self.assertRaisesRegex(ValueError, 'train and heldout share capture paths'):
+            C.identity(spec)
+        for out in (self.spec['cache'], str(self.root), str(self.root / 'cache/child')):
+            with self.subTest(out=out), self.assertRaisesRegex(
+                    ValueError, 'out and cache must be separate directories'):
+                C.identity({**self.spec, 'out': out})
+        with self.assertRaisesRegex(ValueError, 'inputs must be outside output/cache directories'):
+            C.identity({**self.spec, 'out': str(self.root / 'train')})
+
+    def test_step_rejects_corrupt_receipts_without_repeating_or_removing_work(self):
+        variants = ('missing', 'malformed', 'wrong-type', 'schema', 'request',
+                    'data', 'hash', 'no-files', 'added', 'deleted', 'changed')
+        for variant in variants:
+            with self.subTest(variant=variant):
+                path = self.root / variant
+                def operation(out):
+                    out.mkdir()
+                    (out / 'data.bin').write_bytes(b'keep original work')
+                    return {'value': 1}
+                self.assertEqual(C.step(path, {'key': 1}, operation), {'value': 1})
+                receipt = path / 'campaign-step.json'
+                saved = json.loads(receipt.read_text())
+                if variant == 'missing':
+                    receipt.unlink()
+                elif variant == 'malformed':
+                    receipt.write_text('{')
+                elif variant == 'wrong-type':
+                    E.write_json(receipt, [])
+                elif variant in ('added', 'deleted', 'changed'):
+                    artifact = path / 'data.bin'
+                    if variant == 'added':
+                        (path / 'extra.log').write_text('diagnostic')
+                    elif variant == 'deleted':
+                        artifact.unlink()
+                    else:
+                        artifact.write_bytes(b'changed')
+                else:
+                    key, value = {'schema': ('schema', 2), 'request': ('request', {}),
+                                  'data': ('data', {'value': 2}),
+                                  'hash': ('data_sha256', 'wrong'),
+                                  'no-files': ('files', {})}[variant]
+                    saved[key] = value
+                    E.write_json(receipt, saved)
+                before = {str(p): p.read_bytes() for p in path.iterdir()}
+                retry = mock.Mock()
+                with self.assertRaises(RuntimeError) as error:
+                    C.step(path, {'key': 1}, retry)
+                self.assertEqual(str(error.exception),
+                                 f'stale/incomplete campaign step: {path}; preserve it and use a new out')
+                retry.assert_not_called()
+                self.assertEqual({str(p): p.read_bytes() for p in path.iterdir()}, before)
+
+    def test_failed_and_empty_steps_never_write_success_receipts(self):
+        path = self.root / 'failed'
+        def fail(out):
+            out.mkdir()
+            (out / 'diagnostic.log').write_text('preserved failure')
+            raise RuntimeError('operation failed')
+        with self.assertRaisesRegex(RuntimeError, 'operation failed'):
+            C.step(path, {}, fail)
+        self.assertFalse((path / 'campaign-step.json').exists())
+        self.assertEqual((path / 'diagnostic.log').read_text(), 'preserved failure')
+        empty = self.root / 'empty'
+        with self.assertRaisesRegex(RuntimeError, 'campaign step produced no artifacts'):
+            C.step(empty, {}, lambda out: out.mkdir())
+        self.assertFalse((empty / 'campaign-step.json').exists())
+
     def test_separate_timeouts_and_legacy_fallback_validation(self):
         for timeouts, expected in (({'train_timeout': 3, 'npu_timeout': 90}, (3, 90)),
                                    ({'timeout': 5, 'train_timeout': 3}, (3, 5)),
@@ -955,6 +1077,81 @@ C.campaign(argparse.Namespace(spec={str(spec)!r}))
         candidate.write_bytes(b'corrupt')
         with self.assertRaisesRegex(RuntimeError, 'stale/incomplete campaign step'):
             self.launch()
+
+    def test_all_benches_finish_cpu_work_before_sequential_npu_runs(self):
+        self.fixture()
+        self.spec['benches'][0]['cpu']['npu'] = True
+        second = copy.deepcopy(self.spec['benches'][0])
+        second['name'] = 'second'
+        second['profiles'][0]['npu'] = second['cpu']['npu'] = False
+        self.spec['benches'].append(second)
+        events, snapshots = [], []
+        def record(operation):
+            def run(path, *args, **kwargs):
+                events.append(str(path.relative_to(Path(self.spec['out']))))
+                return operation(path, *args, **kwargs)
+            return run
+        write = C.write_json
+        def save(path, value):
+            if path.name == 'campaign.json':
+                snapshots.append(copy.deepcopy(value))
+            write(path, value)
+        with mock.patch.object(C.preparation, 'prepare', side_effect=self.fake_prepare), \
+                mock.patch.object(C.preparation, 'candidate_params', side_effect=self.fake_candidate_params), \
+                mock.patch.object(E, 'supervise', side_effect=self.fake_supervise), \
+                mock.patch.object(C, 'evaluate', side_effect=record(C.evaluate)), \
+                mock.patch.object(C, 'prepare', side_effect=record(C.prepare)), \
+                mock.patch.object(C, 'train_cpu', side_effect=record(C.train_cpu)), \
+                mock.patch.object(C, 'run_npu', side_effect=record(C.run_npu)), \
+                mock.patch.object(C, 'write_json', side_effect=save):
+            self.launch()
+        self.assertEqual(events, [
+            'bench/eval-neutral', 'bench/eval-gpu', 'bench/bundle-gpu',
+            'bench/bundle-cpu', 'bench/eval-cpu', 'second/eval-neutral',
+            'second/eval-gpu', 'second/train-cpu', 'second/eval-cpu',
+            'bench/run-gpu', 'bench/run-cpu'])
+        self.assertEqual(len(snapshots), 12)
+        self.assertEqual(snapshots[0]['benches'], [])
+        states = [[row['npu']['status'] for bench in snapshot['benches']
+                   for row in bench['rows']] for snapshot in snapshots[6:]]
+        self.assertEqual(states, [
+            ['not-requested', 'pending', 'pending', 'not-requested', 'not-requested', 'not-requested'],
+            ['not-requested', 'running', 'pending', 'not-requested', 'not-requested', 'not-requested'],
+            ['not-requested', 'npu-raw-head-parity-passed', 'pending', 'not-requested', 'not-requested', 'not-requested'],
+            ['not-requested', 'npu-raw-head-parity-passed', 'running', 'not-requested', 'not-requested', 'not-requested'],
+            ['not-requested', 'npu-raw-head-parity-passed', 'npu-raw-head-parity-passed', 'not-requested', 'not-requested', 'not-requested'],
+            ['not-requested', 'npu-raw-head-parity-passed', 'npu-raw-head-parity-passed', 'not-requested', 'not-requested', 'not-requested']])
+        self.assertEqual([s['status'] for s in snapshots], ['running'] * 11 + ['complete'])
+
+    def test_markdown_exact_rows_for_missing_and_failed_parity(self):
+        row = {'name': 'gpu', 'metrics': dict(zip(C.METRICS, (1, 2, 3, 4, 5, 6))),
+               'delta_vs_neutral': dict(zip(C.METRICS, (0, -1, 2, 0, 0, 0))),
+               'cpu_train_steps': 0, 'cpu_train_seconds': None,
+               'npu': {'status': 'not-requested'}}
+        report = {'status': 'stopped', 'error': 'interrupted',
+                  'benches': [{'name': 'bench', 'rows': [row]}]}
+        expected = '''# Offline NPU campaign
+
+Status: stopped
+
+quality_validated: false; field-resolution offline metric, not served RGB.
+temporal_sigma is residual variation, not displayed flicker. NPU timing = host call incl. copies.
+
+## bench
+
+| source | resid | conf-resid | bad (%) | ssim | edge | temporal_sigma | delta vs neutral (source − neutral) | CPU train steps/seconds | NPU status | load_ms | cache before | p50/p99 ms | parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---:|---|
+| gpu | 1 | 2 | 3 | 4 | 5 | 6 | resid +0, resid_conf -1, bad% +2, ssim +0, edge +0, temporal_sigma +0 | 0 / — | not-requested | — | — | — / — | — |
+
+Stopped: interrupted
+'''
+        self.assertEqual(C.markdown(report), expected)
+        row['npu'] = {'status': 'failed-or-incomplete', 'load_ms': 12,
+                      'cache_state_before': 'warm', 'p50_ms': 2, 'p99_ms': 3,
+                      'parity': {'passed': False, 'max_abs_error': .25}}
+        self.assertEqual(C.markdown(report), expected.replace(
+            'not-requested | — | — | — / — | —',
+            'failed-or-incomplete | 12 | warm | 2 / 3 | failed; max_abs_error=0.25'))
 
     def test_resume_completed_cpu_steps_after_npu_failure(self):
         self.fixture()

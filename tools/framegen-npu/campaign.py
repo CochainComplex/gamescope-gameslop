@@ -33,7 +33,9 @@ def absolute(value):
 
 
 def integer(value, minimum=1, maximum=None):
-    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+    if type(value) is not int or value < minimum:
+        raise ValueError('invalid campaign integer')
+    if maximum is not None and value > maximum:
         raise ValueError('invalid campaign integer')
 
 
@@ -44,6 +46,46 @@ def name(value):
 
 def timeouts(spec):
     return tuple(spec.get(key, spec.get('timeout')) for key in ('train_timeout', 'npu_timeout'))
+
+
+def _validate_profile(profile, sources):
+    fields(profile, ('name', 'net', 'key', 'npu'))
+    name(profile['name'])
+    if profile['name'] in sources:
+        raise ValueError('duplicate/reserved source name')
+    sources.add(profile['name'])
+    absolute(profile['net'])
+    integer(profile['key'], 0, 0xffffffff)
+    if type(profile['npu']) is not bool:
+        raise ValueError('npu must be boolean')
+
+
+def _validate_cpu(cpu):
+    fields(cpu, ('steps', 'crop', 'profile_key', 'npu'))
+    integer(cpu['steps'], 2)  # one cosine-schedule step has zero LR
+    integer(cpu['crop'])
+    integer(cpu['profile_key'], 0, 0xffffffff)
+    if type(cpu['npu']) is not bool:
+        raise ValueError('npu must be boolean')
+
+
+def _validate_bench(bench, names):
+    fields(bench, ('name', 'train', 'heldout', 'profiles'), ('cpu',))
+    name(bench['name'])
+    if bench['name'] in names:
+        raise ValueError('duplicate bench name')
+    names.add(bench['name'])
+    if absolute(bench['train']) == absolute(bench['heldout']):
+        raise ValueError('train and heldout must be separate frozen captures')
+    if not isinstance(bench['profiles'], list):
+        raise ValueError('profiles must be a list')
+    sources = {'neutral', 'cpu'}
+    for profile in bench['profiles']:
+        _validate_profile(profile, sources)
+    if 'cpu' in bench:
+        _validate_cpu(bench['cpu'])
+    if not bench['profiles'] and 'cpu' not in bench:
+        raise ValueError('bench needs at least one source')
 
 
 def validate_spec(value):
@@ -64,36 +106,7 @@ def validate_spec(value):
         raise ValueError('benches must be a nonempty list')
     names = set()
     for bench in value['benches']:
-        fields(bench, ('name', 'train', 'heldout', 'profiles'), ('cpu',))
-        name(bench['name'])
-        if bench['name'] in names:
-            raise ValueError('duplicate bench name')
-        names.add(bench['name'])
-        if absolute(bench['train']) == absolute(bench['heldout']):
-            raise ValueError('train and heldout must be separate frozen captures')
-        if not isinstance(bench['profiles'], list):
-            raise ValueError('profiles must be a list')
-        sources = {'neutral', 'cpu'}
-        for profile in bench['profiles']:
-            fields(profile, ('name', 'net', 'key', 'npu'))
-            name(profile['name'])
-            if profile['name'] in sources:
-                raise ValueError('duplicate/reserved source name')
-            sources.add(profile['name'])
-            absolute(profile['net'])
-            integer(profile['key'], 0, 0xffffffff)
-            if type(profile['npu']) is not bool:
-                raise ValueError('npu must be boolean')
-        if 'cpu' in bench:
-            cpu = bench['cpu']
-            fields(cpu, ('steps', 'crop', 'profile_key', 'npu'))
-            integer(cpu['steps'], 2)  # one cosine-schedule step has zero LR
-            integer(cpu['crop'])
-            integer(cpu['profile_key'], 0, 0xffffffff)
-            if type(cpu['npu']) is not bool:
-                raise ValueError('npu must be boolean')
-        if not bench['profiles'] and 'cpu' not in bench:
-            raise ValueError('bench needs at least one source')
+        _validate_bench(bench, names)
     return value
 
 
@@ -104,11 +117,7 @@ def capture(path, minimum):
     return {str(p.resolve()): digest(p) for p in paths}
 
 
-def identity(spec):
-    """Hash every input and implementation, including indirectly referenced SDK config."""
-    from experiment import config
-    cfg = config(spec['config'])
-    absolute(cfg['python'])
+def _config_files(cfg):
     config_files = cfg.get('config_files', [])
     if not isinstance(config_files, list):
         raise ValueError('config_files must be a list')
@@ -116,6 +125,25 @@ def identity(spec):
     provider_file = cfg.get('provider_options', {}).get('config_file')
     if provider_file is not None and str(absolute(provider_file)) not in files:
         raise ValueError('provider config_file must be included in config_files')
+    return files
+
+
+def _validate_input_locations(spec, files):
+    out, cache = absolute(spec['out']), absolute(spec['cache'])
+    if out == cache or out in cache.parents or cache in out.parents:
+        raise ValueError('out and cache must be separate directories')
+    for p in files:
+        path = Path(p)
+        if any(path == d or d in path.parents for d in (out, cache)):
+            raise ValueError('inputs must be outside output/cache directories')
+
+
+def identity(spec):
+    """Hash every input and implementation, including indirectly referenced SDK config."""
+    from experiment import config
+    cfg = config(spec['config'])
+    absolute(cfg['python'])
+    files = _config_files(cfg)
     files[str(absolute(spec['config']))] = digest(spec['config'])
     for bench in spec['benches']:
         train, heldout = capture(bench['train'], 2), capture(bench['heldout'], 1)
@@ -125,13 +153,7 @@ def identity(spec):
         files.update(heldout)
         for profile in bench['profiles']:
             files[str(absolute(profile['net']))] = digest(profile['net'])
-    out, cache = absolute(spec['out']), absolute(spec['cache'])
-    if out == cache or out in cache.parents or cache in out.parents:
-        raise ValueError('out and cache must be separate directories')
-    for p in files:
-        path = Path(p)
-        if any(path == d or d in path.parents for d in (out, cache)):
-            raise ValueError('inputs must be outside output/cache directories')
+    _validate_input_locations(spec, files)
     for path in (*HERE.glob('*.py'), ROOT / 'scripts/framegen-net-eval.py',
                  ROOT / 'scripts/framegen-net-train.py'):
         files[str(path)] = digest(path)
@@ -149,15 +171,21 @@ def artifacts(path):
             if p.is_file() and p != path / 'campaign-step.json'}
 
 
+def _step_matches(saved, request, path):
+    if saved['schema'] != 1 or saved['request'] != request:
+        return False
+    if saved['data_sha256'] != fingerprint(saved['data']):
+        return False
+    return saved['files'] and saved['files'] == artifacts(path)
+
+
 def step(path, request, operation):
     """Only a receipt written after success permits reuse; preserve all failed work."""
     receipt = path / 'campaign-step.json'
     if path.exists():
         try:
             saved = json.loads(receipt.read_text())
-            if (saved['schema'] == 1 and saved['request'] == request
-                    and saved['data_sha256'] == fingerprint(saved['data'])
-                    and saved['files'] and saved['files'] == artifacts(path)):
+            if _step_matches(saved, request, path):
                 return saved['data']
         except (OSError, ValueError, KeyError, TypeError):
             pass
@@ -233,42 +261,39 @@ def run_npu(path, bundle, spec):
                        'atol': m['atol'], 'rtol': m['rtol']}}
 
 
+def _markdown_row(row):
+    def fmt(v):
+        return '—' if v is None else f'{v:.6g}'
+    npu = row['npu']
+    delta = ', '.join(f'{k} {v:+.6g}' for k, v in row['delta_vs_neutral'].items())
+    parity = npu.get('parity')
+    cells = [row['name'], *(fmt(row['metrics'][k]) for k in METRICS), delta,
+             f"{row['cpu_train_steps']} / {fmt(row['cpu_train_seconds'])}",
+             npu['status'], fmt(npu.get('load_ms')),
+             npu.get('cache_state_before', '—'),
+             f"{fmt(npu.get('p50_ms'))} / {fmt(npu.get('p99_ms'))}",
+             (('passed' if parity['passed'] else 'failed') +
+              '; max_abs_error=' + fmt(parity['max_abs_error'])) if parity else '—']
+    return '| ' + ' | '.join(cells) + ' |'
+
+
 def markdown(report):
     lines = ['# Offline NPU campaign', '', f"Status: {report['status']}", '',
              'quality_validated: false; ' + LABELS['metric_scope'] + '.',
              LABELS['temporal_scope'] + '. ' + LABELS['timing_scope'] + '.', '']
-    def fmt(v):
-        return '—' if v is None else f'{v:.6g}'
     for bench in report['benches']:
         lines += [f"## {bench['name']}", '',
                   '| source | resid | conf-resid | bad (%) | ssim | edge | temporal_sigma | delta vs neutral (source − neutral) | CPU train steps/seconds | NPU status | load_ms | cache before | p50/p99 ms | parity |',
                   '|---|' + '---:|' * 8 + '---|' + '---:|' + '---|' + '---:|' + '---|']
         for row in bench['rows']:
-            npu = row['npu']
-            delta = ', '.join(f'{k} {v:+.6g}' for k, v in row['delta_vs_neutral'].items())
-            parity = npu.get('parity')
-            cells = [row['name'], *(fmt(row['metrics'][k]) for k in METRICS), delta,
-                     f"{row['cpu_train_steps']} / {fmt(row['cpu_train_seconds'])}",
-                     npu['status'], fmt(npu.get('load_ms')),
-                     npu.get('cache_state_before', '—'),
-                     f"{fmt(npu.get('p50_ms'))} / {fmt(npu.get('p99_ms'))}",
-                     (('passed' if parity['passed'] else 'failed') +
-                      '; max_abs_error=' + fmt(parity['max_abs_error'])) if parity else '—']
-            lines.append('| ' + ' | '.join(cells) + ' |')
+            lines.append(_markdown_row(row))
         lines.append('')
     if report.get('error'):
         lines += ['Stopped: ' + report['error'], '']
     return '\n'.join(lines)
 
 
-@termination_signals()
-def campaign(args):
-    spec = validate_spec(json.loads(absolute(args.spec).read_text()))
-    inputs = identity(spec)
-    token = fingerprint(inputs)
-    out = absolute(spec['out'])
-    report = {'schema': 1, **LABELS, 'identity': inputs, 'fingerprint': token,
-              'status': 'running', 'benches': []}
+def _campaign_output(out, inputs):
     if out.exists():
         try:
             previous = json.loads((out / 'campaign.json').read_text())
@@ -279,6 +304,56 @@ def campaign(args):
             raise RuntimeError(f'stale/incomplete campaign root: {out}; use a new out')
     else:
         out.mkdir(parents=True, exist_ok=False)
+
+
+def _source_row(base, bench, source, neutral, perform):
+    bundle = base / ('bundle-' + source['name'])
+    if source['name'] != 'cpu':
+        metrics = perform(base / ('eval-' + source['name']),
+                          lambda p: evaluate(p, bench['heldout'],
+                                             source['net'], source['key']))
+    training = {'cpu_train_steps': 0, 'cpu_train_seconds': None}
+    if source['npu']:
+        training = perform(bundle, lambda p: prepare(p, bench, source))
+    elif source['name'] == 'cpu':
+        bundle = base / 'train-cpu'
+        training = perform(bundle, lambda p: train_cpu(p, bench, source))
+    if source['name'] == 'cpu':
+        metrics = perform(base / 'eval-cpu', lambda p: evaluate(
+            p, bench['heldout'], bundle / 'candidate.gsfr'))
+    row = {'name': source['name'], 'metrics': metrics, **training,
+           'delta_vs_neutral': {k: metrics[k] - neutral[k] for k in METRICS},
+           'npu': {'status': 'pending' if source['npu'] else 'not-requested'}}
+    return bundle, row
+
+
+def _run_pending(pending, spec, perform, save):
+    for path, bundle, row in pending:
+        row['npu'] = {'status': 'running'}
+        save()
+        try:
+            row['npu'] = perform(path, lambda p: run_npu(p, bundle, spec))
+        except (Exception, Terminated, KeyboardInterrupt):
+            row['npu'] = {'status': 'failed-or-incomplete'}
+            result = path / 'result.json'
+            if result.exists():
+                failed = json.loads(result.read_text())
+                row['npu'].update({k: failed[k] for k in
+                                   ('reason', 'parity', 'load_ms', 'cache_state_before')
+                                   if k in failed})
+            raise
+        save()
+
+
+@termination_signals()
+def campaign(args):
+    spec = validate_spec(json.loads(absolute(args.spec).read_text()))
+    inputs = identity(spec)
+    token = fingerprint(inputs)
+    out = absolute(spec['out'])
+    report = {'schema': 1, **LABELS, 'identity': inputs, 'fingerprint': token,
+              'status': 'running', 'benches': []}
+    _campaign_output(out, inputs)
 
     def save():
         write_json(out / 'campaign.json', report)
@@ -306,43 +381,13 @@ def campaign(args):
                 sources.append({'name': 'cpu', **bench['cpu']})
             for source in sources:
                 source = {**source, 'train_timeout': timeouts(spec)[0]}
-                bundle = base / ('bundle-' + source['name'])
-                if source['name'] != 'cpu':
-                    metrics = perform(base / ('eval-' + source['name']),
-                                      lambda p: evaluate(p, bench['heldout'],
-                                                         source['net'], source['key']))
-                training = {'cpu_train_steps': 0, 'cpu_train_seconds': None}
-                if source['npu']:
-                    training = perform(bundle, lambda p: prepare(p, bench, source))
-                elif source['name'] == 'cpu':
-                    bundle = base / 'train-cpu'
-                    training = perform(bundle, lambda p: train_cpu(p, bench, source))
-                if source['name'] == 'cpu':
-                    metrics = perform(base / 'eval-cpu', lambda p: evaluate(
-                        p, bench['heldout'], bundle / 'candidate.gsfr'))
-                row = {'name': source['name'], 'metrics': metrics, **training,
-                       'delta_vs_neutral': {k: metrics[k] - neutral[k] for k in METRICS},
-                       'npu': {'status': 'pending' if source['npu'] else 'not-requested'}}
+                bundle, row = _source_row(base, bench, source, neutral, perform)
                 summary['rows'].append(row)
                 if source['npu']:
                     pending.append((base / ('run-' + source['name']), bundle, row))
                 save()
         # All CPU work precedes sequential SDK execution, matching the absorbed pipeline.
-        for path, bundle, row in pending:
-            row['npu'] = {'status': 'running'}
-            save()
-            try:
-                row['npu'] = perform(path, lambda p: run_npu(p, bundle, spec))
-            except (Exception, Terminated, KeyboardInterrupt):
-                row['npu'] = {'status': 'failed-or-incomplete'}
-                result = path / 'result.json'
-                if result.exists():
-                    failed = json.loads(result.read_text())
-                    row['npu'].update({k: failed[k] for k in
-                                       ('reason', 'parity', 'load_ms', 'cache_state_before')
-                                       if k in failed})
-                raise
-            save()
+        _run_pending(pending, spec, perform, save)
         if identity(spec) != inputs:
             raise RuntimeError('campaign inputs changed; use frozen copies and a new out')
         report['status'] = 'complete'
