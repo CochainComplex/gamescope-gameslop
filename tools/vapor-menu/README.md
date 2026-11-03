@@ -145,6 +145,8 @@ python3 tools/vapor-menu/test_profiles.py
 These checks compile the C++ profile contracts and compare the two readers'
 configuration matrix. They also cover field/error ordering, host-option parsing,
 exact launch arguments and learned-file discovery without changing model weights.
+Learned-file checks protect explicit/preset/inherited/default path precedence,
+normalization, and context rejection before active learned-file admission.
 
 Build the rebased host with `~/Devstuff/prefix-upstream` first in
 `PKG_CONFIG_PATH`, as documented by its `rb.sh`/`build-deps.sh`. At runtime use

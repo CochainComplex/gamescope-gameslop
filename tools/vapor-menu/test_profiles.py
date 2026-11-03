@@ -51,6 +51,7 @@ class Profiles(unittest.TestCase):
             (["--back=drm"], "Use the full host option name: --back"),
             (["--framegen-p=warp"], "--framegen-p cannot override the preset through --host-arg"),
             (["--backend", "--"], "Invalid backend: --"),
+            (["--backend", "--framegen-pipeline"], "Invalid backend: --framegen-pipeline"),
             (["--backend="], "Invalid backend: "),
             (["--"], "-- cannot override the preset through --host-arg"),
         ]
@@ -64,6 +65,77 @@ class Profiles(unittest.TestCase):
                                           {"WAYLAND_DISPLAY": "", "DISPLAY": ":0"})
         self.assertEqual(context, dict(backend="wayland", base=False, vrr_hybrid=False,
                                        orientation="left", outputs="SteamControlled"))
+        # Option-looking values are consumed, rather than checked as new options.
+        context = launcher.launch_context(["--force-orientation", "--framegen-pipeline"], {})
+        self.assertEqual(context["orientation"], "--framegen-pipeline")
+
+    def test_learned_profile_precedence_and_normalization(self):
+        with tempfile.TemporaryDirectory(prefix="vapor-net-path-", dir="/tmp") as work:
+            folder = Path(work) / "game"
+            folder.mkdir()
+            invalid = Path(work) / "invalid.bin"
+            invalid.write_bytes(b"not a training profile")
+            preset = folder / "default.ini"
+            args = argparse.Namespace(game="game", profile="default", profile_root=work,
+                                      net_profile=None, gamescope="gamescope",
+                                      host_arg=[], command=["game"])
+            requested = str(Path(work) / "unused/../requested.bin")
+            saved = str(Path(work) / "saved.bin")
+            inherited = str(Path(work) / "inherited.bin")
+            cases = [
+                (requested, str(invalid), str(invalid), str(Path(work) / "requested.bin")),
+                ("", saved, str(invalid), saved),
+                (None, "", inherited, inherited),
+                ("", "", "", str(folder / "learned.bin")),
+                (None, "", None, str(folder / "learned.bin")),
+                ("~/" + Path(work).name + ".bin", "", "", str(Path.home() / (Path(work).name + ".bin"))),
+            ]
+            for explicit, stored, ambient, expected in cases:
+                preset.write_text(f"version=1\nnet_profile={stored}\n")
+                args.net_profile = explicit
+                environment = {} if ambient is None else {"GAMESCOPE_FRAMEGEN_NET_PROFILE": ambient}
+                original = environment.copy()
+                with self.subTest(explicit=explicit, stored=stored, ambient=ambient):
+                    _, env, settings, learned = launcher.launch_plan(args, environment)
+                    self.assertEqual(env["GAMESCOPE_FRAMEGEN_NET_PROFILE"], expected)
+                    self.assertEqual(env["GAMESCOPE_FRAMEGEN_NET_ONLINE"], "1")
+                    self.assertEqual((settings, learned), (folder, Path(expected).parent))
+                    self.assertEqual(environment, original)
+                    self.assertFalse(Path(expected).exists())
+                    self.assertEqual(invalid.read_bytes(), b"not a training profile")
+                    self.assertEqual(sorted(p.name for p in folder.iterdir()), ["default.ini"])
+
+    def test_learned_profile_admission_follows_context_and_activity(self):
+        with tempfile.TemporaryDirectory(prefix="vapor-net-order-", dir="/tmp") as work:
+            folder = Path(work) / "game"
+            folder.mkdir()
+            weights = folder / "invalid.bin"
+            weights.write_bytes(b"invalid")
+            preset = folder / "default.ini"
+            preset.write_text(f"version=1\nnet_profile={weights}\n")
+            args = argparse.Namespace(game="game", profile="default", profile_root=work,
+                                      net_profile=None, gamescope="gamescope",
+                                      host_arg=[], command=["game"])
+            cases = [
+                (["--backend=headless"], {}, "This backend cannot present generated frames"),
+                (["--force-orientation=left"], {}, "Output rotation makes frame generation dormant"),
+                ([], {"GAMESCOPE_FRAMEGEN_BASE": "invalid"}, "Invalid boolean setting: GAMESCOPE_FRAMEGEN_BASE"),
+                ([], {}, f"{weights}: incompatible training profile; choose a valid GSFP file or a new path"),
+            ]
+            for arguments, environment, message in cases:
+                args.host_arg = arguments
+                with self.subTest(arguments=arguments, environment=environment):
+                    with self.assertRaises(ValueError) as caught:
+                        launcher.launch_plan(args, environment)
+                    self.assertEqual(str(caught.exception), message)
+            for inactive in ("framegen=off", "mode=blend", "mode=extrapolate", "pipeline=warp", "pipeline=checked"):
+                preset.write_text(f"version=1\n{inactive}\nnet_profile={weights}\n")
+                with self.subTest(inactive=inactive):
+                    _, env, _, learned = launcher.launch_plan(args, {})
+                    self.assertEqual(env["GAMESCOPE_FRAMEGEN_NET_PROFILE"], str(weights))
+                    self.assertEqual(env["GAMESCOPE_FRAMEGEN_NET_ONLINE"], "0")
+                    self.assertEqual(learned, folder)
+                    self.assertEqual(weights.read_bytes(), b"invalid")
 
     def test_exact_launch_command_and_inherited_environment(self):
         with tempfile.TemporaryDirectory(prefix="vapor-plan-", dir="/tmp") as work:

@@ -69,7 +69,7 @@ def environment_bool(environment, key):
     raise ValueError(f"Invalid boolean setting: {key}")
 
 
-def launch_context(host_args, environment):
+def _host_options(host_args):
     managed = ("--experimental-framegen", "--framegen-mode", "--framegen-pipeline",
                "--framegen-multiplier")
     observed = {}
@@ -95,6 +95,11 @@ def launch_context(host_args, environment):
             raise ValueError(f"Duplicate host option: {option}")
         observed[option] = value
         index += 1
+    return observed
+
+
+def launch_context(host_args, environment):
+    observed = _host_options(host_args)
     backend = observed.get("--backend", "auto")
     if backend not in ("auto", "drm", "wayland", "sdl", "headless", "openvr"):
         raise ValueError(f"Invalid backend: {backend}")
@@ -198,6 +203,16 @@ def _launch_command(args, settings, game_library_path):
     return command
 
 
+def _learned_profile_path(requested, settings, environment, directory):
+    net = requested or settings["net_profile"] or environment.get("GAMESCOPE_FRAMEGEN_NET_PROFILE")
+    if not net:
+        net = str(directory / "learned.bin")
+    net = str(Path(net).expanduser().resolve())
+    if uses_net(settings):
+        validate_net_profile(Path(net))
+    return net
+
+
 def launch_plan(args, environment):
     game = identifier(args.game)
     config = Path(environment.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
@@ -213,12 +228,7 @@ def launch_plan(args, environment):
     context = launch_context(args.host_arg, environment)
     validate(settings, context)
     env = environment.copy()
-    net = args.net_profile or settings["net_profile"] or env.get("GAMESCOPE_FRAMEGEN_NET_PROFILE")
-    if not net:
-        net = str(root / game / "learned.bin")
-    net = str(Path(net).expanduser().resolve())
-    if uses_net(settings):
-        validate_net_profile(Path(net))
+    net = _learned_profile_path(args.net_profile, settings, env, root / game)
     env.update(VAPOR_GAME=game, VAPOR_PROFILE=profile, VAPOR_PROFILE_ROOT=str(root),
                VAPOR_BACKEND=context["backend"], VAPOR_BASE=str(int(context["base"])),
                VAPOR_VRR_HYBRID=str(int(context["vrr_hybrid"])),
