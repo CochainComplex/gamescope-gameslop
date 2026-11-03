@@ -16,6 +16,82 @@ spec.loader.exec_module(launcher)
 
 
 class Profiles(unittest.TestCase):
+    def test_preset_field_errors_keep_their_order_and_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="vapor-fields-", dir="/tmp") as work:
+            path = Path(work) / "default.ini"
+            cases = [
+                ("version=2\nversion=1\n", "Unsupported preset version"),
+                ("version=1\nversion=2\n", "Invalid or duplicate preset field"),
+                ("unknown=x\n", "Invalid preset setting: unknown"),
+                ("pipeline=warp\n", "Missing preset version"),
+                ("version=1\nno separator\n", "Invalid or duplicate preset field"),
+                ("version=1\nnet_profile=bad\rpath\n", "Invalid learned-profile path"),
+                ("version=1\nnet_profile=bad\0path\n", "Invalid learned-profile path"),
+                ("version=1\nnet_profile=" + "é"*2049 + "\n", "Invalid learned-profile path"),
+                ("version=1\nbidir=on\npipeline=spatial\n", "Spatial is causal only"),
+            ]
+            for content, message in cases:
+                data = content.encode()
+                path.write_bytes(data)
+                with self.subTest(message=message):
+                    with self.assertRaises(ValueError) as caught:
+                        launcher.load(path)
+                    self.assertEqual(str(caught.exception), message)
+                    self.assertEqual(path.read_bytes(), data)
+            path.write_text("# comment\n\nnet_profile=a=b\nversion=1\n")
+            self.assertEqual(launcher.load(path)["net_profile"], "a=b")
+            path.write_text("version=1\nnet_profile=" + "é"*2048)
+            self.assertEqual(launcher.load(path)["net_profile"], "é"*2048)
+
+    def test_host_context_option_consumption_and_error_priority(self):
+        cases = [
+            (["--backend"], "Missing value for --backend"),
+            (["--backend=drm", "--backend"], "Missing value for --backend"),
+            (["--backend=drm", "--backend=sdl"], "Duplicate host option: --backend"),
+            (["--back=drm"], "Use the full host option name: --back"),
+            (["--framegen-p=warp"], "--framegen-p cannot override the preset through --host-arg"),
+            (["--backend", "--"], "Invalid backend: --"),
+            (["--backend="], "Invalid backend: "),
+            (["--"], "-- cannot override the preset through --host-arg"),
+        ]
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError) as caught:
+                    launcher.launch_context(arguments, {})
+                self.assertEqual(str(caught.exception), message)
+        context = launcher.launch_context(["-f", "--force-orientation", "left",
+                                           "--virtual-connector-strategy=SteamControlled"],
+                                          {"WAYLAND_DISPLAY": "", "DISPLAY": ":0"})
+        self.assertEqual(context, dict(backend="wayland", base=False, vrr_hybrid=False,
+                                       orientation="left", outputs="SteamControlled"))
+
+    def test_exact_launch_command_and_inherited_environment(self):
+        with tempfile.TemporaryDirectory(prefix="vapor-plan-", dir="/tmp") as work:
+            folder = Path(work) / "game"
+            folder.mkdir()
+            (folder / "default.ini").write_text("version=1\npipeline=warp\nmultiplier=3\n")
+            (folder / ".active").mkdir()  # Explicit selection must not inspect a broken marker.
+            args = argparse.Namespace(game="game", profile="default", profile_root=work,
+                                      net_profile=None, gamescope="/host/gamescope",
+                                      host_arg=["-f", "--backend=drm"], command=["game", "", "a b"])
+            inherited = {"PATH": "/bin", "LD_LIBRARY_PATH": "", "GAMESCOPE_GPU_DIAGNOSTICS": "0"}
+            command, env, settings, learned = launcher.launch_plan(args, inherited)
+            self.assertEqual(command, ["/host/gamescope", "--expose-wayland", "--experimental-framegen",
+                                      "--framegen-mode", "motion", "--framegen-multiplier", "3",
+                                      "--framegen-pipeline", "warp", "-f", "--backend=drm", "--",
+                                      "bash", str(ROOT / "scripts/vapor-menu.sh"), "--", "env",
+                                      "LD_LIBRARY_PATH=", "game", "", "a b"])
+            self.assertEqual(inherited, {"PATH": "/bin", "LD_LIBRARY_PATH": "", "GAMESCOPE_GPU_DIAGNOSTICS": "0"})
+            self.assertEqual(env["PATH"], "/host:/bin")
+            self.assertEqual(env["GAMESCOPE_GPU_DIAGNOSTICS"], "0")
+            self.assertEqual(settings, folder)
+            self.assertEqual(learned, folder)
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), [".active", "default.ini"])
+            args.profile = None
+            with self.assertRaises(ValueError) as caught:
+                launcher.launch_plan(args, inherited)
+            self.assertEqual(str(caught.exception), "Invalid active preset")
+
     def test_cpp_storage_and_python_reader_agree(self):
         with tempfile.TemporaryDirectory(prefix="vapor-profiles-", dir="/tmp") as work:
             binary = Path(work) / "test"
@@ -142,7 +218,7 @@ class Profiles(unittest.TestCase):
                        "--gamescope", str(host), "--dry-run", "--", "game"]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("Spatial" if ROOT.name == "gamescope" else "does not support", result.stderr)
+            self.assertEqual(result.stderr, "vapor-profile: Selected host does not support the preset pipeline\n")
             self.assertFalse(root.exists())
 
     def test_reject_invalid_presets(self):

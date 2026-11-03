@@ -137,16 +137,9 @@ struct Profile {
             throw std::runtime_error(reason);
     }
 };
-inline Profile load(const fs::path &path) {
-    Profile p;
-    if (!fs::exists(path)) {
-        if (path.stem()=="spatial-experimental") p.set("pipeline","spatial");
-        return p;
-    }
-    if (fs::is_symlink(path) || !fs::is_regular_file(path) || fs::file_size(path)>8192)
-        throw std::runtime_error("Profile must be a small regular file");
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Cannot read profile");
+namespace detail {
+// Parse in file order; validate policy only after every field is applied.
+inline void readProfileFields(std::istream &in, Profile &p) {
     std::string line;
     bool version=false;
     std::vector<std::string> seen;
@@ -161,6 +154,19 @@ inline Profile load(const fs::path &path) {
         else p.set(key,value);
     }
     if (!version) throw std::runtime_error("Missing profile version");
+}
+} // namespace detail
+inline Profile load(const fs::path &path) {
+    Profile p;
+    if (!fs::exists(path)) {
+        if (path.stem()=="spatial-experimental") p.set("pipeline","spatial");
+        return p;
+    }
+    if (fs::is_symlink(path) || !fs::is_regular_file(path) || fs::file_size(path)>8192)
+        throw std::runtime_error("Profile must be a small regular file");
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Cannot read profile");
+    detail::readProfileFields(in,p);
     p.validate();
     return p;
 }
@@ -292,11 +298,10 @@ struct Store {
         fs::path parent=fs::path(draft.values.at("net_profile")).parent_path();
         if (fs::is_directory(parent)) for (auto &file : fs::directory_iterator(parent)) {
             if (learnedPaths.size()>=256) break;
-            if (file.is_regular_file() && !file.is_symlink() && file.path().extension()==".bin") {
-                try { validateLearned(file.path()); }
-                catch (const std::exception &) { continue; }
-                learnedPaths.push_back(file.path().string());
-            }
+            if (!file.is_regular_file() || file.is_symlink() || file.path().extension()!=".bin") continue;
+            try { validateLearned(file.path()); }
+            catch (const std::exception &) { continue; }
+            learnedPaths.push_back(file.path().string());
         }
         std::sort(learnedPaths.begin(),learnedPaths.end());
         learnedPaths.erase(std::unique(learnedPaths.begin(),learnedPaths.end()),learnedPaths.end());

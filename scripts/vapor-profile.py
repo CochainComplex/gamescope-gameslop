@@ -81,17 +81,19 @@ def launch_context(host_args, environment):
         if arg == "--" or (option.startswith("--") and
                            any(name.startswith(option) for name in managed)):
             raise ValueError(f"{option} cannot override the preset through --host-arg")
-        if option.startswith("--") and any(name.startswith(option) for name in valued):
-            if option not in valued:
-                raise ValueError(f"Use the full host option name: {option}")
-            if not equal:
-                index += 1
-                if index >= len(host_args):
-                    raise ValueError(f"Missing value for {option}")
-                value = host_args[index]
-            if option in observed:
-                raise ValueError(f"Duplicate host option: {option}")
-            observed[option] = value
+        if not option.startswith("--") or not any(name.startswith(option) for name in valued):
+            index += 1
+            continue
+        if option not in valued:
+            raise ValueError(f"Use the full host option name: {option}")
+        if not equal:
+            index += 1
+            if index >= len(host_args):
+                raise ValueError(f"Missing value for {option}")
+            value = host_args[index]
+        if option in observed:
+            raise ValueError(f"Duplicate host option: {option}")
+        observed[option] = value
         index += 1
     backend = observed.get("--backend", "auto")
     if backend not in ("auto", "drm", "wayland", "sdl", "headless", "openvr"):
@@ -135,6 +137,20 @@ def validate_net_profile(path):
             raise ValueError(error)
 
 
+def _set_preset_field(settings, key, value):
+    if key == "version":
+        if value != "1":
+            raise ValueError("Unsupported preset version")
+    elif key == "net_profile":
+        if len(value.encode()) > 4096 or any(c in value for c in "\r\n\0"):
+            raise ValueError("Invalid learned-profile path")
+        settings[key] = value
+    elif key not in CHOICES or value not in CHOICES[key]:
+        raise ValueError(f"Invalid preset setting: {key}")
+    else:
+        settings[key] = value
+
+
 def load(path):
     settings = DEFAULTS.copy()
     if not path.exists():
@@ -151,21 +167,35 @@ def load(path):
         if not separator or key in seen:
             raise ValueError("Invalid or duplicate preset field")
         seen.add(key)
-        if key == "version":
-            if value != "1":
-                raise ValueError("Unsupported preset version")
-        elif key == "net_profile":
-            if len(value.encode()) > 4096 or any(c in value for c in "\r\n\0"):
-                raise ValueError("Invalid learned-profile path")
-            settings[key] = value
-        elif key not in CHOICES or value not in CHOICES[key]:
-            raise ValueError(f"Invalid preset setting: {key}")
-        else:
-            settings[key] = value
+        _set_preset_field(settings, key, value)
     if "version" not in seen:
         raise ValueError("Missing preset version")
     validate(settings)
     return settings
+
+
+def _read_active_profile(path):
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65:
+        raise ValueError("Invalid active preset")
+    return path.read_text().removesuffix("\n")
+
+
+def _launch_command(args, settings, game_library_path):
+    command = [args.gamescope, "--expose-wayland"]
+    if settings["framegen"] == "on":
+        command += ["--experimental-framegen", "--framegen-mode", settings["mode"],
+                    "--framegen-multiplier", settings["multiplier"]]
+        if settings["mode"] == "motion":
+            command += ["--framegen-pipeline", settings["pipeline"]]
+    command += args.host_arg
+    wrapper = Path(__file__).resolve().parent / "vapor-menu.sh"
+    game_command = args.command
+    if game_library_path is not None:
+        game_command = ["env", "LD_LIBRARY_PATH=" + game_library_path, *game_command]
+    command += ["--", "bash", str(wrapper), "--", *game_command]
+    return command
 
 
 def launch_plan(args, environment):
@@ -174,10 +204,8 @@ def launch_plan(args, environment):
     root = Path(args.profile_root or config / "gamescope/profiles").expanduser().resolve()
     active = root / game / ".active"
     profile = args.profile
-    if profile is None and active.exists():
-        if active.is_symlink() or not active.is_file() or active.stat().st_size > 65:
-            raise ValueError("Invalid active preset")
-        profile = active.read_text().removesuffix("\n")
+    if profile is None:
+        profile = _read_active_profile(active)
     profile = identifier(profile or "default")
     settings = load(root / game / f"{profile}.ini")
     if settings["training_device"] != "gpu":
@@ -216,18 +244,7 @@ def launch_plan(args, environment):
     game_library_path = env.pop("LD_LIBRARY_PATH", None)
     if os.path.sep in args.gamescope:
         env["PATH"] = str(Path(args.gamescope).resolve().parent) + os.pathsep + env.get("PATH", os.defpath)
-    command = [args.gamescope, "--expose-wayland"]
-    if settings["framegen"] == "on":
-        command += ["--experimental-framegen", "--framegen-mode", settings["mode"],
-                    "--framegen-multiplier", settings["multiplier"]]
-        if settings["mode"] == "motion":
-            command += ["--framegen-pipeline", settings["pipeline"]]
-    command += args.host_arg
-    wrapper = Path(__file__).resolve().parent / "vapor-menu.sh"
-    game_command = args.command
-    if game_library_path is not None:
-        game_command = ["env", "LD_LIBRARY_PATH=" + game_library_path, *game_command]
-    command += ["--", "bash", str(wrapper), "--", *game_command]
+    command = _launch_command(args, settings, game_library_path)
     return command, env, root / game, Path(net).parent
 
 

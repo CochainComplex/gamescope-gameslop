@@ -142,6 +142,10 @@ Storage/launcher checks run without a compositor:
 python3 tools/vapor-menu/test_profiles.py
 ```
 
+These checks compile the C++ profile contracts and compare the two readers'
+configuration matrix. They also cover field/error ordering, host-option parsing,
+exact launch arguments and learned-file discovery without changing model weights.
+
 Build the rebased host with `~/Devstuff/prefix-upstream` first in
 `PKG_CONFIG_PATH`, as documented by its `rb.sh`/`build-deps.sh`. At runtime use
 its RUNPATH; do not inject the old `~/Devstuff/prefix` with `LD_LIBRARY_PATH` or

@@ -5,6 +5,51 @@
 template<class Fn> static bool rejects(Fn fn) {
     try { fn(); return false; } catch (const std::exception &) { return true; }
 }
+static void checkProfileFields(const vapor::fs::path &root) {
+    const auto path=root/"fields.ini";
+    const std::vector<std::pair<std::string,std::string>> cases{
+        {"version=2\nversion=1\n","Unsupported profile version"},
+        {"version=1\nversion=2\n","Duplicate profile field"},
+        {"unknown=x\n","Invalid profile setting: unknown"},
+        {"pipeline=warp\n","Missing profile version"},
+        {"version=1\nno separator\n","Invalid profile line"},
+        {"version=1\nnet_profile=bad\rpath\n","Invalid learned-profile path"},
+        {"version=1\nbidir=on\npipeline=spatial\n","Spatial is causal only"},
+    };
+    for (const auto &[bytes,message] : cases) {
+        std::ofstream(path) << bytes;
+        bool rejected=false;
+        try { vapor::load(path); }
+        catch (const std::runtime_error &error) { rejected=true; assert(error.what()==message); }
+        assert(rejected);
+    }
+    std::ofstream(path) << "# comment\n\nnet_profile=a=b\nversion=1";
+    assert(vapor::load(path).values.at("net_profile")=="a=b");
+    vapor::fs::remove(path);
+}
+static void checkLearnedDiscovery(vapor::Store &store, const vapor::fs::path &root,
+                                  const std::vector<uint8_t> &weights) {
+    const auto directory=root/"discovery";
+    vapor::fs::create_directories(directory);
+    for (const auto &name : {"a.bin","z.bin","ignored.BIN"})
+        std::ofstream(directory/name,std::ios::binary).write(
+            reinterpret_cast<const char *>(weights.data()),weights.size());
+    std::ofstream(directory/"invalid.bin") << "invalid";
+    vapor::fs::create_directory(directory/"directory.bin");
+    vapor::fs::create_symlink(directory/"a.bin",directory/"linked.bin");
+    vapor::fs::create_symlink(directory/"missing.bin",directory/"dangling.bin");
+    store.draft.set("net_profile",(directory/"new.bin").string());
+    store.refreshLearned();
+    assert((store.learnedPaths==std::vector<std::string>{(directory/"a.bin").string(),
+        (directory/"new.bin").string(),(directory/"z.bin").string()}));
+    store.draft.set("net_profile",(directory/"a.bin").string());
+    store.refreshLearned();
+    assert((store.learnedPaths==std::vector<std::string>{(directory/"a.bin").string(),
+        (directory/"z.bin").string()}));
+    store.draft.set("net_profile",(directory/"absent/file.bin").string());
+    store.refreshLearned();
+    assert((store.learnedPaths==std::vector<std::string>{(directory/"absent/file.bin").string()}));
+}
 int main(int argc, char **argv) {
     assert(argc==2);
     if (std::string(argv[1])=="--matrix") {
@@ -33,6 +78,7 @@ int main(int argc, char **argv) {
     }
     vapor::fs::path root=argv[1];
     vapor::fs::create_directories(root);
+    checkProfileFields(root);
     const auto builtIn = vapor::load(root/"spatial-experimental.ini");
     assert(builtIn.values.at("pipeline")=="spatial");
     assert(builtIn.values.at("bidir")=="off");
@@ -194,4 +240,5 @@ int main(int argc, char **argv) {
         assert(rows.draft.disabledReason("hud_scale")=="Enable frame generation first");
     }
     std::cout << "Profile persistence, validation, draft ownership and weight isolation PASS\n";
+    checkLearnedDiscovery(store,root,*weights);
 }
