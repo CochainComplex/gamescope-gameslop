@@ -527,11 +527,23 @@ repowise doc-drift --no-workspace --check --format json
 repowise coverage status
 ```
 
+When the checkout has staged, unstaged or untracked work, add `--working-tree`
+to the update so the graph and analysis include those live inputs. Preserve the
+edits and keep them out of the synchronization commit. Verify the recorded
+`working_tree_paths` against eligible dirty paths after configured exclusions;
+a matching commit alone does not establish working-tree freshness. Check
+`last_docs_commit`, pending rescore/decision lanes and queued updates as well as
+`last_sync_commit`.
+
 Inspect cascade-budget and stale-page warnings. Use the reported cascade scope
 or `repowise generate --stale` for remaining selected model pages; reserve
 `repowise update --full` for an incomplete index or generation-selection
 reconciliation. The full doctor checks SQL/vector/full-text synchronization and
 MCP startup; `--quick` omits those checks and cannot establish full synchronization.
+Compare stored documentation-drift findings with a live `--check` covering
+`path`, `link`, `anchor`, `command` and `symbol` references. If MCP reports
+`server_stale`, restart that client connection or verify with a fresh stdio MCP
+process using the installed CLI; index freshness does not update loaded code.
 
 Keep updates and persistent rescoring serial. For SQLite writer contention,
 the supported `--no-cost-tracking` update option isolates cost-tracker writes;
