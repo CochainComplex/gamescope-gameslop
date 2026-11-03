@@ -36,26 +36,49 @@ struct TrainingReport
 		&& ( ( bits & 0x80000000u ) == 0u || ( bits & 0x7fffffffu ) == 0u );
 }
 
+[[nodiscard]] inline bool training_report_expected_identity_valid( const TrainingReportIdentity &expected )
+{
+	if ( expected.epoch == 0 || expected.step == 0 || expected.attempt == 0 )
+		return false;
+	return uint64_t( expected.previousAcceptedStep ) + 1u == expected.step;
+}
+
+[[nodiscard]] inline bool training_report_payload_valid( const TrainingReportWords &words )
+{
+	if ( words[GSC_REPORT_MAGIC_AT] != GSC_REPORT_MAGIC
+		|| words[GSC_REPORT_VERSION_AT] != GSC_REPORT_VERSION
+		|| words[GSC_REPORT_PARAMETERS_AT] != GSC_REPORT_PARAMETERS )
+		return false;
+	if ( words[GSC_REPORT_COVERAGE_AT] != GSC_REPORT_PARAMETERS )
+		return false;
+	if ( words[GSC_REPORT_INVALID_STATE_AT] > 4u * GSC_REPORT_PARAMETERS
+		|| words[GSC_REPORT_INVALID_SERVED_AT] > GSC_REPORT_PARAMETERS
+		|| words[GSC_REPORT_CHANGED_AT] > GSC_REPORT_PARAMETERS )
+		return false;
+	return training_report_metric_valid( words[GSC_REPORT_MAX_ABS_AT] )
+		&& training_report_metric_valid( words[GSC_REPORT_MAX_DELTA_AT] );
+}
+
+[[nodiscard]] inline bool training_report_matches_identity(
+	const TrainingReportWords &words, const TrainingReportIdentity &expected )
+{
+	if ( words[GSC_REPORT_EPOCH_LO_AT] != uint32_t( expected.epoch )
+		|| words[GSC_REPORT_EPOCH_HI_AT] != uint32_t( expected.epoch >> 32 ) )
+		return false;
+	return words[GSC_REPORT_KEY_AT] == expected.key
+		&& words[GSC_REPORT_STEP_AT] == expected.step
+		&& words[GSC_REPORT_ATTEMPT_AT] == expected.attempt;
+}
+
 [[nodiscard]] inline std::optional<TrainingReport> decode_training_report(
 	const TrainingReportWords &words, const TrainingReportIdentity &expected )
 {
-	if ( expected.epoch == 0 || expected.step == 0 || expected.attempt == 0
-		|| uint64_t( expected.previousAcceptedStep ) + 1u != expected.step
-		|| words[GSC_REPORT_MAGIC_AT] != GSC_REPORT_MAGIC
-		|| words[GSC_REPORT_VERSION_AT] != GSC_REPORT_VERSION
-		|| words[GSC_REPORT_PARAMETERS_AT] != GSC_REPORT_PARAMETERS
-		|| words[GSC_REPORT_COVERAGE_AT] != GSC_REPORT_PARAMETERS
-		|| words[GSC_REPORT_INVALID_STATE_AT] > 4u * GSC_REPORT_PARAMETERS
-		|| words[GSC_REPORT_INVALID_SERVED_AT] > GSC_REPORT_PARAMETERS
-		|| words[GSC_REPORT_CHANGED_AT] > GSC_REPORT_PARAMETERS
-		|| !training_report_metric_valid( words[GSC_REPORT_MAX_ABS_AT] )
-		|| !training_report_metric_valid( words[GSC_REPORT_MAX_DELTA_AT] )
-		|| words[GSC_REPORT_EPOCH_LO_AT] != uint32_t( expected.epoch )
-		|| words[GSC_REPORT_EPOCH_HI_AT] != uint32_t( expected.epoch >> 32 )
-		|| words[GSC_REPORT_KEY_AT] != expected.key
-		|| words[GSC_REPORT_STEP_AT] != expected.step
-		|| words[GSC_REPORT_ATTEMPT_AT] != expected.attempt
-		|| words[GSC_REPORT_ACCEPTED_AT] > 1u )
+	// Admission checks inspect a completed report; GPU retirement belongs to the caller.
+	if ( !training_report_expected_identity_valid( expected ) )
+		return std::nullopt;
+	if ( !training_report_payload_valid( words ) )
+		return std::nullopt;
+	if ( !training_report_matches_identity( words, expected ) || words[GSC_REPORT_ACCEPTED_AT] > 1u )
 		return std::nullopt;
 	for ( uint32_t i = GSC_REPORT_RESERVED_AT; i < GSC_REPORT_WORDS; ++i )
 		if ( words[i] != 0u ) return std::nullopt;

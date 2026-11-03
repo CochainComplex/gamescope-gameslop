@@ -156,7 +156,10 @@ void ieeeMetricBits()
 		for ( uint32_t bits : { 0u, 0x80000000u, 1u, 0x007fffffu, 0x00800000u, 0x7f7fffffu } )
 		{
 			auto words = healthy(); words[field] = bits;
-			assert( decode_training_report( words, Identity ).has_value() );
+			const auto result = decode_training_report( words, Identity );
+			assert( result );
+			assert( std::bit_cast<uint32_t>( result->maxAbsServed ) == words[7] );
+			assert( std::bit_cast<uint32_t>( result->maxDelta ) == words[8] );
 		}
 		// Explicit encodings avoid host floating-point classification and
 		// exercise the same contract under -ffast-math.
