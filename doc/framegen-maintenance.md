@@ -584,6 +584,11 @@ coverage map: pass every still-applicable report in the same invocation to retai
 coverage and test contexts from other suites. A focused fixture's percentage
 describes its instrumented region, not the entire backend file.
 
+An index refresh does not refresh test measurements. When source commits move
+ahead of the coverage report, keep its original measurement revision and report
+the gap explicitly. Do not touch report timestamps or reimport old data merely
+to make coverage appear current; newly added code remains unmeasured.
+
 Keep source-extracted renderer/compositor/backend fixtures as scoped hit maps
 for test selection, outside whole-file coverage denominators. Whole-file
 measurement requires instrumentation of the complete translation unit and
