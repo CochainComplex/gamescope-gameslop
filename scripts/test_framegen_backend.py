@@ -105,6 +105,22 @@ class BackendContract(unittest.TestCase):
             B.require_contract(npu._replace(operation=resident.operation, execution=resident.execution),
                                B.requirements_for(resident))
 
+    def test_record_shape_rejection_never_reads_words(self):
+        class NoWordReads(tuple):
+            def __iter__(self):
+                raise AssertionError("malformed record words were observed")
+
+        contract = B.PROFILES["generation"]
+        required = B.requirements_for(contract)
+        for record, words in ((B.Contract, contract), (B.Requirements, required)):
+            for fields, values in ((record._fields[::-1], words), (record._fields, words[:-1])):
+                malformed = type("MalformedWire", (NoWordReads,), {"_fields": fields})(values)
+                with self.subTest(record=record.__name__, fields=fields), self.assertRaises(ValueError):
+                    if record is B.Contract:
+                        B.require_contract(malformed, required)
+                    else:
+                        B.require_contract(contract, malformed)
+
     def test_requirements_are_typed_and_missing_features_never_fallback(self):
         for name, contract in B.PROFILES.items():
             required = B.requirements_for(contract)

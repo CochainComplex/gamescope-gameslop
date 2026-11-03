@@ -82,8 +82,9 @@ def _record(value, record):
     # Tools intentionally load isolated script modules. Wire compatibility must
     # not depend on which copy created an immutable named tuple.
     if (not isinstance(value, tuple) or getattr(type(value), '_fields', None) != record._fields
-            or len(value) != len(record._fields)
-            or any(type(x) is not int or not 0 <= x <= 0xffffffff for x in value)):
+            or len(value) != len(record._fields)):
+        return None
+    if any(type(x) is not int or not 0 <= x <= 0xffffffff for x in value):
         return None
     # Use the validated words, never potentially inconsistent foreign attributes.
     return value if type(value) is record else record(*value)
