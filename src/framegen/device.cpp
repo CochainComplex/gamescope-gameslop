@@ -340,6 +340,48 @@ void CVulkanDevice::waitFramegen( uint64_t sequence )
 	cache_timeline_completion( m_framegenCompletedSeqNo, sequence );
 }
 
+// The owning timeline has completed; read once without waiting and attribute
+// this sample to its submitted batch shape. The caller retires the association
+// even when readback fails or the sample cannot seed a cost.
+void CVulkanDevice::framegenReadCompletedTiming( const std::pair<uint64_t, FramegenQueryAssoc_t> &completed )
+{
+	const FramegenQueryAssoc_t &association = completed.second;
+	const uint32_t nSlot = association.nSlot;
+	const uint32_t nRung = association.nRung;
+	const uint32_t nGeneratedCount = association.nGeneratedCount;
+	uint64_t ts[2] = { 0, 0 };
+	const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
+		sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
+	const uint64_t ulTimestampMask = m_uFramegenTimestampValidBits >= 64
+		? UINT64_MAX : ( ( 1ull << m_uFramegenTimestampValidBits ) - 1ull );
+	const uint64_t ulGpuTicks = ( ts[1] - ts[0] ) & ulTimestampMask;
+	if ( res != VK_SUCCESS || ulGpuTicks == 0
+		|| nRung >= kFramegenLadderSlots || nGeneratedCount >= kFramegenGeneratedCountSlots )
+		return;
+
+	// Timestamp values wrap at timestampValidBits, which can be less
+	// than 64 even though GetQueryPoolResults returns uint64_t values.
+	// Modular subtraction above keeps a wrap-crossing batch valid.
+	const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flFramegenTimestampPeriodNs );
+	if ( association.bOnlineTraining )
+	{
+		m_ulFramegenTrainingCostNs = std::max( m_ulFramegenTrainingCostNs, ulGpuNs );
+		m_ulFramegenTrainingSampleSeqNo = completed.first;
+	}
+	// Training-only batches own the same ring, but are not serving costs.
+	if ( nGeneratedCount == 0u )
+		return;
+
+	m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
+	// Fold into this exact batch shape with a symmetric slow EMA (7/8).
+	// A single anomalous batch must not shed pipeline passes for the whole scene,
+	// and x2-like gaps must not inherit x4-like batch timings.
+	uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
+	ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;
+	if ( m_aFramegenRungSamples[ nRung ][ nGeneratedCount ] != UINT32_MAX )
+		m_aFramegenRungSamples[ nRung ][ nGeneratedCount ]++;
+}
+
 // Recycle dedicated-queue command buffers and consume timestamp queries whose
 // owning timeline has completed. Shared-queue command buffers are recycled by
 // garbageCollect(), but their framegen query associations live here too so the
@@ -381,42 +423,7 @@ void CVulkanDevice::framegenGarbageCollect()
 	while ( completedQueriesEnd != m_framegenQuerySlotBySeqNo.end()
 		&& completedQueriesEnd->first <= currentSeqNo )
 	{
-		const uint32_t nSlot = completedQueriesEnd->second.nSlot;
-		const uint32_t nRung = completedQueriesEnd->second.nRung;
-		const uint32_t nGeneratedCount = completedQueriesEnd->second.nGeneratedCount;
-		uint64_t ts[2] = { 0, 0 };
-		const VkResult res = vk.GetQueryPoolResults( device(), m_framegenQueryPool, nSlot * 2, 2,
-			sizeof( ts ), ts, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
-		const uint64_t ulTimestampMask = m_uFramegenTimestampValidBits >= 64
-			? UINT64_MAX : ( ( 1ull << m_uFramegenTimestampValidBits ) - 1ull );
-		const uint64_t ulGpuTicks = ( ts[1] - ts[0] ) & ulTimestampMask;
-		if ( res == VK_SUCCESS && ulGpuTicks != 0
-			&& nRung < kFramegenLadderSlots && nGeneratedCount < kFramegenGeneratedCountSlots )
-		{
-			// Timestamp values wrap at timestampValidBits, which can be less
-			// than 64 even though GetQueryPoolResults returns uint64_t values.
-			// Modular subtraction above keeps a wrap-crossing batch valid.
-			const uint64_t ulGpuNs = (uint64_t)( double( ulGpuTicks ) * m_flFramegenTimestampPeriodNs );
-			if ( completedQueriesEnd->second.bOnlineTraining )
-			{
-				m_ulFramegenTrainingCostNs = std::max( m_ulFramegenTrainingCostNs, ulGpuNs );
-				m_ulFramegenTrainingSampleSeqNo = completedQueriesEnd->first;
-			}
-			// Training-only batches own the same ring, but are not serving costs.
-			if ( nGeneratedCount == 0u )
-			{
-				++completedQueriesEnd;
-				continue;
-			}
-			m_ulFramegenLastRawGpuTimeNs = ulGpuNs;
-			// Fold into this exact batch shape with a symmetric slow EMA (7/8).
-			// A single anomalous batch must not shed pipeline passes for the whole scene,
-			// and x2-like gaps must not inherit x4-like batch timings.
-			uint64_t &ulRungCost = m_aFramegenRungCostNs[ nRung ][ nGeneratedCount ];
-			ulRungCost = ( ulRungCost == 0 ) ? ulGpuNs : ( ulRungCost * 7 + ulGpuNs ) / 8;
-			if ( m_aFramegenRungSamples[ nRung ][ nGeneratedCount ] != UINT32_MAX )
-				m_aFramegenRungSamples[ nRung ][ nGeneratedCount ]++;
-		}
+		framegenReadCompletedTiming( *completedQueriesEnd );
 		++completedQueriesEnd;
 	}
 	m_framegenQuerySlotBySeqNo.erase( m_framegenQuerySlotBySeqNo.begin(), completedQueriesEnd );

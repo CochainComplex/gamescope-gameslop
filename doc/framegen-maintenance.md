@@ -106,6 +106,15 @@ Cancellation restores them only while source/history/grid identity still agrees.
 Keep their baked phase and target; general recording cancellation also needs an
 audit of motion, learning and reservoir publication.
 
+`framegenGarbageCollect` observes the owning completion timeline once and retires
+completed command buffers before reading their timing samples.
+`framegenReadCompletedTiming` owns one completed association's non-waiting query
+read and cost accounting; GC consumes even failed or unusable samples. Training
+reset removes training eligibility while preserving serving samples; scene reset
+drops associations without releasing pending command buffers. The CPU contracts
+in `tests/test_framegen_device.py` cover this ordering and accounting, not GPU
+completion or display timing.
+
 `evaluate_deadline_ladder` drains a nonzero hold and returns before checking
 cost maturity or rung limits. The decision that drains the hold to zero still
 cannot degrade; only the next decision may do so. The renderer keeps the

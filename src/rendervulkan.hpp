@@ -1486,6 +1486,8 @@ protected:
 	uint64_t m_ulStagingCopyMaxNs = 0;
 
 private:
+	// Compositor-thread accounting for one completed query association; no wait.
+	inline __attribute__((always_inline)) void framegenReadCompletedTiming( const std::pair<uint64_t, FramegenQueryAssoc_t> &completed );
 	// Dedicated queue only; cmdBuf has already been ended exactly once.
 	// Keep the ordinary submit path free of an extra call/ownership wrapper.
 	inline __attribute__((always_inline)) uint64_t submitFramegenCommands( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, uint64_t ulWaitCompositeSeqNo, int nQuerySlot, uint32_t nLadderRung, uint32_t nGeneratedCount, bool bOnlineTraining );
