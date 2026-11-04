@@ -13504,35 +13504,11 @@ static void framegen_bidir_drop_queued_real( uint64_t ulRealFrameId )
 	framegen_metrics_note_dropped_real( 1 );
 }
 
-static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false, uint64_t ulAnchorRealFrameId = 0, bool bExplicitProvisional = false, bool bBoundCorrection = false )
+struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; uint64_t ulWakeDeadlineNs; std::optional<uint64_t> oTargetVBlankNs; };
+
+static bool framegen_submit_reserve_slots( const FramegenSlotRequest_t *pRequests,
+	uint32_t nRequestCount, uint64_t ulSingleTargetFlipNs, std::vector<SlotPlan_t> &slots )
 {
-	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0
-		|| !framegen_work_completed() )
-		return false;
-
-	// Fold the previous batch's adaptation readback into the adaptation state
-	// before recording this one, so its thresholds ride these push constants.
-	framegen_adapt_consume( eff.pipeline );
-	// Stage C dataset capture: flush the previous batch's training tensors
-	// under the same completion gate.
-	framegen_record_consume();
-	framegen_color_probe_consume();
-	// Online learning: persist the last profile snapshot, if one completed.
-	framegen_net_profile_consume();
-	if ( bBoundCorrection && ( !g_framegenHistory.valid
-		|| g_framegenHistory.previousReal == nullptr || g_framegenHistory.currentReal == nullptr ) )
-		return false;
-
-	if ( bClearPending )
-		g_framegenHistory.pending.clear();
-
-	const uint64_t ulRecordStartNs = get_time_in_nanos();
-	const bool bLearningPipelinesWarm = g_framegenMotion.learning.warmedSeqNo != 0u;
-
-	// Reserve this interval's output slots up front so an empty batch never
-	// records/submits a command buffer.
-	struct SlotPlan_t { gamescope::Rc<CVulkanTexture> tex; float phase; float strength; uint32_t slotIndex; uint64_t ulTargetFlipNs; uint64_t ulWakeDeadlineNs; std::optional<uint64_t> oTargetVBlankNs; };
-	std::vector<SlotPlan_t> slots;
 	slots.reserve( nRequestCount );
 	for ( uint32_t i = 0; i < nRequestCount; i++ )
 	{
@@ -13583,64 +13559,13 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		framegen_net_note_skip( NetLearningSkip::OutputPool );
 		return false;
 	}
-	if ( pColorProbe != nullptr
-		&& ( slots.size() != k_uFramegenColorProbeCandidates
-			|| pColorProbe->reference == nullptr
-			|| !framegen_color_probe_prepare( slots[ 0 ].tex->width(), slots[ 0 ].tex->height(),
-				slots[ 0 ].tex->drmFormat(), pColorProbe->eotf ) ) )
-		return false;
+	return true;
+}
 
-	// Record the whole interval's generation into ONE command buffer submitted
-	// once: the shared motion intermediates are serialized by the per-command-
-	// buffer barrier tracking, all slots share a single framegen seqNo, and the
-	// batch draws from the isolated framegen descriptor ring (see markFramegen).
-	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer( true );
-	pCmdBuffer->markFramegen();
-	const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( g_framegenHistory.drmFormat );
-	const bool bBidir = vulkan_framegen_bidir_active();
-	const bool bMotionRequested = eff.mode == GamescopeFramegenMode::Motion
-		&& dispatch.motionSupported;
-	// The classic/deadline/idle planners can submit several batches for one real
-	// interval. Re-estimating and re-training on that identical pair both wastes
-	// the deadline and statistically overweights slow intervals. The finalized
-	// field remains resident until any new preparation explicitly invalidates it.
-	const bool bReuseMotion = pColorProbe == nullptr
-		&& bMotionRequested
-		&& g_framegenMotion.uMotionFieldFrameId != 0
-		&& g_framegenMotion.uMotionFieldFrameId == g_framegenHistory.currentFrameId
-		&& g_framegenMotion.eMotionFieldPipeline == eff.pipeline
-		&& g_framegenMotion.bMotionFieldBidir == bBidir
-		&& framegen_motion_field() != nullptr
-		&& ( !bBidir || framegen_motion_field_rev() != nullptr );
-	// Classic batches keep their historical generated-count key and exclude
-	// cached refills. Deadline pacing measures cached warps too, but under their
-	// own work-class key so they cannot make full preparation look cheaper.
-	const gamescope::framegen::DeadlineWorkClass_t eDeadlineWorkClass = bReuseMotion
-		? gamescope::framegen::DeadlineWorkClass_t::CachedWarp
-		: gamescope::framegen::DeadlineWorkClass_t::FullPreparationAndWarp;
-	// Only this already-prepared shape has a cancellation boundary without
-	// publishing fresh motion/learning/reservoir state during recording.
-	uint64_t ulCorrectionCostNs = 0u;
-	if ( bBoundCorrection )
-	{
-		if ( !bReuseMotion || bBidir || pColorProbe != nullptr || bClearPending )
-			return false;
-		if ( eff.mode != GamescopeFramegenMode::Motion
-			|| eff.pipeline != GamescopeFramegenPipeline::Checked )
-			return false;
-		if ( !bDeadlineCostKeying || nRequestCount != 1u
-			|| !g_device.hasFramegenQueue() || pRequests[ 0 ].wakeDeadlineNs == 0u )
-			return false;
-		const uint32_t key = gamescope::framegen::deadline_work_class_cost_key( eDeadlineWorkClass );
-		ulCorrectionCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, key );
-		if ( ulCorrectionCostNs == 0u
-			|| g_device.framegenRungSampleCount( g_framegenHistory.nDegradeSteps, key )
-				< gamescope::framegen::k_uDeadlineMinSamples )
-			return false;
-	}
-	const int nQuerySlot = !bReuseMotion || bDeadlineCostKeying
-		? g_device.framegenTimestampBegin( pCmdBuffer.get() ) : -1;
-
+static void framegen_submit_preserve_motion_history( CVulkanCmdBuffer *pCmdBuffer,
+	bool bReuseMotion, const FramegenColorProbeRequest_t *pColorProbe,
+	bool bMotionRequested, bool bBidir, const FramegenEffective_t &eff )
+{
 	// Preserve the preceding pair's finalized displacement before preparation
 	// overwrites the working fields. The exact pipeline/mode and consecutive-ID
 	// gates keep estimator changes or a skipped interval from looking like
@@ -13667,22 +13592,11 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			g_framegenMotion.uMotionHistoryIntervalNs = 0;
 		}
 	}
+}
 
-	// Motion estimation depends only on the two real frames, so it is computed
-	// once for the real pair; later batches reuse its finalized field. Falls
-	// back to extrapolation for every slot if the
-	// intermediates can't be allocated. The ladder's effective mode (not the base
-	// global) selects the pass, so motion can be shed under GPU pressure without
-	// disturbing vulkan_framegen_is_enabled() or the forced-composite tax.
-	const bool bMotion = bReuseMotion || ( bMotionRequested
-		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(),
-			g_framegenHistory.currentReal->height(), dispatch, eff.pipeline ) );
-	// Held-out samples grade the actual motion path, not its allocation or
-	// capability fallback. A failed motion setup drops the sample and leaves all
-	// real-frame presentation untouched.
-	if ( pColorProbe != nullptr && !bMotion )
-		return false;
-
+static bool framegen_submit_record_net( CVulkanCmdBuffer *pCmdBuffer, bool bMotion,
+	bool bReuseMotion, const FramegenEffective_t &eff, bool bBidir )
+{
 	// With the checked fields final, capture the RAW training tensors
 	// (pre-refinement, pre-trust — what the net must learn to improve on),
 	// then refine both fields through the net. Everything downstream — the adaptation
@@ -13704,25 +13618,21 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	// the training dispatches below stand down with it.
 	if ( bMotion && !bReuseMotion && framegen_net_requested( eff.pipeline )
 		&& g_framegenMotion.mvFieldNet != nullptr )
-		framegen_record_net( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height, bBidir );
-	// With the field final, record the adaptation probe — the warps below
-	// read its verdict in this same batch, the CPU next batch. The meter-only
-	// probe waits until the generated frames are recorded.
-	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.pipeline );
-	// A reused field was measured with the batch that estimated it, and a
-	// colour-validation field spans a skipped frame, not a display pair.
-	const bool bMeterProbe = bMotion && !bReuseMotion && !bAdaptProbe && pColorProbe == nullptr
-		&& framegen_quality_meter_enabled();
-	if ( bAdaptProbe )
-		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
+		framegen_record_net( pCmdBuffer, g_framegenMotion.width, g_framegenMotion.height, bBidir );
+	return bNetRecord;
+}
 
+static bool framegen_submit_train_motion( CVulkanCmdBuffer *pCmdBuffer,
+	const FramegenColorProbeRequest_t *pColorProbe, bool bReuseMotion,
+	const FramegenEffective_t &eff, bool bAdaptProbe, bool bMotion, bool bBidir )
+{
 	// Train after the probe so a content cut can zero every gradient slice
 	// before Adam sees it. Same-batch inference still used the pre-step weights;
 	// the optimizer publishes only for the next batch. When adaptation is
 	// explicitly disabled, training retains its previous unguarded behavior.
 	const bool bNetStateReadback = pColorProbe == nullptr
 		&& !bReuseMotion && g_framegenMotion.bNetActive && framegen_net_online_enabled()
-		&& framegen_record_net_train_pair( pCmdBuffer.get(), eff.pipeline, bAdaptProbe );
+		&& framegen_record_net_train_pair( pCmdBuffer, eff.pipeline, bAdaptProbe );
 	// Mirrors bNetStateReadback above and framegen_net_requested's pipeline gate.
 	if ( pColorProbe != nullptr )
 		framegen_net_note_skip( NetLearningSkip::ColorProbe );
@@ -13743,6 +13653,14 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		g_framegenMotion.eMotionFieldPipeline = eff.pipeline;
 		g_framegenMotion.bMotionFieldBidir = bBidir;
 	}
+	return bNetStateReadback;
+}
+
+static void framegen_submit_record_slots( CVulkanCmdBuffer *pCmdBuffer,
+	const std::vector<SlotPlan_t> &slots, bool bMotion, bool bBidir,
+	const FramegenColorProbeRequest_t *pColorProbe, const FramegenEffective_t &eff,
+	const FramegenDispatch_t &dispatch )
+{
 	if ( bMotion )
 	{
 		// Each warp reads the shared motion field(s) and history; keep per-slot.
@@ -13763,12 +13681,12 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 						? flEndpointTraceOverride : flOneSidedOverride;
 					flOverride = k_flFramegenColorProbeStrengths[ i ];
 				}
-				framegen_bidir_warp_slot( pCmdBuffer.get(), slot.tex,
+				framegen_bidir_warp_slot( pCmdBuffer, slot.tex,
 					std::clamp( slot.phase, 0.0f, 1.0f ), eff.pipeline,
 					flOneSidedOverride, flEndpointTraceOverride );
 			}
 			else
-				framegen_warp_slot( pCmdBuffer.get(), slot.tex, slot.strength, eff.pipeline );
+				framegen_warp_slot( pCmdBuffer, slot.tex, slot.strength, eff.pipeline );
 		}
 	}
 	else if ( eff.mode == GamescopeFramegenMode::Blend || bBidir )
@@ -13779,7 +13697,7 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		// (An extrapolated slot would predict PAST the newest frame — content
 		// from a different timeline that would visibly jump.)
 		for ( const SlotPlan_t &slot : slots )
-			framegen_bind_blend( pCmdBuffer.get(), slot.tex, std::clamp( slot.phase, 0.0f, 1.0f ) );
+			framegen_bind_blend( pCmdBuffer, slot.tex, std::clamp( slot.phase, 0.0f, 1.0f ) );
 	}
 	else
 	{
@@ -13789,13 +13707,17 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		size_t i = 0;
 		for ( ; i + 1 < slots.size(); i += 2 )
 		{
-			framegen_bind_extrapolate_pair( pCmdBuffer.get(), dispatch.extrapolatePair,
+			framegen_bind_extrapolate_pair( pCmdBuffer, dispatch.extrapolatePair,
 				slots[ i ].tex, slots[ i + 1 ].tex, slots[ i ].strength, slots[ i + 1 ].strength );
 		}
 		if ( i < slots.size() )
-			framegen_bind_extrapolate( pCmdBuffer.get(), dispatch.extrapolate, slots[ i ].tex, slots[ i ].strength );
+			framegen_bind_extrapolate( pCmdBuffer, dispatch.extrapolate, slots[ i ].tex, slots[ i ].strength );
 	}
+}
 
+static void framegen_submit_preserve_luma( CVulkanCmdBuffer *pCmdBuffer,
+	bool bMotion, bool bBidir, const FramegenEffective_t &eff )
+{
 	// Preserve two-interval-old real-frame luma without extending the
 	// output-ring lifetime. Every warp above reads the old reservoir first;
 	// this same-command-buffer copy is ordered after those reads and publishes
@@ -13825,16 +13747,21 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 			g_framegenMotion.uLumaReservoirFrameId[nTarget] = g_framegenHistory.previousFrameId;
 		}
 	}
+}
 
+static bool framegen_submit_finish_recording( CVulkanCmdBuffer *pCmdBuffer,
+	int nQuerySlot, bool bNetStateReadback, bool bAdaptProbe, bool bMeterProbe,
+	const FramegenColorProbeRequest_t *pColorProbe, const std::vector<SlotPlan_t> &slots )
+{
 	if ( !bNetStateReadback || !bAdaptProbe )
-		g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
+		g_device.framegenTimestampEnd( pCmdBuffer, nQuerySlot );
 	// Non-training batches exclude the meter/readback overhead from rung costs.
 	// Trained batches retain the complete cost as their optional-learning bound.
 	// The exclusion is only approximate: under synchronization2 the meter's
 	// dispatches can start while the last warps are still executing, so part of
 	// its cost can land before the end timestamp.
 	const bool bStatsRecorded = bAdaptProbe
-		|| ( bMeterProbe && framegen_record_quality_meter( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height ) );
+		|| ( bMeterProbe && framegen_record_quality_meter( pCmdBuffer, g_framegenMotion.width, g_framegenMotion.height ) );
 	if ( pColorProbe != nullptr )
 	{
 		// Readback copies deliberately sit after the end timestamp: held-out validation measures
@@ -13846,36 +13773,16 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		pCmdBuffer->hostReadBarrier();
 	}
 	if ( bNetStateReadback && bAdaptProbe )
-		g_device.framegenTimestampEnd( pCmdBuffer.get(), nQuerySlot );
-	// Causal pacing reuses the existing small timestamp table, but causal one-slot work
-	// is keyed by preparation shape instead of the now-constant output count.
-	const uint32_t nCostKey = bDeadlineCostKeying
-		? gamescope::framegen::deadline_work_class_cost_key( eDeadlineWorkClass )
-		: (uint32_t)slots.size();
-	// Split-family base mode ingests the new history on the COMPOSITE queue, at a
-	// scratch-timeline point strictly later than the composite this batch was
-	// planned against. Waiting on the composite alone would let the framegen
-	// queue sample previousReal/currentReal while that copy is still writing it.
-	// lastBaseIngestSeqNo is zero on every other path, so this is a no-op there.
-	const uint64_t ulWaitCompositeSeqNo =
-		std::max( ulCompositeSeqNo, g_framegenHistory.lastBaseIngestSeqNo );
-	const uint64_t ulSeqNo = bBoundCorrection
-		? g_device.trySubmitFramegenBefore( std::move( pCmdBuffer ),
-			ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey,
-			false, pRequests[ 0 ].wakeDeadlineNs, ulCorrectionCostNs )
-		: g_device.submitFramegen( std::move( pCmdBuffer ),
-			ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey,
-			bNetStateReadback && bAdaptProbe );
-	if ( ulSeqNo == 0u )
-		return false;
-	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
-	const uint64_t ulSubmitNs = get_time_in_nanos();
-	if ( bNetStateReadback && bAdaptProbe && bLearningPipelinesWarm )
-	{
-		g_framegenMotion.learning.pendingRecordSeqNo = ulSeqNo;
-		g_framegenMotion.learning.pendingRecordNs = ulSubmitNs - ulRecordStartNs;
-	}
+		g_device.framegenTimestampEnd( pCmdBuffer, nQuerySlot );
+	return bStatsRecorded;
+}
 
+static void framegen_submit_publish( const std::vector<SlotPlan_t> &slots,
+	const FramegenColorProbeRequest_t *pColorProbe, uint64_t ulSeqNo,
+	uint64_t ulCompositeSeqNo, uint64_t ulSubmitNs, uint64_t ulAnchorRealFrameId,
+	bool bDeadlineCostKeying, bool bExplicitProvisional, uint32_t nGapVblanks,
+	bool bStatsRecorded, bool bAdaptProbe, bool bNetRecord, bool bNetStateReadback )
+{
 	for ( const SlotPlan_t &slot : slots )
 	{
 		if ( pColorProbe != nullptr )
@@ -13946,7 +13853,13 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 	g_framegenHistory.genReadB = g_framegenHistory.currentReal;
 	g_framegenHistory.genReadReference = pColorProbe != nullptr ? pColorProbe->reference : nullptr;
 	g_framegenHistory.genReadSeqNo = ulSeqNo;
+}
 
+static void framegen_submit_notify( const std::vector<SlotPlan_t> &slots,
+	const FramegenColorProbeRequest_t *pColorProbe, uint32_t nGapVblanks,
+	bool bMotion, const FramegenEffective_t &eff, uint32_t nMaxDegradeSteps,
+	bool bReuseMotion, bool bDeadlineCostKeying )
+{
 	const uint32_t nGeneratedCount = (uint32_t)slots.size();
 
 	static uint64_t s_uGeneratedDebugLogCounter = 0;
@@ -13989,6 +13902,171 @@ static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uin
 		else
 			nudge_steamcompmgr();
 	}
+}
+
+static bool framegen_submit_planned( const FramegenSlotRequest_t *pRequests, uint32_t nRequestCount, uint32_t nGapVblanks, const FramegenEffective_t &eff, uint64_t ulCompositeSeqNo, uint32_t nMaxDegradeSteps, bool bClearPending, const FramegenColorProbeRequest_t *pColorProbe = nullptr, uint64_t ulSingleTargetFlipNs = 0, bool bDeadlineCostKeying = false, uint64_t ulAnchorRealFrameId = 0, bool bExplicitProvisional = false, bool bBoundCorrection = false )
+{
+	if ( nRequestCount == 0 || nGapVblanks == 0 || ulCompositeSeqNo == 0
+		|| !framegen_work_completed() )
+		return false;
+
+	// Fold the previous batch's adaptation readback into the adaptation state
+	// before recording this one, so its thresholds ride these push constants.
+	framegen_adapt_consume( eff.pipeline );
+	// Stage C dataset capture: flush the previous batch's training tensors
+	// under the same completion gate.
+	framegen_record_consume();
+	framegen_color_probe_consume();
+	// Online learning: persist the last profile snapshot, if one completed.
+	framegen_net_profile_consume();
+	if ( bBoundCorrection && ( !g_framegenHistory.valid
+		|| g_framegenHistory.previousReal == nullptr || g_framegenHistory.currentReal == nullptr ) )
+		return false;
+
+	if ( bClearPending )
+		g_framegenHistory.pending.clear();
+
+	const uint64_t ulRecordStartNs = get_time_in_nanos();
+	const bool bLearningPipelinesWarm = g_framegenMotion.learning.warmedSeqNo != 0u;
+
+	// Reserve this interval's output slots up front so an empty batch never
+	// records/submits a command buffer.
+	std::vector<SlotPlan_t> slots;
+	if ( !framegen_submit_reserve_slots( pRequests, nRequestCount, ulSingleTargetFlipNs, slots ) )
+		return false;
+	if ( pColorProbe != nullptr
+		&& ( slots.size() != k_uFramegenColorProbeCandidates
+			|| pColorProbe->reference == nullptr
+			|| !framegen_color_probe_prepare( slots[ 0 ].tex->width(), slots[ 0 ].tex->height(),
+				slots[ 0 ].tex->drmFormat(), pColorProbe->eotf ) ) )
+		return false;
+
+	// Record the whole interval's generation into ONE command buffer submitted
+	// once: the shared motion intermediates are serialized by the per-command-
+	// buffer barrier tracking, all slots share a single framegen seqNo, and the
+	// batch draws from the isolated framegen descriptor ring (see markFramegen).
+	std::unique_ptr<CVulkanCmdBuffer> pCmdBuffer = g_device.commandBuffer( true );
+	pCmdBuffer->markFramegen();
+	const FramegenDispatch_t &dispatch = framegen_dispatch_for_format( g_framegenHistory.drmFormat );
+	const bool bBidir = vulkan_framegen_bidir_active();
+	const bool bMotionRequested = eff.mode == GamescopeFramegenMode::Motion
+		&& dispatch.motionSupported;
+	// The classic/deadline/idle planners can submit several batches for one real
+	// interval. Re-estimating and re-training on that identical pair both wastes
+	// the deadline and statistically overweights slow intervals. The finalized
+	// field remains resident until any new preparation explicitly invalidates it.
+	const bool bReuseMotion = pColorProbe == nullptr
+		&& bMotionRequested
+		&& g_framegenMotion.uMotionFieldFrameId != 0
+		&& g_framegenMotion.uMotionFieldFrameId == g_framegenHistory.currentFrameId
+		&& g_framegenMotion.eMotionFieldPipeline == eff.pipeline
+		&& g_framegenMotion.bMotionFieldBidir == bBidir
+		&& framegen_motion_field() != nullptr
+		&& ( !bBidir || framegen_motion_field_rev() != nullptr );
+	// Classic batches keep their historical generated-count key and exclude
+	// cached refills. Deadline pacing measures cached warps too, but under their
+	// own work-class key so they cannot make full preparation look cheaper.
+	const gamescope::framegen::DeadlineWorkClass_t eDeadlineWorkClass = bReuseMotion
+		? gamescope::framegen::DeadlineWorkClass_t::CachedWarp
+		: gamescope::framegen::DeadlineWorkClass_t::FullPreparationAndWarp;
+	// Only this already-prepared shape has a cancellation boundary without
+	// publishing fresh motion/learning/reservoir state during recording.
+	uint64_t ulCorrectionCostNs = 0u;
+	if ( bBoundCorrection )
+	{
+		if ( !bReuseMotion || bBidir || pColorProbe != nullptr || bClearPending )
+			return false;
+		if ( eff.mode != GamescopeFramegenMode::Motion
+			|| eff.pipeline != GamescopeFramegenPipeline::Checked )
+			return false;
+		if ( !bDeadlineCostKeying || nRequestCount != 1u
+			|| !g_device.hasFramegenQueue() || pRequests[ 0 ].wakeDeadlineNs == 0u )
+			return false;
+		const uint32_t key = gamescope::framegen::deadline_work_class_cost_key( eDeadlineWorkClass );
+		ulCorrectionCostNs = g_device.framegenRungCostNs( g_framegenHistory.nDegradeSteps, key );
+		if ( ulCorrectionCostNs == 0u
+			|| g_device.framegenRungSampleCount( g_framegenHistory.nDegradeSteps, key )
+				< gamescope::framegen::k_uDeadlineMinSamples )
+			return false;
+	}
+	const int nQuerySlot = !bReuseMotion || bDeadlineCostKeying
+		? g_device.framegenTimestampBegin( pCmdBuffer.get() ) : -1;
+
+	framegen_submit_preserve_motion_history( pCmdBuffer.get(), bReuseMotion,
+		pColorProbe, bMotionRequested, bBidir, eff );
+
+	// Motion estimation depends only on the two real frames, so it is computed
+	// once for the real pair; later batches reuse its finalized field. Falls
+	// back to extrapolation for every slot if the
+	// intermediates can't be allocated. The ladder's effective mode (not the base
+	// global) selects the pass, so motion can be shed under GPU pressure without
+	// disturbing vulkan_framegen_is_enabled() or the forced-composite tax.
+	const bool bMotion = bReuseMotion || ( bMotionRequested
+		&& framegen_prepare_motion( pCmdBuffer.get(), g_framegenHistory.currentReal->width(),
+			g_framegenHistory.currentReal->height(), dispatch, eff.pipeline ) );
+	// Held-out samples grade the actual motion path, not its allocation or
+	// capability fallback. A failed motion setup drops the sample and leaves all
+	// real-frame presentation untouched.
+	if ( pColorProbe != nullptr && !bMotion )
+		return false;
+
+	const bool bNetRecord = framegen_submit_record_net( pCmdBuffer.get(), bMotion,
+		bReuseMotion, eff, bBidir );
+	// With the field final, record the adaptation probe — the warps below
+	// read its verdict in this same batch, the CPU next batch. The meter-only
+	// probe waits until the generated frames are recorded.
+	const bool bAdaptProbe = bMotion && !bReuseMotion && framegen_adapt_enabled( eff.pipeline );
+	// A reused field was measured with the batch that estimated it, and a
+	// colour-validation field spans a skipped frame, not a display pair.
+	const bool bMeterProbe = bMotion && !bReuseMotion && !bAdaptProbe && pColorProbe == nullptr
+		&& framegen_quality_meter_enabled();
+	if ( bAdaptProbe )
+		framegen_record_adapt_probe( pCmdBuffer.get(), g_framegenMotion.width, g_framegenMotion.height );
+
+	const bool bNetStateReadback = framegen_submit_train_motion( pCmdBuffer.get(),
+		pColorProbe, bReuseMotion, eff, bAdaptProbe, bMotion, bBidir );
+	framegen_submit_record_slots( pCmdBuffer.get(), slots, bMotion, bBidir,
+		pColorProbe, eff, dispatch );
+
+	framegen_submit_preserve_luma( pCmdBuffer.get(), bMotion, bBidir, eff );
+
+	const bool bStatsRecorded = framegen_submit_finish_recording( pCmdBuffer.get(),
+		nQuerySlot, bNetStateReadback, bAdaptProbe, bMeterProbe, pColorProbe, slots );
+	// Causal pacing reuses the existing small timestamp table, but causal one-slot work
+	// is keyed by preparation shape instead of the now-constant output count.
+	const uint32_t nCostKey = bDeadlineCostKeying
+		? gamescope::framegen::deadline_work_class_cost_key( eDeadlineWorkClass )
+		: (uint32_t)slots.size();
+	// Split-family base mode ingests the new history on the COMPOSITE queue, at a
+	// scratch-timeline point strictly later than the composite this batch was
+	// planned against. Waiting on the composite alone would let the framegen
+	// queue sample previousReal/currentReal while that copy is still writing it.
+	// lastBaseIngestSeqNo is zero on every other path, so this is a no-op there.
+	const uint64_t ulWaitCompositeSeqNo =
+		std::max( ulCompositeSeqNo, g_framegenHistory.lastBaseIngestSeqNo );
+	const uint64_t ulSeqNo = bBoundCorrection
+		? g_device.trySubmitFramegenBefore( std::move( pCmdBuffer ),
+			ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey,
+			false, pRequests[ 0 ].wakeDeadlineNs, ulCorrectionCostNs )
+		: g_device.submitFramegen( std::move( pCmdBuffer ),
+			ulWaitCompositeSeqNo, nQuerySlot, g_framegenHistory.nDegradeSteps, nCostKey,
+			bNetStateReadback && bAdaptProbe );
+	if ( ulSeqNo == 0u )
+		return false;
+	g_framegenHistory.lastFramegenWorkSeqNo = ulSeqNo;
+	const uint64_t ulSubmitNs = get_time_in_nanos();
+	if ( bNetStateReadback && bAdaptProbe && bLearningPipelinesWarm )
+	{
+		g_framegenMotion.learning.pendingRecordSeqNo = ulSeqNo;
+		g_framegenMotion.learning.pendingRecordNs = ulSubmitNs - ulRecordStartNs;
+	}
+
+	framegen_submit_publish( slots, pColorProbe, ulSeqNo, ulCompositeSeqNo,
+		ulSubmitNs, ulAnchorRealFrameId, bDeadlineCostKeying, bExplicitProvisional,
+		nGapVblanks, bStatsRecorded, bAdaptProbe, bNetRecord, bNetStateReadback );
+
+	framegen_submit_notify( slots, pColorProbe, nGapVblanks, bMotion, eff,
+		nMaxDegradeSteps, bReuseMotion, bDeadlineCostKeying );
 	return true;
 }
 
