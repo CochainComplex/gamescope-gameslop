@@ -1344,78 +1344,38 @@ struct BidirPlanStep_t
 		: state.ringBound.delayNs != 0u ? std::min( envelopeDelayNs, state.ringBound.delayNs ) : envelopeDelayNs;
 }
 
-// One bidir plan for the real pair previous -> current, as a pure function of
-// the queue, the timeline state and the presenter's view of this opportunity.
-//
-// Every plan samples the window. The envelope, bounded by the ring, sets D, and
-// a D that differs from the translation's re-establishes it: the current real
-// is shown D after its record time. A longer D leaves the queued reals on their
-// targets; a shorter one moves them earlier by the difference.
-//
-// Reals never leave for room alone. The display shows at most D/T + k reals
-// within D + kT, so the newest queued reals beyond that bound go, one per real
-// over it and never the front leaving with this paint; a backlog that did not
-// drain drops the reals of its excess the same way. Neither changes D.
-//
-// Admission keeps the queue within the ring-derived capacity, counting the
-// front as leaving only when the presenter's own rule shows it at this
-// opportunity. Endpoints never overtake the queued reals older than them and
-// are computed from the translation directly, so no real is lost to coalescing.
-[[nodiscard]] inline BidirPlanStep_t plan_bidir_step( const BidirTimelineState_t &state,
-	const BidirPlanInputs_t &in )
+[[nodiscard]] inline bool bidir_pair_invalid( const BidirPlanInputs_t &in, uint64_t T )
 {
-	BidirPlanStep_t step = { .state = state };
-	BidirTimelineState_t &s = step.state;
-	const BidirPresenterView_t &view = in.presenter;
-	const uint64_t T = view.vblankIntervalNs;
-	const uint64_t opportunityNs = view.opportunityNs;
-	if ( T == 0u || in.previous.sourceReadyNs == 0u || in.current.sourceReadyNs <= in.previous.sourceReadyNs
-		|| in.previous.recordNs == 0u || in.current.recordNs < in.previous.recordNs )
-		return step;
+	return T == 0u || in.previous.sourceReadyNs == 0u || in.current.sourceReadyNs <= in.previous.sourceReadyNs
+		|| in.previous.recordNs == 0u || in.current.recordNs < in.previous.recordNs;
+}
 
+inline void invalidate_bidir_timeline( BidirTimelineState_t &s, const BidirPlanInputs_t &in )
+{
 	if ( in.invalidate || s.gridEpoch == 0u )
 		s = { .gridEpoch = s.gridEpoch + 1u == 0u ? 1u : s.gridEpoch + 1u };
+}
 
-	const uint64_t backlogExcessNs = bidir_backlog_excess( in.queue, view );
-	const uint64_t heldNs = s.epoch.valid ? s.epoch.delayNs : 0u;
-	const uint64_t delayNs = observe_bidir_pair_delay( s, in, backlogExcessNs, heldNs );
-	if ( delayNs == 0u )
-		return step;
+[[nodiscard]] inline BidirReestablish_t bidir_reestablish_kind( uint64_t heldNs, uint64_t delayNs )
+{
+	return heldNs == 0u ? BidirReestablish_t::Established
+		: delayNs > heldNs ? BidirReestablish_t::Lengthened : BidirReestablish_t::Shortened;
+}
 
-	if ( delayNs != heldNs )
-	{
-		step.reestablish = heldNs == 0u ? BidirReestablish_t::Established
-			: delayNs > heldNs ? BidirReestablish_t::Lengthened : BidirReestablish_t::Shortened;
-		s.epoch = establish_bidir_epoch( delayNs, s.gridEpoch );
-		s.grid = { .D0 = opportunityNs, .W0 = in.wakeNs, .T = T };
-	}
-
-	const std::array endpoints = { in.previous, in.current };
-	const BidirPlan_t plan = plan_bidir_slots( s.grid, s.epoch, endpoints, in.multiplier, s.gridEpoch );
-	if ( !plan.validEpoch )
-		return step;
-	step.planned = true;
-
-	std::vector<BidirQueueEntry_t> queue( in.queue.begin(), in.queue.end() );
-	if ( step.reestablish == BidirReestablish_t::Shortened )
-	{
-		pull_bidir_queue( queue, heldNs - delayNs, s.grid, bidir_earliest_front( view ) );
-		step.retargeted = queue;
-	}
-	const BidirBacklogStep_t backlog = observe_bidir_backlog( s.backlog,
-		backlogExcessNs, opportunityNs, T, k_ulBidirWindowNs );
-	s.backlog = backlog.backlog;
-	step.backlogDropped = backlog.undrained;
-
+[[nodiscard]] inline size_t bidir_front_leaving( const std::vector<BidirQueueEntry_t> &queue,
+	const BidirPlanInputs_t &in, const BidirPresenterView_t &view )
+{
 	// The front leaves with this paint only if the presenter shows it here. A
 	// front it would retire counts as staying, which only admits less.
-	const size_t leaving = !queue.empty() && bidir_front_action( bidir_front_inputs(
+	return !queue.empty() && bidir_front_action( bidir_front_inputs(
 		queue.front(), in.frontCompleted, queue.size(), view ) ) == BidirFrontAction_t::Present ? 1u : 0u;
-	// A new translation also queues the previous endpoint, unless it already
-	// entered the timeline.
-	const bool queuePrevious = step.reestablish != BidirReestablish_t::Kept
-		&& in.previous.realFrameId > in.consumedFrameId;
+}
 
+[[nodiscard]] inline size_t drop_bidir_excess_reals( BidirPlanStep_t &step, BidirTimelineState_t &s,
+	std::vector<BidirQueueEntry_t> &queue, const BidirPresenterView_t &view, uint64_t T,
+	uint64_t opportunityNs, size_t leaving, bool queuePrevious,
+	const BidirBacklogStep_t &backlog, uint64_t backlogExcessNs )
+{
 	// The newest staying reals go while the reals exceed what the display shows
 	// in time, and once per vblank of an undrained backlog's excess. Any drop is
 	// progress for a backlog: its window restarts.
@@ -1442,32 +1402,33 @@ struct BidirPlanStep_t
 	}
 	if ( ringOverflow )
 		s.ringBound = observe_bidir_ring_overflow( s.ringBound, opportunityNs, s.epoch.delayNs );
+	return incomingReals;
+}
 
-	const size_t committed = queue.size() - leaving + incomingReals;
-	const size_t room = view.capacity > committed ? view.capacity - committed : 0u;
-
-	const auto queueEndpoint = [&]( const BidirEndpoint_t &endpoint ) {
-		const uint64_t idealNs = s.epoch.endpoint_display_time( endpoint.recordNs );
-		const uint64_t n = grid_index_at_or_after( s.grid, idealNs );
-		const BidirPlannedEndpoint_t planned = {
-			.queue = true,
-			.targetNs = bidir_target_after( s.grid.target( n ),
-				bidir_real_floor( queue, endpoint.realFrameId ), T ),
-			.idealNs = idealNs,
-			.wakeNs = s.grid.wake( n ),
-		};
-		queue.push_back( {
-			.kind = BidirSlotKind_t::RealEndpoint,
-			.targetNs = planned.targetNs,
-			.realFrameId = endpoint.realFrameId,
-			.idealNs = idealNs,
-		} );
-		return planned;
+[[nodiscard]] inline BidirPlannedEndpoint_t queue_bidir_endpoint( const BidirTimelineState_t &s,
+	std::vector<BidirQueueEntry_t> &queue, const BidirEndpoint_t &endpoint, uint64_t T )
+{
+	const uint64_t idealNs = s.epoch.endpoint_display_time( endpoint.recordNs );
+	const uint64_t n = grid_index_at_or_after( s.grid, idealNs );
+	const BidirPlannedEndpoint_t planned = {
+		.queue = true,
+		.targetNs = bidir_target_after( s.grid.target( n ),
+			bidir_real_floor( queue, endpoint.realFrameId ), T ),
+		.idealNs = idealNs,
+		.wakeNs = s.grid.wake( n ),
 	};
-	if ( queuePrevious )
-		step.previous = queueEndpoint( in.previous );
-	step.current = queueEndpoint( in.current );
+	queue.push_back( {
+		.kind = BidirSlotKind_t::RealEndpoint,
+		.targetNs = planned.targetNs,
+		.realFrameId = endpoint.realFrameId,
+		.idealNs = idealNs,
+	} );
+	return planned;
+}
 
+inline void admit_bidir_slots( BidirPlanStep_t &step, const BidirPlan_t &plan,
+	const std::vector<BidirQueueEntry_t> &queue, const BidirPlanInputs_t &in, size_t room )
+{
 	// plan.slots is ordered by display target, so the admitted prefix keeps the
 	// timeline dense from the next opportunity onward. Nothing is admitted at or
 	// before an older real, or at an occupied target.
@@ -1485,6 +1446,85 @@ struct BidirPlanStep_t
 			continue;
 		step.admitted.push_back( slot );
 	}
+}
+
+// One bidir plan for the real pair previous -> current, as a pure function of
+// the queue, the timeline state and the presenter's view of this opportunity.
+//
+// Every plan samples the window. The envelope, bounded by the ring, sets D, and
+// a D that differs from the translation's re-establishes it: the current real
+// is shown D after its record time. A longer D leaves the queued reals on their
+// targets; a shorter one moves them earlier by the difference.
+//
+// Reals never leave for room alone. The display shows at most D/T + k reals
+// within D + kT, so the newest queued reals beyond that bound go, one per real
+// over it and never the front leaving with this paint; a backlog that did not
+// drain drops the reals of its excess the same way. Neither changes D.
+//
+// Admission keeps the queue within the ring-derived capacity, counting the
+// front as leaving only when the presenter's own rule shows it at this
+// opportunity. Endpoints never overtake the queued reals older than them and
+// are computed from the translation directly, so no real is lost to coalescing.
+[[nodiscard]] inline BidirPlanStep_t plan_bidir_step( const BidirTimelineState_t &state,
+	const BidirPlanInputs_t &in )
+{
+	BidirPlanStep_t step = { .state = state };
+	BidirTimelineState_t &s = step.state;
+	const BidirPresenterView_t &view = in.presenter;
+	const uint64_t T = view.vblankIntervalNs;
+	const uint64_t opportunityNs = view.opportunityNs;
+	if ( bidir_pair_invalid( in, T ) )
+		return step;
+
+	invalidate_bidir_timeline( s, in );
+
+	const uint64_t backlogExcessNs = bidir_backlog_excess( in.queue, view );
+	const uint64_t heldNs = s.epoch.valid ? s.epoch.delayNs : 0u;
+	const uint64_t delayNs = observe_bidir_pair_delay( s, in, backlogExcessNs, heldNs );
+	if ( delayNs == 0u )
+		return step;
+
+	if ( delayNs != heldNs )
+	{
+		step.reestablish = bidir_reestablish_kind( heldNs, delayNs );
+		s.epoch = establish_bidir_epoch( delayNs, s.gridEpoch );
+		s.grid = { .D0 = opportunityNs, .W0 = in.wakeNs, .T = T };
+	}
+
+	const std::array endpoints = { in.previous, in.current };
+	const BidirPlan_t plan = plan_bidir_slots( s.grid, s.epoch, endpoints, in.multiplier, s.gridEpoch );
+	if ( !plan.validEpoch )
+		return step;
+	step.planned = true;
+
+	std::vector<BidirQueueEntry_t> queue( in.queue.begin(), in.queue.end() );
+	if ( step.reestablish == BidirReestablish_t::Shortened )
+	{
+		pull_bidir_queue( queue, heldNs - delayNs, s.grid, bidir_earliest_front( view ) );
+		step.retargeted = queue;
+	}
+	const BidirBacklogStep_t backlog = observe_bidir_backlog( s.backlog,
+		backlogExcessNs, opportunityNs, T, k_ulBidirWindowNs );
+	s.backlog = backlog.backlog;
+	step.backlogDropped = backlog.undrained;
+
+	const size_t leaving = bidir_front_leaving( queue, in, view );
+	// A new translation also queues the previous endpoint, unless it already
+	// entered the timeline.
+	const bool queuePrevious = step.reestablish != BidirReestablish_t::Kept
+		&& in.previous.realFrameId > in.consumedFrameId;
+
+	const size_t incomingReals = drop_bidir_excess_reals( step, s, queue, view, T, opportunityNs, leaving, queuePrevious,
+		backlog, backlogExcessNs );
+
+	const size_t committed = queue.size() - leaving + incomingReals;
+	const size_t room = view.capacity > committed ? view.capacity - committed : 0u;
+
+	if ( queuePrevious )
+		step.previous = queue_bidir_endpoint( s, queue, in.previous, T );
+	step.current = queue_bidir_endpoint( s, queue, in.current, T );
+
+	admit_bidir_slots( step, plan, queue, in, room );
 	step.shedCapacity = view.capacity + leaving;
 	s.ringBound.deepestQueue = std::max( s.ringBound.deepestQueue, queue.size() + step.admitted.size() - leaving );
 	return step;
