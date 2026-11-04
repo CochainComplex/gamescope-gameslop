@@ -912,173 +912,25 @@ ReshadeEffectPipeline::~ReshadeEffectPipeline()
     m_device->vk.DestroyPipelineLayout(m_device->device(), m_pipelineLayout, nullptr);
 }
 
-bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &key)
+static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey &key,
+    const reshadefx::module &module, const std::string &local_reshade_path,
+    const std::string &global_reshade_path, gamescope::OwningRc<CVulkanTexture> &renderTarget,
+    std::vector<gamescope::OwningRc<CVulkanTexture>> &textures,
+    std::optional<CVulkanCmdBuffer> &cmdBuffer)
 {
-    m_key = key;
-    m_device = device;
-
-	VkPhysicalDeviceProperties deviceProperties;
-	device->vk.GetPhysicalDeviceProperties(device->physDev(), &deviceProperties);
-
-	reshadefx::preprocessor pp;
-	pp.add_macro_definition("__RESHADE__", std::to_string(INT_MAX));
-	pp.add_macro_definition("__RESHADE_PERFORMANCE_MODE__", "0");
-	pp.add_macro_definition("__VENDOR__", std::to_string(deviceProperties.vendorID));
-	pp.add_macro_definition("__DEVICE__", std::to_string(deviceProperties.deviceID));
-	pp.add_macro_definition("__RENDERER__", std::to_string(0x20000));
-	pp.add_macro_definition("__APPLICATION__", std::to_string(0x0));
-	pp.add_macro_definition("BUFFER_WIDTH", std::to_string(key.bufferWidth));
-	pp.add_macro_definition("BUFFER_HEIGHT", std::to_string(key.bufferHeight));
-	pp.add_macro_definition("BUFFER_RCP_WIDTH", "(1.0 / BUFFER_WIDTH)");
-	pp.add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
-	pp.add_macro_definition("BUFFER_COLOR_SPACE", std::to_string(static_cast<uint32_t>(ConvertToReshadeColorSpace(key.bufferColorSpace))));
-	pp.add_macro_definition("BUFFER_COLOR_BIT_DEPTH", std::to_string(GetFormatBitDepth(key.bufferFormat)));
-    pp.add_macro_definition("GAMESCOPE", "1");
-    pp.add_macro_definition("GAMESCOPE_SDR_ON_HDR_NITS", std::to_string(g_ColorMgmt.pending.flSDROnHDRBrightness));
-
-    std::string gamescope_reshade_share_path = "/share/gamescope/reshade";
-
-    std::string local_reshade_path = gamescope::GetLocalUsrDir() + gamescope_reshade_share_path;
-    std::string global_reshade_path = gamescope::GetUsrDir() + gamescope_reshade_share_path;
-
-    pp.add_include_path(local_reshade_path + "/Shaders");
-	pp.add_include_path(global_reshade_path + "/Shaders");
-
-    std::string local_shader_file_path = local_reshade_path + "/Shaders/" + key.path;
-    std::string global_shader_file_path = global_reshade_path + "/Shaders/" + key.path;
-
-	if (!pp.append_file(local_shader_file_path))
-	{
-        if (!pp.append_file(global_shader_file_path))
-        {
-            reshade_log.errorf("Failed to load reshade fx file: %s (%s or %s) - %s", key.path.c_str(), local_shader_file_path.c_str(), global_shader_file_path.c_str(), pp.errors().c_str());
-            return false;
-        }
-	}
-
-	std::string errors = pp.errors();
-	if (!errors.empty())
-	{
-		reshade_log.errorf("Failed to parse reshade fx shader module: %s", errors.c_str());
-		return false;
-	}
-
-	std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(
-		true /* vulkan semantics */, true /* debug info */, false /* uniforms to spec constants */, false /*flip vertex shader*/));
-
-	reshadefx::parser parser;
-	parser.parse(pp.output(), codegen.get());
-
-	errors = parser.errors();
-	if (!errors.empty())
-	{
-		reshade_log.errorf("Failed to parse reshade fx shader module: %s", errors.c_str());
-		return false;
-	}
-
-	m_module = std::make_unique<reshadefx::module>();
-	codegen->write_result(*m_module);
-
-#if 0
-    FILE *f = fopen("test.spv", "wb");
-    fwrite(m_module->code.data(), 1, m_module->code.size(), f);
-    fclose(f);
-#endif
-
-	if (m_module->techniques.size() <= key.techniqueIdx)
-	{
-		reshade_log.errorf("Invalid technique index");
-		return false;
-	}
-
-	auto& technique = m_module->techniques[key.techniqueIdx];
-	reshade_log.infof("Using technique: %s\n", technique.name.c_str());
-
-    // Allocate command buffers
-    {
-		VkCommandBufferAllocateInfo commandBufferAllocateInfo =
-        {
-			.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-			.commandPool        = device->generalCommandPool(),
-			.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-			.commandBufferCount = 1
-		};
-
-        VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
-		VkResult result = device->vk.AllocateCommandBuffers(device->device(), &commandBufferAllocateInfo, &cmdBuffer);
-		if (result != VK_SUCCESS)
-		{
-			reshade_log.errorf("vkAllocateCommandBuffers failed");
-			return false;
-		}
-
-        m_cmdBuffer.emplace(device, cmdBuffer, device->generalQueue(), device->generalQueueFamily(), commandBufferAllocateInfo.commandPool);
-    }
-
-    // Create Uniform Buffer
-    {
-        VkBufferCreateInfo bufferCreateInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size  = m_module->total_uniform_size,
-            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        };
-
-        VkResult result = device->vk.CreateBuffer(device->device(), &bufferCreateInfo, nullptr, &m_buffer);
-        if (result != VK_SUCCESS)
-        {
-            reshade_log.errorf("vkCreateBuffer failed");
-            return false;
-        }
-
-        VkMemoryRequirements memRequirements;
-        device->vk.GetBufferMemoryRequirements(device->device(), m_buffer, &memRequirements);
-
-        uint32_t memTypeIndex = device->findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits);
-        assert(memTypeIndex != ~0u);
-        VkMemoryAllocateInfo allocInfo =
-        {
-            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize  = memRequirements.size,
-            .memoryTypeIndex = memTypeIndex,
-        };
-        result = device->vk.AllocateMemory(device->device(), &allocInfo, nullptr, &m_bufferMemory);
-        if (result != VK_SUCCESS)
-        {
-            reshade_log.errorf("vkAllocateMemory failed");
-            return false;
-        }
-        device->vk.BindBufferMemory(device->device(), m_buffer, m_bufferMemory, 0);
-        if (result != VK_SUCCESS)
-        {
-            reshade_log.errorf("vkBindBufferMemory failed");
-            return false;
-        }
-
-        result = device->vk.MapMemory(device->device(), m_bufferMemory, 0, VK_WHOLE_SIZE, 0, &m_mappedPtr);
-        if (result != VK_SUCCESS)
-        {
-            reshade_log.errorf("vkMapMemory failed");
-            return false;
-        }
-    }
-
-    // Create Uniforms
-    m_uniforms = createReshadeUniforms(*m_module, &m_flags);
-
     // Create Textures
     {
-        m_rt = new CVulkanTexture();
+        renderTarget = new CVulkanTexture();
         CVulkanTexture::createFlags flags;
         flags.bSampled = true;
         flags.bStorage = true;
         flags.bColorAttachment = true;
 
-        bool ret = m_rt->BInit(m_key.bufferWidth, m_key.bufferHeight, 1, VulkanFormatToDRM(m_key.bufferFormat), flags, nullptr);
+        bool ret = renderTarget->BInit(key.bufferWidth, key.bufferHeight, 1, VulkanFormatToDRM(key.bufferFormat), flags, nullptr);
         assert(ret);
     }
 
-    for (const auto& tex : m_module->textures)
+    for (const auto& tex : module.textures)
     {
         gamescope::Rc<CVulkanTexture> texture;
         if (tex.semantic.empty())
@@ -1179,10 +1031,10 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
 
                 memcpy(scratchPtr, pixels, size);
 
-                m_cmdBuffer->reset();
-                m_cmdBuffer->begin();
-                m_cmdBuffer->copyBufferToImage(scratchBuffer, 0, 0, texture);
-                device->submitInternal(&*m_cmdBuffer);
+                cmdBuffer->reset();
+                cmdBuffer->begin();
+                cmdBuffer->copyBufferToImage(scratchBuffer, 0, 0, texture);
+                device->submitInternal(&*cmdBuffer);
                 device->waitIdle(false);
 
                 free(data);
@@ -1192,8 +1044,8 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         }
         else if (texture)
         {
-            m_cmdBuffer->reset();
-            m_cmdBuffer->begin();
+            cmdBuffer->reset();
+            cmdBuffer->begin();
             VkClearColorValue clearColor{};
             VkImageSubresourceRange range =
             {
@@ -1203,66 +1055,25 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
                 .baseArrayLayer = 0,
                 .layerCount = 1,
             };
-            m_cmdBuffer->prepareDestImage(texture.get());
-            m_cmdBuffer->insertBarrier();
-            device->vk.CmdClearColorImage(m_cmdBuffer->rawBuffer(), texture->vkImage(), VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
-            m_cmdBuffer->markDirty(texture.get());
-            device->submitInternal(&*m_cmdBuffer);
+            cmdBuffer->prepareDestImage(texture.get());
+            cmdBuffer->insertBarrier();
+            device->vk.CmdClearColorImage(cmdBuffer->rawBuffer(), texture->vkImage(), VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
+            cmdBuffer->markDirty(texture.get());
+            device->submitInternal(&*cmdBuffer);
             device->waitIdle(false);
         }
 
-        m_textures.emplace_back(std::move(texture));
+        textures.emplace_back(std::move(texture));
     }
 
-    // Create Samplers
-    {
-        for (const auto& sampler : m_module->samplers)
-        {
-            gamescope::Rc<CVulkanTexture> tex;
+    return true;
+}
 
-            tex = findTexture(sampler.texture_name);
-            if (!tex)
-            {
-                reshade_log.errorf("Couldn't find texture with name: %s", sampler.texture_name.c_str());
-            }
-
-            VkFilter            minFilter;
-            VkFilter            magFilter;
-            VkSamplerMipmapMode mipmapMode;
-            ConvertReshadeFilter(sampler.filter, minFilter, magFilter, mipmapMode);
-
-            VkSamplerCreateInfo samplerCreateInfo;
-            samplerCreateInfo.sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-            samplerCreateInfo.pNext                   = nullptr;
-            samplerCreateInfo.flags                   = 0;
-            samplerCreateInfo.magFilter               = magFilter;
-            samplerCreateInfo.minFilter               = minFilter;
-            samplerCreateInfo.mipmapMode              = mipmapMode;
-            samplerCreateInfo.addressModeU            = ConvertReshadeAddressMode(sampler.address_u);
-            samplerCreateInfo.addressModeV            = ConvertReshadeAddressMode(sampler.address_v);
-            samplerCreateInfo.addressModeW            = ConvertReshadeAddressMode(sampler.address_w);
-            samplerCreateInfo.mipLodBias              = sampler.lod_bias;
-            samplerCreateInfo.anisotropyEnable        = VK_FALSE;
-            samplerCreateInfo.maxAnisotropy           = 0;
-            samplerCreateInfo.compareEnable           = VK_FALSE;
-            samplerCreateInfo.compareOp               = VK_COMPARE_OP_ALWAYS;
-            samplerCreateInfo.minLod                  = sampler.min_lod;
-            samplerCreateInfo.maxLod                  = sampler.max_lod;
-            samplerCreateInfo.borderColor             = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-            samplerCreateInfo.unnormalizedCoordinates = VK_FALSE;
-
-            VkSampler vkSampler;
-            VkResult result = device->vk.CreateSampler(device->device(), &samplerCreateInfo, nullptr, &vkSampler);
-            if (result != VK_SUCCESS)
-            {
-                reshade_log.errorf("vkCreateSampler failed");
-                return false;
-            }
-
-            m_samplers.emplace_back(vkSampler, std::move(tex));
-        }
-    }
-
+static bool createReshadeDescriptorResources(CVulkanDevice *device, const reshadefx::module &module,
+    VkDescriptorSetLayout (&descriptorSetLayouts)[GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT],
+    VkPipelineLayout &pipelineLayout, VkDescriptorPool &descriptorPool,
+    VkDescriptorSet (&descriptorSets)[GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT])
+{
     // Create Descriptor Set Layouts
 
     {
@@ -1280,7 +1091,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         layoutCreateInfo.bindingCount = 1;
         layoutCreateInfo.pBindings    = &layoutBinding;
 
-        VkResult result = device->vk.CreateDescriptorSetLayout(device->device(), &layoutCreateInfo, nullptr, &m_descriptorSetLayouts[GAMESCOPE_RESHADE_DESCRIPTOR_SET_UBO]);
+        VkResult result = device->vk.CreateDescriptorSetLayout(device->device(), &layoutCreateInfo, nullptr, &descriptorSetLayouts[GAMESCOPE_RESHADE_DESCRIPTOR_SET_UBO]);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("Failed to create descriptor set layout.");
@@ -1290,7 +1101,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
 
     {
         std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
-        for (uint32_t i = 0; i < m_module->samplers.size(); i++)
+        for (uint32_t i = 0; i < module.samplers.size(); i++)
         {
             VkDescriptorSetLayoutBinding layoutBinding;
             layoutBinding.binding            = i;
@@ -1309,7 +1120,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         layoutCreateInfo.bindingCount = layoutBindings.size();
         layoutCreateInfo.pBindings    = layoutBindings.data();
 
-        VkResult result = device->vk.CreateDescriptorSetLayout(device->device(), &layoutCreateInfo, nullptr, &m_descriptorSetLayouts[GAMESCOPE_RESHADE_DESCRIPTOR_SET_SAMPLED_IMAGES]);
+        VkResult result = device->vk.CreateDescriptorSetLayout(device->device(), &layoutCreateInfo, nullptr, &descriptorSetLayouts[GAMESCOPE_RESHADE_DESCRIPTOR_SET_SAMPLED_IMAGES]);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("Failed to create descriptor set layout.");
@@ -1319,7 +1130,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
 
     {
         std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
-        for (uint32_t i = 0; i < m_module->samplers.size(); i++)
+        for (uint32_t i = 0; i < module.samplers.size(); i++)
         {
             VkDescriptorSetLayoutBinding layoutBinding;
             layoutBinding.binding            = i;
@@ -1338,7 +1149,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         layoutCreateInfo.bindingCount = layoutBindings.size();
         layoutCreateInfo.pBindings    = layoutBindings.data();
 
-        VkResult result = device->vk.CreateDescriptorSetLayout(device->device(), &layoutCreateInfo, nullptr, &m_descriptorSetLayouts[GAMESCOPE_RESHADE_DESCRIPTOR_SET_STORAGE_IMAGES]);
+        VkResult result = device->vk.CreateDescriptorSetLayout(device->device(), &layoutCreateInfo, nullptr, &descriptorSetLayouts[GAMESCOPE_RESHADE_DESCRIPTOR_SET_STORAGE_IMAGES]);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("Failed to create descriptor set layout.");
@@ -1352,13 +1163,13 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
             .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext                  = nullptr,
             .flags                  = 0,
-            .setLayoutCount         = uint32_t(std::size(m_descriptorSetLayouts)),
-            .pSetLayouts            = m_descriptorSetLayouts,
+            .setLayoutCount         = uint32_t(std::size(descriptorSetLayouts)),
+            .pSetLayouts            = descriptorSetLayouts,
             .pushConstantRangeCount = 0,
             .pPushConstantRanges    = nullptr,
         };
 
-        VkResult result = device->vk.CreatePipelineLayout(device->device(), &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
+        VkResult result = device->vk.CreatePipelineLayout(device->device(), &pipelineLayoutCreateInfo, nullptr, &pipelineLayout);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("Failed to create pipeline layout.");
@@ -1370,8 +1181,8 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         VkDescriptorPoolSize descriptorPoolSizes[] =
         {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         uint32_t(GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT * 1u) },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uint32_t(GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT * m_module->samplers.size()) },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          uint32_t(GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT * m_module->storages.size()) },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uint32_t(GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT * module.samplers.size()) },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          uint32_t(GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT * module.storages.size()) },
         };
 
         VkDescriptorPoolCreateInfo descriptorPoolCreateInfo;
@@ -1382,7 +1193,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         descriptorPoolCreateInfo.poolSizeCount = std::size(descriptorPoolSizes);
         descriptorPoolCreateInfo.pPoolSizes    = descriptorPoolSizes;
 
-        VkResult result = device->vk.CreateDescriptorPool(device->device(), &descriptorPoolCreateInfo, nullptr, &m_descriptorPool);
+        VkResult result = device->vk.CreateDescriptorPool(device->device(), &descriptorPoolCreateInfo, nullptr, &descriptorPool);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("Failed to create descriptor pool.");
@@ -1395,11 +1206,11 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         VkDescriptorSetAllocateInfo descriptorSetAllocateInfo;
         descriptorSetAllocateInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         descriptorSetAllocateInfo.pNext              = nullptr;
-        descriptorSetAllocateInfo.descriptorPool     = m_descriptorPool;
+        descriptorSetAllocateInfo.descriptorPool     = descriptorPool;
         descriptorSetAllocateInfo.descriptorSetCount = 1;
-        descriptorSetAllocateInfo.pSetLayouts        = &m_descriptorSetLayouts[i];
+        descriptorSetAllocateInfo.pSetLayouts        = &descriptorSetLayouts[i];
 
-        VkResult result = device->vk.AllocateDescriptorSets(device->device(), &descriptorSetAllocateInfo, &m_descriptorSets[i]);
+        VkResult result = device->vk.AllocateDescriptorSets(device->device(), &descriptorSetAllocateInfo, &descriptorSets[i]);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("Failed to allocate descriptor set.");
@@ -1407,6 +1218,14 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         }
     }
 
+    return true;
+}
+
+static bool createReshadePassPipelines(CVulkanDevice *device, ReshadeEffectPipeline &effectPipeline,
+    reshadefx::module &module, const reshadefx::technique_info &technique,
+    VkPipelineLayout pipelineLayout, const gamescope::OwningRc<CVulkanTexture> &renderTarget,
+    std::vector<VkPipeline> &pipelines)
+{
     // Create Pipelines
 	for (const auto& pass : technique.passes)
 	{
@@ -1415,8 +1234,8 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
         VkShaderModuleCreateInfo shaderModuleInfo =
         {
             .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .codeSize = m_module->code.size(),
-            .pCode    = reinterpret_cast<uint32_t*>(m_module->code.data()),
+            .codeSize = module.code.size(),
+            .pCode    = reinterpret_cast<uint32_t*>(module.code.data()),
         };
 
 		if (!pass.cs_entry_point.empty())
@@ -1433,7 +1252,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
 			{
 				.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .stage  = shaderStageCreateInfoCompute,
-                .layout = m_pipelineLayout,
+                .layout = pipelineLayout,
 			};
 
 			VkPipeline pipeline = VK_NULL_HANDLE;
@@ -1444,7 +1263,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
                 return false;
             }
 
-            m_pipelines.push_back(pipeline);
+            pipelines.push_back(pipeline);
 		}
         else
         {
@@ -1457,11 +1276,11 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
             {
                 gamescope::Rc<CVulkanTexture> rt;
                 if (i == 0 && pass.render_target_names[0].empty())
-                    rt = m_rt;
+                    rt = renderTarget;
                 else if (pass.render_target_names[i].empty())
                     break;
                 else
-                    rt = findTexture(pass.render_target_names[i]);
+                    rt = effectPipeline.findTexture(pass.render_target_names[i]);
 
                 if (rt == nullptr)
                     continue;
@@ -1648,7 +1467,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
             pipelineCreateInfo.pDepthStencilState  = nullptr;
             pipelineCreateInfo.pColorBlendState    = &colorBlendCreateInfo;
             pipelineCreateInfo.pDynamicState       = &dynamicStateCreateInfo;
-            pipelineCreateInfo.layout              = m_pipelineLayout;
+            pipelineCreateInfo.layout              = pipelineLayout;
             pipelineCreateInfo.renderPass          = VK_NULL_HANDLE;
             pipelineCreateInfo.subpass             = 0;
             pipelineCreateInfo.basePipelineHandle  = VK_NULL_HANDLE;
@@ -1662,9 +1481,227 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
                 return false;
             }
 
-            m_pipelines.push_back(pipeline);
+            pipelines.push_back(pipeline);
         }
 	}
+
+    return true;
+}
+
+bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &key)
+{
+    m_key = key;
+    m_device = device;
+
+	VkPhysicalDeviceProperties deviceProperties;
+	device->vk.GetPhysicalDeviceProperties(device->physDev(), &deviceProperties);
+
+	reshadefx::preprocessor pp;
+	pp.add_macro_definition("__RESHADE__", std::to_string(INT_MAX));
+	pp.add_macro_definition("__RESHADE_PERFORMANCE_MODE__", "0");
+	pp.add_macro_definition("__VENDOR__", std::to_string(deviceProperties.vendorID));
+	pp.add_macro_definition("__DEVICE__", std::to_string(deviceProperties.deviceID));
+	pp.add_macro_definition("__RENDERER__", std::to_string(0x20000));
+	pp.add_macro_definition("__APPLICATION__", std::to_string(0x0));
+	pp.add_macro_definition("BUFFER_WIDTH", std::to_string(key.bufferWidth));
+	pp.add_macro_definition("BUFFER_HEIGHT", std::to_string(key.bufferHeight));
+	pp.add_macro_definition("BUFFER_RCP_WIDTH", "(1.0 / BUFFER_WIDTH)");
+	pp.add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
+	pp.add_macro_definition("BUFFER_COLOR_SPACE", std::to_string(static_cast<uint32_t>(ConvertToReshadeColorSpace(key.bufferColorSpace))));
+	pp.add_macro_definition("BUFFER_COLOR_BIT_DEPTH", std::to_string(GetFormatBitDepth(key.bufferFormat)));
+    pp.add_macro_definition("GAMESCOPE", "1");
+    pp.add_macro_definition("GAMESCOPE_SDR_ON_HDR_NITS", std::to_string(g_ColorMgmt.pending.flSDROnHDRBrightness));
+
+    std::string gamescope_reshade_share_path = "/share/gamescope/reshade";
+
+    std::string local_reshade_path = gamescope::GetLocalUsrDir() + gamescope_reshade_share_path;
+    std::string global_reshade_path = gamescope::GetUsrDir() + gamescope_reshade_share_path;
+
+    pp.add_include_path(local_reshade_path + "/Shaders");
+	pp.add_include_path(global_reshade_path + "/Shaders");
+
+    std::string local_shader_file_path = local_reshade_path + "/Shaders/" + key.path;
+    std::string global_shader_file_path = global_reshade_path + "/Shaders/" + key.path;
+
+	if (!pp.append_file(local_shader_file_path))
+	{
+        if (!pp.append_file(global_shader_file_path))
+        {
+            reshade_log.errorf("Failed to load reshade fx file: %s (%s or %s) - %s", key.path.c_str(), local_shader_file_path.c_str(), global_shader_file_path.c_str(), pp.errors().c_str());
+            return false;
+        }
+	}
+
+	std::string errors = pp.errors();
+	if (!errors.empty())
+	{
+		reshade_log.errorf("Failed to parse reshade fx shader module: %s", errors.c_str());
+		return false;
+	}
+
+	std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(
+		true /* vulkan semantics */, true /* debug info */, false /* uniforms to spec constants */, false /*flip vertex shader*/));
+
+	reshadefx::parser parser;
+	parser.parse(pp.output(), codegen.get());
+
+	errors = parser.errors();
+	if (!errors.empty())
+	{
+		reshade_log.errorf("Failed to parse reshade fx shader module: %s", errors.c_str());
+		return false;
+	}
+
+	m_module = std::make_unique<reshadefx::module>();
+	codegen->write_result(*m_module);
+
+#if 0
+    FILE *f = fopen("test.spv", "wb");
+    fwrite(m_module->code.data(), 1, m_module->code.size(), f);
+    fclose(f);
+#endif
+
+	if (m_module->techniques.size() <= key.techniqueIdx)
+	{
+		reshade_log.errorf("Invalid technique index");
+		return false;
+	}
+
+	auto& technique = m_module->techniques[key.techniqueIdx];
+	reshade_log.infof("Using technique: %s\n", technique.name.c_str());
+
+    // Allocate command buffers
+    {
+		VkCommandBufferAllocateInfo commandBufferAllocateInfo =
+        {
+			.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+			.commandPool        = device->generalCommandPool(),
+			.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+			.commandBufferCount = 1
+		};
+
+        VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
+		VkResult result = device->vk.AllocateCommandBuffers(device->device(), &commandBufferAllocateInfo, &cmdBuffer);
+		if (result != VK_SUCCESS)
+		{
+			reshade_log.errorf("vkAllocateCommandBuffers failed");
+			return false;
+		}
+
+        m_cmdBuffer.emplace(device, cmdBuffer, device->generalQueue(), device->generalQueueFamily(), commandBufferAllocateInfo.commandPool);
+    }
+
+    // Create Uniform Buffer
+    {
+        VkBufferCreateInfo bufferCreateInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size  = m_module->total_uniform_size,
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        };
+
+        VkResult result = device->vk.CreateBuffer(device->device(), &bufferCreateInfo, nullptr, &m_buffer);
+        if (result != VK_SUCCESS)
+        {
+            reshade_log.errorf("vkCreateBuffer failed");
+            return false;
+        }
+
+        VkMemoryRequirements memRequirements;
+        device->vk.GetBufferMemoryRequirements(device->device(), m_buffer, &memRequirements);
+
+        uint32_t memTypeIndex = device->findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits);
+        assert(memTypeIndex != ~0u);
+        VkMemoryAllocateInfo allocInfo =
+        {
+            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize  = memRequirements.size,
+            .memoryTypeIndex = memTypeIndex,
+        };
+        result = device->vk.AllocateMemory(device->device(), &allocInfo, nullptr, &m_bufferMemory);
+        if (result != VK_SUCCESS)
+        {
+            reshade_log.errorf("vkAllocateMemory failed");
+            return false;
+        }
+        device->vk.BindBufferMemory(device->device(), m_buffer, m_bufferMemory, 0);
+        if (result != VK_SUCCESS)
+        {
+            reshade_log.errorf("vkBindBufferMemory failed");
+            return false;
+        }
+
+        result = device->vk.MapMemory(device->device(), m_bufferMemory, 0, VK_WHOLE_SIZE, 0, &m_mappedPtr);
+        if (result != VK_SUCCESS)
+        {
+            reshade_log.errorf("vkMapMemory failed");
+            return false;
+        }
+    }
+
+    // Create Uniforms
+    m_uniforms = createReshadeUniforms(*m_module, &m_flags);
+
+    if (!createReshadeTextures(device, m_key, *m_module, local_reshade_path,
+            global_reshade_path, m_rt, m_textures, m_cmdBuffer))
+        return false;
+
+    // Create Samplers
+    {
+        for (const auto& sampler : m_module->samplers)
+        {
+            gamescope::Rc<CVulkanTexture> tex;
+
+            tex = findTexture(sampler.texture_name);
+            if (!tex)
+            {
+                reshade_log.errorf("Couldn't find texture with name: %s", sampler.texture_name.c_str());
+            }
+
+            VkFilter            minFilter;
+            VkFilter            magFilter;
+            VkSamplerMipmapMode mipmapMode;
+            ConvertReshadeFilter(sampler.filter, minFilter, magFilter, mipmapMode);
+
+            VkSamplerCreateInfo samplerCreateInfo;
+            samplerCreateInfo.sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            samplerCreateInfo.pNext                   = nullptr;
+            samplerCreateInfo.flags                   = 0;
+            samplerCreateInfo.magFilter               = magFilter;
+            samplerCreateInfo.minFilter               = minFilter;
+            samplerCreateInfo.mipmapMode              = mipmapMode;
+            samplerCreateInfo.addressModeU            = ConvertReshadeAddressMode(sampler.address_u);
+            samplerCreateInfo.addressModeV            = ConvertReshadeAddressMode(sampler.address_v);
+            samplerCreateInfo.addressModeW            = ConvertReshadeAddressMode(sampler.address_w);
+            samplerCreateInfo.mipLodBias              = sampler.lod_bias;
+            samplerCreateInfo.anisotropyEnable        = VK_FALSE;
+            samplerCreateInfo.maxAnisotropy           = 0;
+            samplerCreateInfo.compareEnable           = VK_FALSE;
+            samplerCreateInfo.compareOp               = VK_COMPARE_OP_ALWAYS;
+            samplerCreateInfo.minLod                  = sampler.min_lod;
+            samplerCreateInfo.maxLod                  = sampler.max_lod;
+            samplerCreateInfo.borderColor             = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+            samplerCreateInfo.unnormalizedCoordinates = VK_FALSE;
+
+            VkSampler vkSampler;
+            VkResult result = device->vk.CreateSampler(device->device(), &samplerCreateInfo, nullptr, &vkSampler);
+            if (result != VK_SUCCESS)
+            {
+                reshade_log.errorf("vkCreateSampler failed");
+                return false;
+            }
+
+            m_samplers.emplace_back(vkSampler, std::move(tex));
+        }
+    }
+
+    if (!createReshadeDescriptorResources(device, *m_module, m_descriptorSetLayouts,
+            m_pipelineLayout, m_descriptorPool, m_descriptorSets))
+        return false;
+
+    if (!createReshadePassPipelines(device, *this, *m_module, technique,
+            m_pipelineLayout, m_rt, m_pipelines))
+        return false;
 
     return true;
 }
