@@ -18,7 +18,7 @@ def materialize(source_path, directory):
     for name, begin, end in (
         ('flip_type', 'enum class FlipType\n', 'FlipType eFlipType ='),
         ('decision', 'bool bShouldPaint = false;',
-         '// State processed above can invalidate or replace the queue'),
+         'steamcompmgr_arbitrate_generated_frame( bVrrHybridActive,'),
     ):
         if source.count(begin) != 1 or source.count(end) != 1:
             raise ValueError('ambiguous/missing production fragment: ' + name)

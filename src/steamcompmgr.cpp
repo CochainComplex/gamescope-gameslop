@@ -10228,18 +10228,9 @@ static void framegen_drop_commit_deadline()
 	g_FramegenCommitTimer.DisarmTimer();
 }
 
-void
-steamcompmgr_main(int argc, char **argv)
+static inline void steamcompmgr_parse_options( int argc, char **argv, int &o, int &opt_index,
+	int &readyPipeFD, bool &bForceWindowsFullscreen )
 {
-	s_steamcompmgrThread = pthread_self();
-	int	readyPipeFD = -1;
-
-	// Reset getopt() state
-	optind = 1;
-
-	int o;
-	int opt_index = -1;
-	bool bForceWindowsFullscreen = false;
 	while ((o = getopt_long(argc, argv, gamescope_optstring, gamescope_options, &opt_index)) != -1)
 	{
 		const char *opt_name;
@@ -10314,6 +10305,838 @@ steamcompmgr_main(int argc, char **argv)
 				assert(false); // unreachable
 		}
 	}
+}
+
+static inline void steamcompmgr_signal_ready( xwayland_ctx_t *root_ctx, int &readyPipeFD )
+{
+	if ( readyPipeFD != -1 )
+	{
+		dprintf( readyPipeFD, "%s %s\n", root_ctx->xwayland_server->get_nested_display_name(), wlserver_get_wl_display_name() );
+		close( readyPipeFD );
+		readyPipeFD = -1;
+	}
+}
+
+static inline void steamcompmgr_init_watchers( bool bForceWindowsFullscreen )
+{
+	if ( g_BacklightWatcher.Init() )
+		g_SteamCompMgrWaiter.AddWaitable( &g_BacklightWatcher, EPOLLPRI );
+
+	{
+		gamescope_xwayland_server_t *pServer = NULL;
+		for (size_t i = 0; (pServer = wlserver_get_xwayland_server(i)); i++)
+		{
+			xwayland_ctx_t *pXWaylandCtx = pServer->ctx.get();
+			g_SteamCompMgrWaiter.AddWaitable( pXWaylandCtx );
+
+			pServer->ctx->force_windows_fullscreen = bForceWindowsFullscreen;
+		}
+	}
+}
+
+static inline void steamcompmgr_read_vram_capacities()
+{
+	FILE *sysfs_caps = fopen("/sys/fs/cgroup/dmem.capacity", "r");
+	if (sysfs_caps != nullptr) {
+		char *line = NULL;
+		size_t size = 0;
+		while (getline(&line, &size, sysfs_caps) >= 0) {
+			char *capacity = strstr(line, " ");
+			if (capacity)
+				++capacity;
+			else
+				continue;
+			uint64_t vramSize = strtoull(capacity, NULL, 10);
+			std::string idString = std::string(line, (capacity - 1) - line);
+			g_vramCapacities.emplace(idString, vramSize);
+		}
+	}
+}
+
+static inline void steamcompmgr_update_virtual_connector_strategy( gamescope::VirtualConnectorStrategy eVirtualConnectorStrategy,
+	gamescope::VirtualConnectorStrategy &s_eLastVirtualConnectorStrategy, bool bBackendJustInitted )
+{
+	if ( eVirtualConnectorStrategy != s_eLastVirtualConnectorStrategy || bBackendJustInitted )
+	{
+		// If our virtual connector strategy changes, clear out our virtual connector
+		// global focuses.
+		g_VirtualConnectorFocuses.clear();
+		s_eLastVirtualConnectorStrategy = eVirtualConnectorStrategy;
+
+		xwm_log.infof( "Late init of virtual connector stuff." );
+
+		// misyl: Make the virtual connector up-front if we are in a single-output mode.
+		// So we don't delay in getting display/output info to the game
+		static constexpr uint64_t k_unSingleOutputVirtualConnectorKey = 0;
+
+		g_VirtualConnectorFocuses[ k_unSingleOutputVirtualConnectorKey ] = global_focus_t
+		{
+			.ulVirtualFocusKey = k_unSingleOutputVirtualConnectorKey,
+			.pVirtualConnector = GetBackend()->UsesVirtualConnectors() ? GetBackend()->CreateVirtualConnector( k_unSingleOutputVirtualConnectorKey ) : nullptr,
+		};
+
+		hasRepaint = true;
+	}
+}
+
+[[gnu::always_inline]] static inline void steamcompmgr_update_virtual_connector_focuses( gamescope::VirtualConnectorStrategy eVirtualConnectorStrategy,
+	const std::vector<gamescope::VirtualConnectorKey_t> &keysToClose )
+{
+	// TODO(misyl): Improve this situation, it's kind of a mess.
+	// We could/should make this event driven rather than solving
+	// per-frame.
+
+	if ( !gamescope::VirtualConnectorIsSingleOutput() )
+	{
+		std::vector<gamescope::VirtualConnectorKey_t> newKeys;
+
+		auto focusWindows = GetGlobalPossibleFocusWindows();
+		for ( steamcompmgr_win_t *pWindow : focusWindows )
+		{
+			// Exclude windows that are useless (1x1), or override redirect windows
+			if ( win_is_useless( pWindow ) ||
+				( pWindow->type == steamcompmgr_win_type_t::XWAYLAND && pWindow->xwayland().a.override_redirect &&
+				 !pWindow->isSteamLegacyBigPicture ) ) // bootstrapper is override redirect :(
+			{
+				continue;
+			}
+
+			gamescope::VirtualConnectorKey_t ulKey = pWindow->GetVirtualConnectorKey( eVirtualConnectorStrategy );
+
+			if ( gamescope::Algorithm::Contains( keysToClose, ulKey ) )
+			{
+				if ( pWindow->type == steamcompmgr_win_type_t::XWAYLAND )
+				{
+					XEvent event = {0};
+					event.xclient.type = ClientMessage;
+					event.xclient.window = pWindow->xwayland().id;
+					event.xclient.message_type = pWindow->xwayland().ctx->atoms.wm_protocols;
+					event.xclient.format = 32;
+					event.xclient.data.l[0] = pWindow->xwayland().ctx->atoms.wm_delete_window;
+					event.xclient.data.l[1] = CurrentTime;
+
+					XSendEvent(pWindow->xwayland().ctx->dpy, pWindow->xwayland().id, False, NoEventMask, &event);
+				}
+				else
+				{
+					xwm_log.errorf( "Closing Wayland windows not supported yet." );
+				}
+			}
+
+			if ( !gamescope::Algorithm::Contains( newKeys, ulKey ) )
+				newKeys.emplace_back( ulKey );
+		}
+		std::sort( newKeys.begin(), newKeys.end() );
+
+		std::vector<gamescope::VirtualConnectorKey_t> oldKeys;
+		for ( const auto &iter : g_VirtualConnectorFocuses )
+			oldKeys.emplace_back( iter.first );
+		std::sort( oldKeys.begin(), oldKeys.end() );
+
+		std::vector<gamescope::VirtualConnectorKey_t> diffKeys;
+
+		std::set_symmetric_difference(oldKeys.begin(), oldKeys.end(),
+							newKeys.begin(), newKeys.end(),
+							std::back_inserter(diffKeys),
+							[](auto& a, auto& b) { return a < b; });
+
+		for ( gamescope::VirtualConnectorKey_t ulKey : diffKeys )
+		{
+			bool bIsSteam = gamescope::VirtualConnectorKeyIsSteam( ulKey );
+			bool bIsBaseKey = ulKey == 0;
+
+			if ( gamescope::Algorithm::Contains( newKeys, ulKey ) )
+			{
+				g_VirtualConnectorFocuses[ulKey] = global_focus_t
+				{
+					.ulVirtualFocusKey = ulKey,
+					.pVirtualConnector = GetBackend()->UsesVirtualConnectors() ? GetBackend()->CreateVirtualConnector( ulKey ) : nullptr,
+				};
+			}
+			else if ( !bIsSteam && !bIsBaseKey ) // Never remove Steam's virtual connector or the 0th connector.
+			{
+				g_VirtualConnectorFocuses.erase( ulKey );
+			}
+		}
+	}
+
+	UpdateMangoappInstances();
+
+	for ( auto &iter : g_VirtualConnectorFocuses )
+	{
+		global_focus_t *pFocus = &iter.second;
+		if ( pFocus->IsDirty() )
+		{
+			determine_and_apply_focus( pFocus );
+			hasRepaint = true;
+		}
+	}
+}
+
+static inline void steamcompmgr_update_hdr_active( bool bOutputHDRCapable )
+{
+	gamescope::IBackendConnector *pConn = GetBackend()->GetCurrentConnector();
+	const bool bContentDriven = bOutputHDRCapable && !g_bForceHDR10OutputDebug &&
+		( cv_hdr_content_driven ||
+		  ( pConn && pConn->GetHDRInfo().bContentDrivenHDR ) );
+
+	bool bOutputHDRActive = bOutputHDRCapable;
+	if ( bContentDriven )
+	{
+		// Track any live window, not just the focused one, so browsing the
+		// Steam UI over a running HDR game does not bounce the panel through
+		// a modeset on every focus change.
+		bOutputHDRActive = false;
+		for ( steamcompmgr_win_t *pWin : GetGlobalPossibleFocusWindows() )
+		{
+			commit_t *pCommit = get_window_last_done_commit_peek( pWin );
+			if ( pCommit && ColorspaceIsHDR( pCommit->colorspace() ) )
+			{
+				bOutputHDRActive = true;
+				break;
+			}
+		}
+	}
+	if ( bOutputHDRActive != g_bOutputHDREnabled )
+		xwm_log.infof( "HDR output %s%s", bOutputHDRActive ? "enabled" : "disabled", bContentDriven ? " (hdr_content_driven)" : "" );
+	g_bOutputHDREnabled = bOutputHDRActive;
+}
+
+static inline void steamcompmgr_update_output_size( xwayland_ctx_t *root_ctx, bool &flush_root, bool bOutputHDRCapable )
+{
+	// Pick our width/height for this potential frame, regardless of how it might change later
+	// At some point we might even add proper locking so we get real updates atomically instead
+	// of whatever jumble of races the below might cause over a couple of frames
+	if ( currentOutputWidth != g_nOutputWidth ||
+		 currentOutputHeight != g_nOutputHeight ||
+		 currentOutputRefresh != g_nOutputRefresh ||
+		 currentOutputRotation != g_uOutputRotation ||
+		 currentHDROutput != g_bOutputHDREnabled ||
+		 currentHDRCapable != bOutputHDRCapable ||
+		 currentHDRForce != g_bForceHDRSupportDebug )
+	{
+		if ( g_nXWaylandCount > 1 )
+		{
+			g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;
+			wlserver_lock();
+			// Update only Steam, the root ctx, with the new output size for now
+			wlserver_set_xwayland_server_mode( 0, g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
+			wlserver_unlock();
+		}
+
+		// XXX(JoshA): Remake this. It sucks.
+		if ( GetBackend()->UsesVulkanSwapchain() )
+		{
+			// No image only means "not this iteration": rendervulkan has
+			// already arranged the retry or requested shutdown.
+			vulkan_acquire_swapchain_image( true );
+		}
+		else
+		{
+			vulkan_remake_output_images();
+		}
+
+
+		{
+			gamescope_xwayland_server_t *server = NULL;
+			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			{
+				uint32_t hdr_value = ( bOutputHDRCapable || g_bForceHDRSupportDebug ) ? 1 : 0;
+				XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
+					(unsigned char *)&hdr_value, 1 );
+
+				server->ctx->cursor->setDirty();
+
+				if (server->ctx.get() == root_ctx)
+				{
+					flush_root = true;
+				}
+				else
+				{
+					XFlush(server->ctx->dpy);
+				}
+			}
+		}
+
+		currentOutputWidth = g_nOutputWidth;
+		currentOutputHeight = g_nOutputHeight;
+		currentOutputRefresh = g_nOutputRefresh;
+		currentOutputRotation = g_uOutputRotation;
+		currentHDROutput = g_bOutputHDREnabled;
+		currentHDRCapable = bOutputHDRCapable;
+		currentHDRForce = g_bForceHDRSupportDebug;
+
+#if HAVE_PIPEWIRE
+		nudge_pipewire();
+#endif
+	}
+}
+
+static inline void steamcompmgr_update_refresh_cycles( bool vblank )
+{
+	if ( vblank )
+	{
+		int nRealRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+		g_SteamCompMgrAppRefreshCycle = gamescope::mHzToRefreshCycle( nRealRefreshmHz );
+		g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle;
+		if ( g_nSteamCompMgrTargetFPS )
+		{
+			int nRealRefreshHz = gamescope::ConvertmHzToHz( nRealRefreshmHz );
+			int nTargetFPS = g_nSteamCompMgrTargetFPS;
+			nTargetFPS = std::min<int>( nTargetFPS, nRealRefreshHz );
+
+			if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
+			{
+				g_SteamCompMgrLimitedAppRefreshCycle = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
+			}
+			else
+			{
+				int nVblankDivisor = nRealRefreshHz / nTargetFPS;
+
+				g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle * nVblankDivisor;
+			}
+		}
+	}
+}
+
+static inline void steamcompmgr_predict_present_time( bool bIsVBlankFromTimer, bool bVRR )
+{
+	uint64_t ulNow = get_time_in_nanos();
+	const gamescope::VBlankScheduleTime &schedule = g_SteamCompMgrVBlankTime.schedule;
+	s_PredictedTearingPresentTime = gamescope::PredictFixedPresentTime( ulNow,
+		schedule.ulTargetVBlank, g_SteamCompMgrAppRefreshCycle );
+	// A fence wake lands in the armed pass until it runs, then misses that vblank's flip.
+	const std::optional<gamescope::VBlankScheduleTime> armed = bIsVBlankFromTimer ? std::nullopt : GetVBlankTimer().GetArmedSchedule();
+	const gamescope::VBlankScheduleTime &latch = armed ? *armed : schedule;
+	s_PredictedPresentTime = gamescope::PredictFixedLatchPresentTime( ulNow, latch.ulTargetVBlank,
+		latch.ulScheduledWakeupPoint, g_SteamCompMgrAppRefreshCycle, bIsVBlankFromTimer || armed );
+	// The armed schedule can carry a new refresh before this loop's cycles catch up.
+	s_PredictedRefreshGrid = bVRR ? 0 : latch.ulRefreshCycle ? latch.ulRefreshCycle : g_SteamCompMgrAppRefreshCycle;
+	if ( bVRR )
+		s_PredictedPresentTime = s_PredictedTearingPresentTime = gamescope::PredictPresentTime( ulNow,
+			GetVBlankTimer().VRRWakeupOffset(), GetVBlankTimer().GetLastVBlank(),
+			gamescope::mHzToRefreshCycle( GetVBlankTimer().GetRefresh() ) );
+}
+
+static inline void steamcompmgr_latch_vblank_frame_done( bool vblank, uint64_t &vblank_idx )
+{
+	if ( vblank )
+	{
+		steamcompmgr_note_vblank_pass( g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank,
+			g_SteamCompMgrAppRefreshCycle );
+
+		{
+			uint64_t now = get_time_in_nanos();
+
+			steamcompmgr_update_vr_session_state();
+
+			gamescope_xwayland_server_t *server = NULL;
+			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			{
+				for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
+				{
+					steamcompmgr_latch_frame_done( w, vblank_idx, now );
+				}
+			}
+
+			for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
+			{
+				steamcompmgr_latch_frame_done( xdg_win.get(), vblank_idx, now );
+			}
+		}
+	}
+}
+
+static inline void steamcompmgr_send_presented( bool vblank )
+{
+	if ( vblank )
+	{
+		wlserver_lock();
+		gamescope_xwayland_server_t *server = NULL;
+		for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			handle_presented_xwayland( server->ctx.get() );
+		wlserver_unlock();
+	}
+}
+
+static inline void steamcompmgr_update_app_hdr_metadata( xwayland_ctx_t *root_ctx, bool &flush_root )
+{
+	GamescopeAppTextureColorspace current_app_colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+	std::shared_ptr<gamescope::BackendBlob> app_hdr_metadata = nullptr;
+	global_focus_t *pCurrentFocus = GetCurrentFocus();
+	if ( pCurrentFocus && pCurrentFocus->HeldCommits[HELD_COMMIT_BASE] != nullptr )
+	{
+		current_app_colorspace = pCurrentFocus->HeldCommits[HELD_COMMIT_BASE]->colorspace();
+		if (pCurrentFocus->HeldCommits[HELD_COMMIT_BASE]->feedback)
+			app_hdr_metadata = pCurrentFocus->HeldCommits[HELD_COMMIT_BASE]->feedback->hdr_metadata_blob;
+	}
+
+	bool app_wants_hdr = ColorspaceIsHDR( current_app_colorspace );
+
+	if ( app_wants_hdr != g_bAppWantsHDRCached )
+	{
+		uint32_t app_wants_hdr_prop = app_wants_hdr ? 1 : 0;
+
+		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppWantsHDRFeedback, XA_CARDINAL, 32, PropModeReplace,
+				(unsigned char *)&app_wants_hdr_prop, 1 );
+
+		g_bAppWantsHDRCached = app_wants_hdr;
+		flush_root = true;
+	}
+
+	if ( app_hdr_metadata != g_ColorMgmt.pending.appHDRMetadata )
+	{
+		if ( app_hdr_metadata )
+		{
+			std::vector<uint32_t> app_hdr_metadata_blob;
+			app_hdr_metadata_blob.resize((sizeof(hdr_metadata_infoframe) + (sizeof(uint32_t) - 1)) / sizeof(uint32_t));
+			memset(app_hdr_metadata_blob.data(), 0, sizeof(uint32_t) * app_hdr_metadata_blob.size());
+			memcpy(app_hdr_metadata_blob.data(), &app_hdr_metadata->View<hdr_output_metadata>().hdmi_metadata_type1, sizeof(hdr_metadata_infoframe));
+
+			XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppHDRMetadataFeedback, XA_CARDINAL, 32, PropModeReplace,
+					(unsigned char *)app_hdr_metadata_blob.data(), (int)app_hdr_metadata_blob.size() );
+		}
+		else
+		{
+			XDeleteProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppHDRMetadataFeedback);
+		}
+
+		g_ColorMgmt.pending.appHDRMetadata	 = app_hdr_metadata;
+		flush_root = true;
+	}
+}
+
+static inline void steamcompmgr_arbitrate_generated_frame( bool bVrrHybridActive, uint64_t &ulFixedCommitDeadlineNs, bool bBidirActive, bool vblank,
+	const gamescope::framegen::RepaintPlan_t &repaintPlan, bool &bShouldPaint, bool &bFramegenGeneratedPaint )
+{
+	// Earlier steamcompmgr_main stages can invalidate or replace the queue
+	// after the loop-entry cleanup check, so arbitrate only on a fresh deadline.
+	ulFixedCommitDeadlineNs = !bVrrHybridActive
+		? vulkan_framegen_fixed_refresh_commit_deadline_ns() : 0u;
+	if ( vulkan_framegen_has_pending_generated_frame() )
+	{
+		// Real frames always take priority over generated ones: the
+		// backends present a pending generated frame ahead of anything
+		// else, so if new real content has been latched — a game frame
+		// or an overlay/notification update — drop the stale prediction
+		// rather than letting it displace that content and add a vblank
+		// of latency. Generated frames only fill vblanks the game left
+		// empty.
+		// A nonzero native fixed-refresh deadline gets its own arbiter.
+		// A zero deadline takes the vblank arbiter in the else branch
+		// without evaluating any fixed-refresh timer, in-flight or retry
+		// condition.
+		if ( ulFixedCommitDeadlineNs != 0u )
+		{
+			if ( hasRepaint )
+			{
+				// Test this before all generated-commit state: queued real
+				// work has absolute priority and reaches the normal paint path.
+				g_bFramegenCommitDeadline = false;
+				vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+			}
+			else
+			{
+				// Drop a stale carry-over fire. The genuinely armed timer
+				// will re-set the flag at its current target.
+				if ( g_ulFramegenCommitDeadlineNs != ulFixedCommitDeadlineNs )
+					g_bFramegenCommitDeadline = false;
+				else if ( g_bFramegenCommitDeadline
+					&& get_time_in_nanos() < ulFixedCommitDeadlineNs )
+					g_bFramegenCommitDeadline = false;
+				// A generated commit must not overtake the preceding real
+				// present. Its flip-completion nudge re-enters this arbiter.
+				const bool bPresentInFlight =
+					GetBackend()->GetCurrentConnector()
+					&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
+				if ( gamescope::framegen::can_start_early_generated_commit(
+						g_bFramegenCommitDeadline, false,
+						bPresentInFlight )
+					&& vulkan_framegen_generated_frame_due()
+					// Real-arrival cutoff: if the learned cadence puts
+					// the next real client frame inside the commit-lead
+					// window, don't reserve KMS state ahead of it — the
+					// normal vblank path presents it without the extra
+					// vblank of latency.
+					&& !vulkan_framegen_real_arrival_blocks_early_commit() )
+				{
+					g_bFramegenCommitDeadline = false;
+					const bool bReady = vulkan_framegen_generated_frame_ready();
+					if ( bReady && repaintPlan.generatedMayTakeSlot )
+					{
+						bShouldPaint = true;
+						bFramegenGeneratedPaint = true;
+						g_bFramegenEarlyGeneratedInFlight = true;
+					}
+					else
+						vulkan_framegen_discard_generated_frame( bReady ? "superseded_by_repaint" : "generation_too_slow" );
+				}
+			}
+		}
+		else
+		{
+			// VRR/vblank timing stays independent of the fixed-refresh
+			// deadline. Both paths share the repaint guard in steamcompmgr_paint_virtual_connector.
+			const bool bHybridInFlight = bVrrHybridActive
+				&& GetBackend()->GetCurrentConnector()
+				&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
+			if ( bVrrHybridActive && g_bFramegenCommitDeadline && get_time_in_nanos() < g_ulFramegenCommitDeadlineNs )
+				g_bFramegenCommitDeadline = false;
+			if ( hasRepaint )
+			{
+				if ( !bBidirActive )
+					vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
+				if ( bVrrHybridActive )
+				{
+					g_bFramegenCommitDeadline = false;
+					g_FramegenCommitTimer.DisarmTimer();
+					vulkan_framegen_cancel_vrr_hybrid_slot(
+						"superseded_by_real_frame" );
+				}
+			}
+			else if ( ( bVrrHybridActive ? g_bFramegenCommitDeadline : vblank )
+				&& !bHybridInFlight
+				&& vulkan_framegen_generated_frame_due() )
+			{
+				if ( bVrrHybridActive )
+					g_bFramegenCommitDeadline = false;
+				const bool bReady = vulkan_framegen_generated_frame_ready();
+				if ( bReady && repaintPlan.generatedMayTakeSlot )
+				{
+					bShouldPaint = true;
+					bFramegenGeneratedPaint = true;
+				}
+				else
+					vulkan_framegen_discard_generated_frame( bReady ? "superseded_by_repaint" : "generation_too_slow" );
+			}
+		}
+	}
+	else
+	{
+		// Nothing pending (discarded or invalidated since the timer was
+		// armed) — a stale mid-interval deadline has nothing to show.
+		g_bFramegenCommitDeadline = false;
+	}
+}
+
+[[gnu::always_inline]] static inline void steamcompmgr_paint_virtual_connector( global_focus_t *pPaintFocus, bool vblank, bool bVRR, bool bVRRCanFlip, bool bIsVBlankFromTimer,
+	bool bVrrHybridActive, uint64_t &ulFixedCommitDeadlineNs, bool bBidirActive,
+	const gamescope::framegen::RepaintPlan_t &repaintPlan, gamescope::framegen::RepaintIteration_t &repaintIteration,
+	bool bOverlayRepaint, bool &bForceRepaint, int &nIgnoredOverlayRepaints )
+{
+	const UpscaleSettings_t upscaleSettings = GetUpscaleSettings(
+		window_is_steam( pPaintFocus->focusWindow ),
+		g_wantedUpscaleFilter,
+		g_wantedUpscaleScaler,
+		g_upscaleFilterSharpness );
+	pPaintFocus->eUpscaleFilter = upscaleSettings.eFilter;
+	pPaintFocus->eUpscaleScaler = upscaleSettings.eScaler;
+	pPaintFocus->nUpscaleSharpness = upscaleSettings.nSharpness;
+
+	if ( vblank )
+	{
+		if ( pPaintFocus->cursor )
+			pPaintFocus->cursor->UpdatePosition();
+	}
+
+	if ( pPaintFocus->GetNestedHints() && !g_bForceRelativeMouse )
+	{
+		const bool bImageEmpty =
+			( pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty() ) &&
+			( !window_is_steam( pPaintFocus->inputFocusWindow ) );
+
+		const bool bHasPointerConstraint = pPaintFocus->cursor && pPaintFocus->cursor->IsConstrained();
+
+		uint32_t uAppId = pPaintFocus->inputFocusWindow
+			? pPaintFocus->inputFocusWindow->appID
+			: 0;
+
+		const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
+
+		const bool bRelativeMouseMode = bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
+
+		pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
+	}
+
+	// HACK: Disable tearing if we have an overlay to avoid stutters right now
+	// TODO: Fix properly.
+	const bool bHasOverlay = ( pPaintFocus->overlayWindow && pPaintFocus->overlayWindow->opacity ) ||
+							( pPaintFocus->externalOverlayWindow && pPaintFocus->externalOverlayWindow->opacity ) ||
+							( pPaintFocus->overrideWindow  && pPaintFocus->focusWindow && !pPaintFocus->focusWindow->isSteamStreamingClient && pPaintFocus->overrideWindow->opacity );
+
+	// If we are running behind, allow tearing.
+
+	// Only the first focus painted on a vblank takes a forced sync flip;
+	// the request stays pending until that live paint retires it.
+	const bool bForcedPaint = std::exchange( bForceRepaint, false );
+	const bool bForceSyncFlip = bForcedPaint || is_fading_out( pPaintFocus );
+
+	// If we are compositing, always force sync flips because we currently wait
+	// for composition to finish before submitting.
+	// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
+	const bool bSurfaceWantsAsync = (pPaintFocus->HeldCommits[HELD_COMMIT_BASE] != nullptr && pPaintFocus->HeldCommits[HELD_COMMIT_BASE]->async);
+	// Generated frames must land on vblanks; tearing real frames around
+	// them would misplace both. Framegen and tearing are exclusive.
+	const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync
+		&& !vulkan_framegen_is_enabled();
+
+	enum class FlipType
+	{
+		Normal,
+		Async,
+		VRR,
+	};
+
+	FlipType eFlipType = FlipType::Normal;
+
+	if ( bForceSyncFlip )
+		eFlipType = FlipType::Normal;
+	else if ( bVRR )
+		eFlipType = FlipType::VRR;
+	else if ( bTearing )
+	{
+		eFlipType = FlipType::Async;
+
+		if ( nIgnoredOverlayRepaints )
+			eFlipType = FlipType::Normal;
+		if ( bHasOverlay ) // Don't tear if the Steam or perf overlay is up atm.
+			eFlipType = FlipType::Normal;
+		if ( GetVBlankTimer().WasCompositing() )
+			eFlipType = FlipType::Normal;
+	}
+	else
+		eFlipType = FlipType::Normal;
+
+	bool bShouldPaint = false;
+
+	// Framegen: true when this pass paints because a GENERATED frame is
+	// being committed, rather than because real content changed. Only
+	// steamcompmgr_arbitrate_generated_frame can set it, so with framegen disabled (or with
+	// nothing pending) it stays false and this pass behaves exactly as before.
+	bool bFramegenGeneratedPaint = false;
+
+	//if ( GetBackend()->IsVisible() )
+	if ( true )
+	{
+		switch ( eFlipType )
+		{
+			case FlipType::Normal:
+			{
+				bShouldPaint = vblank && ( hasRepaint || bOverlayRepaint || bForceSyncFlip );
+				break;
+			}
+
+			case FlipType::Async:
+			{
+				bShouldPaint = hasRepaint;
+
+				if ( vblank && !bShouldPaint && bOverlayRepaint )
+					nIgnoredOverlayRepaints++;
+
+				break;
+			}
+
+			case FlipType::VRR:
+			{
+				bShouldPaint = hasRepaint && bVRRCanFlip;
+
+				if ( bIsVBlankFromTimer )
+				{
+					if ( bOverlayRepaint )
+					{
+						if ( vulkan_framegen_has_pending_generated_frame()
+							|| nIgnoredOverlayRepaints >= cv_adaptive_sync_overlay_cycles
+							|| repaintPlan.exhausted )
+						{
+							// Pending generation uses the shared age guard below;
+							// the overlay-repaint throttle must not add another waiting period.
+							bShouldPaint = true;
+						}
+						else if ( !bShouldPaint )
+						{
+							// If we hit vblank (ie. fastest refresh cycle since last commit),
+							// and we aren't painting and we have a pending overlay, then:
+							// defer it until the next game update or next true vblank.
+							if ( !cv_adaptive_sync_ignore_overlay )
+								nIgnoredOverlayRepaints++;
+						}
+					}
+				}
+
+				// If we have a pending page flip and doing VRR, lets not do another...
+				if ( GetBackend()->GetCurrentConnector() &&
+					 GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0 )
+					bShouldPaint = false;
+
+				break;
+			}
+		}
+	}
+	else
+	{
+		bShouldPaint = false;
+	}
+
+	steamcompmgr_arbitrate_generated_frame( bVrrHybridActive, ulFixedCommitDeadlineNs, bBidirActive, vblank,
+		repaintPlan, bShouldPaint, bFramegenGeneratedPaint );
+
+	// A paint that the arbiter did not select must not consume a causal
+	// prediction outside its slot. Apply this to fixed-refresh, vblank
+	// and VRR paths alike; bidir owns a separate ordered timeline.
+	if ( bShouldPaint && !hasRepaint && !bFramegenGeneratedPaint
+		&& vulkan_framegen_has_pending_generated_frame() )
+	{
+		switch ( repaintIteration.take_unselected_paint( repaintPlan ) )
+		{
+			case gamescope::framegen::UnselectedPaint_t::Yield:
+				bShouldPaint = false;
+				break;
+			case gamescope::framegen::UnselectedPaint_t::DiscardPrediction:
+				vulkan_framegen_discard_generated_frame( "superseded_by_repaint" );
+				break;
+			case gamescope::framegen::UnselectedPaint_t::Paint:
+				break;
+		}
+	}
+
+	static uint64_t s_uFramegenVblankDebugLogCounter = 0;
+	if ( vblank && vulkan_framegen_is_enabled() && FramegenDebugShouldLog( s_uFramegenVblankDebugLogCounter ) )
+	{
+		// Classify what this vblank slot will show: a real frame, a
+		// generated frame, or (nothing presented) a hardware repeat of
+		// the previous scanout buffer.
+		const char *pszSlotType = !bShouldPaint
+			? "repeat"
+			: ( vulkan_framegen_has_pending_generated_frame() ? "generated" : "real" );
+		// Attribute a repeat taken while the queue still held content:
+		// which arbiter condition declined it, and whether the front's
+		// own display target was still in the future at this vblank.
+		double flFrontTargetDeltaMs = 0.0;
+		const size_t uPending = vulkan_framegen_pending_queue_debug( &flFrontTargetDeltaMs );
+		xwm_log.infof( "framegen: vblank slot=%s pending=%zu due=%d ready=%d hasRepaint=%d overlayOnly=%d front_target_delta_ms=%.3f",
+			pszSlotType, uPending, (int)vulkan_framegen_generated_frame_due(),
+			(int)vulkan_framegen_generated_frame_ready(), (int)hasRepaint,
+			(int)hasRepaintNonBasePlane, flFrontTargetDeltaMs );
+	}
+
+	// Absolute-deadline causal pacing: this vblank is going to a
+	// hardware repeat while framegen is active — no real content and
+	// nothing pending (a stall, a too-slow discard, or a mispredicted
+	// keep-up). Ask the causal planner for the earliest slot that can still be
+	// prepared. A GPU overrun or the bounded forward-prediction cap may
+	// still require more than one honest repeat. The planner does nothing
+	// outside fixed-refresh causal pacing (VRR hybrid and bidir pace
+	// themselves).
+	if ( vblank && !bShouldPaint && vulkan_framegen_is_enabled() )
+		vulkan_framegen_causal_tick();
+
+	if ( bShouldPaint )
+	{
+		// Framegen cursor freshness: a generated-frame commit is triggered
+		// by the commit-deadline timer (fixed-refresh) or the mid-interval
+		// hybrid timer, not by the vblank, so the cursor position latched
+		// by the vblank-gated UpdatePosition() above can be up to a whole
+		// refresh interval old by the time this layer stack is assembled.
+		// Re-sample it here so the stack paint_all builds — which the
+		// backend late-composites onto the generated frame in base-layer
+		// mode — carries the cursor where it actually is at commit time.
+		// This only re-reads wlserver's latest pointer position; it does
+		// not paint, wake, or re-time anything, so pacing and the
+		// scheduler's decisions are untouched.
+		if ( bFramegenGeneratedPaint && pPaintFocus->cursor )
+			pPaintFocus->cursor->UpdatePosition();
+
+		// Sample the base-layer latch before painting: it can change inside
+		// the paint. Under bidir the flip substitution reports what it showed.
+		const bool bBaseLayer = vulkan_framegen_base_layer_active();
+		const auto eOutcome = paint_all( pPaintFocus, eFlipType == FlipType::Async );
+		const gamescope::framegen::PaintReport_t report = vulkan_framegen_bidir_take_paint_report();
+		repaintIteration.add_paint( gamescope::framegen::classify_paint_output( bFramegenGeneratedPaint,
+			bBaseLayer, bBidirActive, report.verdict ), eOutcome, bForcedPaint, report );
+	}
+}
+
+static inline void steamcompmgr_update_framegen_commit_timer( bool bVrrHybridActive, uint64_t &ulFixedCommitDeadlineNs )
+{
+	// The VRR timer path is independent of the fixed-refresh deadline: a
+	// zero fixed deadline never reaches clock sampling, timer arming or the
+	// passed-deadline retry below.
+	if ( bVrrHybridActive )
+	{
+		uint64_t ulWakeDeadlineNs =
+			vulkan_framegen_vrr_hybrid_wake_deadline_ns();
+		if ( ulWakeDeadlineNs != 0u && !g_bFramegenCommitDeadline
+			&& get_time_in_nanos() >= ulWakeDeadlineNs )
+		{
+			vulkan_framegen_cancel_vrr_hybrid_slot(
+				"late_wake_arm" );
+			ulWakeDeadlineNs = 0u;
+		}
+		if ( ulWakeDeadlineNs != 0u
+			&& ulWakeDeadlineNs != g_ulFramegenCommitDeadlineNs )
+		{
+			g_bFramegenCommitDeadline = false;
+			g_ulFramegenCommitDeadlineNs = ulWakeDeadlineNs;
+			g_FramegenCommitTimer.ArmTimer( ulWakeDeadlineNs );
+		}
+		else if ( ulWakeDeadlineNs == 0u )
+			framegen_drop_commit_deadline();
+	}
+	else
+	{
+		// Earlier steamcompmgr_main stages may consume, replace, or create the native causal slot.
+		// Re-read it only after real work has had absolute priority.
+		ulFixedCommitDeadlineNs =
+			vulkan_framegen_fixed_refresh_commit_deadline_ns();
+		if ( ulFixedCommitDeadlineNs != 0u )
+		{
+			const uint64_t ulCommitArmNowNs = get_time_in_nanos();
+			if ( ulCommitArmNowNs >= ulFixedCommitDeadlineNs )
+			{
+				// A fixed-grid slot can be created only after the preceding
+				// real commit returns. Re-enter once after that real work; if
+				// its flip is still in flight, flip completion is the only
+				// subsequent retry wake.
+				if ( g_ulFramegenCommitDeadlineNs != ulFixedCommitDeadlineNs )
+					g_bFramegenCommitDeadline = false;
+				if ( !g_bFramegenCommitDeadline )
+				{
+					g_ulFramegenCommitDeadlineNs = ulFixedCommitDeadlineNs;
+					g_FramegenCommitTimer.DisarmTimer();
+					g_bFramegenCommitDeadline = true;
+					g_SteamCompMgrWaiter.Nudge();
+				}
+			}
+			else if ( ulFixedCommitDeadlineNs != g_ulFramegenCommitDeadlineNs )
+			{
+				g_bFramegenCommitDeadline = false;
+				g_ulFramegenCommitDeadlineNs = ulFixedCommitDeadlineNs;
+				g_FramegenCommitTimer.ArmTimer( ulFixedCommitDeadlineNs );
+			}
+		}
+		else if ( g_ulFramegenCommitDeadlineNs != 0u )
+		{
+			// A deadline owned earlier in this iteration was superseded by
+			// real work. Cancel it after the real commit, never before it.
+			g_bFramegenCommitDeadline = false;
+			framegen_drop_commit_deadline();
+		}
+	}
+}
+
+void
+steamcompmgr_main(int argc, char **argv)
+{
+	s_steamcompmgrThread = pthread_self();
+	int	readyPipeFD = -1;
+
+	// Reset getopt() state
+	optind = 1;
+
+	int o;
+	int opt_index = -1;
+	bool bForceWindowsFullscreen = false;
+	steamcompmgr_parse_options( argc, argv, o, opt_index, readyPipeFD, bForceWindowsFullscreen );
 
 	int subCommandArg = -1;
 	if ( optind < argc )
@@ -10367,12 +11190,7 @@ steamcompmgr_main(int argc, char **argv)
 			determine_and_apply_focus( pFocus );
 	}
 
-	if ( readyPipeFD != -1 )
-	{
-		dprintf( readyPipeFD, "%s %s\n", root_ctx->xwayland_server->get_nested_display_name(), wlserver_get_wl_display_name() );
-		close( readyPipeFD );
-		readyPipeFD = -1;
-	}
+	steamcompmgr_signal_ready( root_ctx, readyPipeFD );
 
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
@@ -10380,19 +11198,7 @@ steamcompmgr_main(int argc, char **argv)
 	GetVBlankTimer().ArmNextVBlank( true );
 	WatchMangoappConfig();
 
-	if ( g_BacklightWatcher.Init() )
-		g_SteamCompMgrWaiter.AddWaitable( &g_BacklightWatcher, EPOLLPRI );
-
-	{
-		gamescope_xwayland_server_t *pServer = NULL;
-		for (size_t i = 0; (pServer = wlserver_get_xwayland_server(i)); i++)
-		{
-			xwayland_ctx_t *pXWaylandCtx = pServer->ctx.get();
-			g_SteamCompMgrWaiter.AddWaitable( pXWaylandCtx );
-
-			pServer->ctx->force_windows_fullscreen = bForceWindowsFullscreen;
-		}
-	}
+	steamcompmgr_init_watchers( bForceWindowsFullscreen );
 
 	update_vrr_atoms(root_ctx, true);
 	update_limiter_atoms(root_ctx, true);
@@ -10418,21 +11224,7 @@ steamcompmgr_main(int argc, char **argv)
 	// ie. color.rgb = color.rgba * u_ctm[offsetLayerIdx];
 	s_scRGB709To2020Matrix = GetBackend()->CreateBackendBlob( glm::mat3x4( glm::transpose( k_2020_from_709 ) ) );
 
-	FILE *sysfs_caps = fopen("/sys/fs/cgroup/dmem.capacity", "r");
-	if (sysfs_caps != nullptr) {
-		char *line = NULL;
-		size_t size = 0;
-		while (getline(&line, &size, sysfs_caps) >= 0) {
-			char *capacity = strstr(line, " ");
-			if (capacity)
-				++capacity;
-			else
-				continue;
-			uint64_t vramSize = strtoull(capacity, NULL, 10);
-			std::string idString = std::string(line, (capacity - 1) - line);
-			g_vramCapacities.emplace(idString, vramSize);
-		}
-	}
+	steamcompmgr_read_vram_capacities();
 
 	for (;;)
 	{
@@ -10524,27 +11316,7 @@ steamcompmgr_main(int argc, char **argv)
 		static gamescope::VirtualConnectorStrategy s_eLastVirtualConnectorStrategy = gamescope::cv_backend_virtual_connector_strategy;
 		gamescope::VirtualConnectorStrategy eVirtualConnectorStrategy = gamescope::cv_backend_virtual_connector_strategy;
 
-		if ( eVirtualConnectorStrategy != s_eLastVirtualConnectorStrategy || bBackendJustInitted )
-		{
-			// If our virtual connector strategy changes, clear out our virtual connector
-			// global focuses.
-			g_VirtualConnectorFocuses.clear();
-			s_eLastVirtualConnectorStrategy = eVirtualConnectorStrategy;
-
-			xwm_log.infof( "Late init of virtual connector stuff." );
-
-			// misyl: Make the virtual connector up-front if we are in a single-output mode.
-			// So we don't delay in getting display/output info to the game
-			static constexpr uint64_t k_unSingleOutputVirtualConnectorKey = 0;
-
-			g_VirtualConnectorFocuses[ k_unSingleOutputVirtualConnectorKey ] = global_focus_t
-			{
-				.ulVirtualFocusKey = k_unSingleOutputVirtualConnectorKey,
-				.pVirtualConnector = GetBackend()->UsesVirtualConnectors() ? GetBackend()->CreateVirtualConnector( k_unSingleOutputVirtualConnectorKey ) : nullptr,
-			};
-
-			hasRepaint = true;
-		}
+		steamcompmgr_update_virtual_connector_strategy( eVirtualConnectorStrategy, s_eLastVirtualConnectorStrategy, bBackendJustInitted );
 
 #if 0
 		bool bDirtyFocuses = false;
@@ -10568,97 +11340,7 @@ steamcompmgr_main(int argc, char **argv)
 
 		// XXX: Need to look into why this doesn't work.
 		//	if ( bDirtyFocuses )
-		{
-			// TODO(misyl): Improve this situation, it's kind of a mess.
-			// We could/should make this event driven rather than solving
-			// per-frame.
-
-			if ( !gamescope::VirtualConnectorIsSingleOutput() )
-			{
-				std::vector<gamescope::VirtualConnectorKey_t> newKeys;
-
-				auto focusWindows = GetGlobalPossibleFocusWindows();
-				for ( steamcompmgr_win_t *pWindow : focusWindows )
-				{
-					// Exclude windows that are useless (1x1), or override redirect windows
-					if ( win_is_useless( pWindow ) ||
-						( pWindow->type == steamcompmgr_win_type_t::XWAYLAND && pWindow->xwayland().a.override_redirect &&
-						 !pWindow->isSteamLegacyBigPicture ) ) // bootstrapper is override redirect :(
-					{
-						continue;
-					}
-
-					gamescope::VirtualConnectorKey_t ulKey = pWindow->GetVirtualConnectorKey( eVirtualConnectorStrategy );
-
-					if ( gamescope::Algorithm::Contains( keysToClose, ulKey ) )
-					{
-						if ( pWindow->type == steamcompmgr_win_type_t::XWAYLAND )
-						{
-							XEvent event = {0};
-							event.xclient.type = ClientMessage;
-							event.xclient.window = pWindow->xwayland().id;
-							event.xclient.message_type = pWindow->xwayland().ctx->atoms.wm_protocols;
-							event.xclient.format = 32;
-							event.xclient.data.l[0] = pWindow->xwayland().ctx->atoms.wm_delete_window;
-							event.xclient.data.l[1] = CurrentTime;
-
-							XSendEvent(pWindow->xwayland().ctx->dpy, pWindow->xwayland().id, False, NoEventMask, &event);
-						}
-						else
-						{
-							xwm_log.errorf( "Closing Wayland windows not supported yet." );
-						}
-					}
-
-					if ( !gamescope::Algorithm::Contains( newKeys, ulKey ) )
-						newKeys.emplace_back( ulKey );
-				}
-				std::sort( newKeys.begin(), newKeys.end() );
-
-				std::vector<gamescope::VirtualConnectorKey_t> oldKeys;
-				for ( const auto &iter : g_VirtualConnectorFocuses )
-					oldKeys.emplace_back( iter.first );
-				std::sort( oldKeys.begin(), oldKeys.end() );
-
-				std::vector<gamescope::VirtualConnectorKey_t> diffKeys;
-
-				std::set_symmetric_difference(oldKeys.begin(), oldKeys.end(),
-									newKeys.begin(), newKeys.end(),
-									std::back_inserter(diffKeys),
-									[](auto& a, auto& b) { return a < b; });
-
-				for ( gamescope::VirtualConnectorKey_t ulKey : diffKeys )	
-				{
-					bool bIsSteam = gamescope::VirtualConnectorKeyIsSteam( ulKey );
-					bool bIsBaseKey = ulKey == 0;
-
-					if ( gamescope::Algorithm::Contains( newKeys, ulKey ) )
-					{
-						g_VirtualConnectorFocuses[ulKey] = global_focus_t
-						{
-							.ulVirtualFocusKey = ulKey,
-							.pVirtualConnector = GetBackend()->UsesVirtualConnectors() ? GetBackend()->CreateVirtualConnector( ulKey ) : nullptr,
-						};
-					}
-					else if ( !bIsSteam && !bIsBaseKey ) // Never remove Steam's virtual connector or the 0th connector.
-					{
-						g_VirtualConnectorFocuses.erase( ulKey );
-					}
-				}
-			}
-
-			UpdateMangoappInstances();
-
-			for ( auto &iter : g_VirtualConnectorFocuses )
-			{
-				global_focus_t *pFocus = &iter.second;
-				if ( pFocus->IsDirty() )
-				{
-					determine_and_apply_focus( pFocus );
-					hasRepaint = true;
-				}
-			}
-		}
+		steamcompmgr_update_virtual_connector_focuses( eVirtualConnectorStrategy, keysToClose );
 
 		// If our DRM state is out-of-date, refresh it. This might update
 		// the output size.
@@ -10673,146 +11355,19 @@ steamcompmgr_main(int argc, char **argv)
 		g_uCompositeDebug = cv_composite_debug;
 
 		// Capability is advertised to clients regardless of the live "active"
-		// state below, so games can request HDR while the panel is idling in SDR.
+		// state in steamcompmgr_update_hdr_active, so games can request HDR while the panel is idling in SDR.
 		const bool bOutputHDRCapable = (g_bSupportsHDR_CachedValue || g_bForceHDR10OutputDebug) && cv_hdr_enabled;
 
-		{
-			gamescope::IBackendConnector *pConn = GetBackend()->GetCurrentConnector();
-			const bool bContentDriven = bOutputHDRCapable && !g_bForceHDR10OutputDebug &&
-				( cv_hdr_content_driven ||
-				  ( pConn && pConn->GetHDRInfo().bContentDrivenHDR ) );
+		steamcompmgr_update_hdr_active( bOutputHDRCapable );
 
-			bool bOutputHDRActive = bOutputHDRCapable;
-			if ( bContentDriven )
-			{
-				// Track any live window, not just the focused one, so browsing the
-				// Steam UI over a running HDR game does not bounce the panel through
-				// a modeset on every focus change.
-				bOutputHDRActive = false;
-				for ( steamcompmgr_win_t *pWin : GetGlobalPossibleFocusWindows() )
-				{
-					commit_t *pCommit = get_window_last_done_commit_peek( pWin );
-					if ( pCommit && ColorspaceIsHDR( pCommit->colorspace() ) )
-					{
-						bOutputHDRActive = true;
-						break;
-					}
-				}
-			}
-			if ( bOutputHDRActive != g_bOutputHDREnabled )
-				xwm_log.infof( "HDR output %s%s", bOutputHDRActive ? "enabled" : "disabled", bContentDriven ? " (hdr_content_driven)" : "" );
-			g_bOutputHDREnabled = bOutputHDRActive;
-		}
+		steamcompmgr_update_output_size( root_ctx, flush_root, bOutputHDRCapable );
 
-		// Pick our width/height for this potential frame, regardless of how it might change later
-		// At some point we might even add proper locking so we get real updates atomically instead
-		// of whatever jumble of races the below might cause over a couple of frames
-		if ( currentOutputWidth != g_nOutputWidth ||
-			 currentOutputHeight != g_nOutputHeight ||
-			 currentOutputRefresh != g_nOutputRefresh ||
-			 currentOutputRotation != g_uOutputRotation ||
-			 currentHDROutput != g_bOutputHDREnabled ||
-			 currentHDRCapable != bOutputHDRCapable ||
-			 currentHDRForce != g_bForceHDRSupportDebug )
-		{
-			if ( g_nXWaylandCount > 1 )
-			{
-				g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;
-				wlserver_lock();
-				// Update only Steam, the root ctx, with the new output size for now
-				wlserver_set_xwayland_server_mode( 0, g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
-				wlserver_unlock();
-			}
-
-			// XXX(JoshA): Remake this. It sucks.
-			if ( GetBackend()->UsesVulkanSwapchain() )
-			{
-				// No image only means "not this iteration": rendervulkan has
-				// already arranged the retry or requested shutdown.
-				vulkan_acquire_swapchain_image( true );
-			}
-			else
-			{
-				vulkan_remake_output_images();
-			}
-
-
-			{
-				gamescope_xwayland_server_t *server = NULL;
-				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				{
-					uint32_t hdr_value = ( bOutputHDRCapable || g_bForceHDRSupportDebug ) ? 1 : 0;
-					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)&hdr_value, 1 );
-
-					server->ctx->cursor->setDirty();
-
-					if (server->ctx.get() == root_ctx)
-					{
-						flush_root = true;
-					}
-					else
-					{
-						XFlush(server->ctx->dpy);
-					}
-				}
-			}
-
-			currentOutputWidth = g_nOutputWidth;
-			currentOutputHeight = g_nOutputHeight;
-			currentOutputRefresh = g_nOutputRefresh;
-			currentOutputRotation = g_uOutputRotation;
-			currentHDROutput = g_bOutputHDREnabled;
-			currentHDRCapable = bOutputHDRCapable;
-			currentHDRForce = g_bForceHDRSupportDebug;
-
-#if HAVE_PIPEWIRE
-			nudge_pipewire();
-#endif
-		}
-
-		// Framegen dormancy, after the remake above and before anything paints.
+		// Framegen dormancy, after steamcompmgr_update_output_size and before anything paints.
 		vulkan_framegen_update_dormancy();
 
-		if ( vblank )
-		{
-			int nRealRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-			g_SteamCompMgrAppRefreshCycle = gamescope::mHzToRefreshCycle( nRealRefreshmHz );
-			g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle;
-			if ( g_nSteamCompMgrTargetFPS )
-			{
-				int nRealRefreshHz = gamescope::ConvertmHzToHz( nRealRefreshmHz );
-				int nTargetFPS = g_nSteamCompMgrTargetFPS;
-				nTargetFPS = std::min<int>( nTargetFPS, nRealRefreshHz );
+		steamcompmgr_update_refresh_cycles( vblank );
 
-				if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
-				{
-					g_SteamCompMgrLimitedAppRefreshCycle = gamescope::mHzToRefreshCycle( gamescope::ConvertHztomHz( nTargetFPS ) );
-				}
-				else
-				{
-					int nVblankDivisor = nRealRefreshHz / nTargetFPS;
-
-					g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle * nVblankDivisor;
-				}
-			}
-		}
-
-		uint64_t ulNow = get_time_in_nanos();
-		const gamescope::VBlankScheduleTime &schedule = g_SteamCompMgrVBlankTime.schedule;
-		s_PredictedTearingPresentTime = gamescope::PredictFixedPresentTime( ulNow,
-			schedule.ulTargetVBlank, g_SteamCompMgrAppRefreshCycle );
-		// A fence wake lands in the armed pass until it runs, then misses that vblank's flip.
-		const std::optional<gamescope::VBlankScheduleTime> armed = bIsVBlankFromTimer ? std::nullopt : GetVBlankTimer().GetArmedSchedule();
-		const gamescope::VBlankScheduleTime &latch = armed ? *armed : schedule;
-		s_PredictedPresentTime = gamescope::PredictFixedLatchPresentTime( ulNow, latch.ulTargetVBlank,
-			latch.ulScheduledWakeupPoint, g_SteamCompMgrAppRefreshCycle, bIsVBlankFromTimer || armed );
-		// The armed schedule can carry a new refresh before this loop's cycles catch up.
-		s_PredictedRefreshGrid = bVRR ? 0 : latch.ulRefreshCycle ? latch.ulRefreshCycle : g_SteamCompMgrAppRefreshCycle;
-		if ( bVRR )
-			s_PredictedPresentTime = s_PredictedTearingPresentTime = gamescope::PredictPresentTime( ulNow,
-				GetVBlankTimer().VRRWakeupOffset(), GetVBlankTimer().GetLastVBlank(),
-				gamescope::mHzToRefreshCycle( GetVBlankTimer().GetRefresh() ) );
+		steamcompmgr_predict_present_time( bIsVBlankFromTimer, bVRR );
 
 		// Ask for a new surface every vblank
 		// When we observe a new commit being complete for a surface, we ask for a new frame.
@@ -10820,31 +11375,7 @@ steamcompmgr_main(int argc, char **argv)
 		// application can commit a new frame that completes before we ever displayed
 		// the current pending commit.
 		uint64_t &vblank_idx = s_ulVBlankIdx;
-		if ( vblank )
-		{
-			steamcompmgr_note_vblank_pass( g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank,
-				g_SteamCompMgrAppRefreshCycle );
-
-			{
-				uint64_t now = get_time_in_nanos();
-
-				steamcompmgr_update_vr_session_state();
-
-				gamescope_xwayland_server_t *server = NULL;
-				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				{
-					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
-					{
-						steamcompmgr_latch_frame_done( w, vblank_idx, now );
-					}
-				}
-
-				for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
-				{
-					steamcompmgr_latch_frame_done( xdg_win.get(), vblank_idx, now );
-				}
-			}
-		}
+		steamcompmgr_latch_vblank_frame_done( vblank, vblank_idx );
 
 		{
 			gamescope_xwayland_server_t *server = NULL;
@@ -10898,14 +11429,7 @@ steamcompmgr_main(int argc, char **argv)
 		// actually show a window if it wasn't visible, but we could! And that is the first
 		// opportunity it had. It's confusing but we need this for forward progress.
 
-		if ( vblank )
-		{
-			wlserver_lock();
-			gamescope_xwayland_server_t *server = NULL;
-			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				handle_presented_xwayland( server->ctx.get() );
-			wlserver_unlock();
-		}
+		steamcompmgr_send_presented( vblank );
 
 		//
 
@@ -10916,51 +11440,7 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 
-		{
-			GamescopeAppTextureColorspace current_app_colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
-			std::shared_ptr<gamescope::BackendBlob> app_hdr_metadata = nullptr;
-			global_focus_t *pCurrentFocus = GetCurrentFocus();
-			if ( pCurrentFocus && pCurrentFocus->HeldCommits[HELD_COMMIT_BASE] != nullptr )
-			{
-				current_app_colorspace = pCurrentFocus->HeldCommits[HELD_COMMIT_BASE]->colorspace();
-				if (pCurrentFocus->HeldCommits[HELD_COMMIT_BASE]->feedback)
-					app_hdr_metadata = pCurrentFocus->HeldCommits[HELD_COMMIT_BASE]->feedback->hdr_metadata_blob;
-			}
-
-			bool app_wants_hdr = ColorspaceIsHDR( current_app_colorspace );
-
-			if ( app_wants_hdr != g_bAppWantsHDRCached )
-			{
-				uint32_t app_wants_hdr_prop = app_wants_hdr ? 1 : 0;
-
-				XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppWantsHDRFeedback, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)&app_wants_hdr_prop, 1 );
-
-				g_bAppWantsHDRCached = app_wants_hdr;
-				flush_root = true;
-			}
-
-			if ( app_hdr_metadata != g_ColorMgmt.pending.appHDRMetadata )
-			{
-				if ( app_hdr_metadata )
-				{
-					std::vector<uint32_t> app_hdr_metadata_blob;
-					app_hdr_metadata_blob.resize((sizeof(hdr_metadata_infoframe) + (sizeof(uint32_t) - 1)) / sizeof(uint32_t));
-					memset(app_hdr_metadata_blob.data(), 0, sizeof(uint32_t) * app_hdr_metadata_blob.size());
-					memcpy(app_hdr_metadata_blob.data(), &app_hdr_metadata->View<hdr_output_metadata>().hdmi_metadata_type1, sizeof(hdr_metadata_infoframe));
-
-					XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppHDRMetadataFeedback, XA_CARDINAL, 32, PropModeReplace,
-							(unsigned char *)app_hdr_metadata_blob.data(), (int)app_hdr_metadata_blob.size() );
-				}
-				else
-				{
-					XDeleteProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppHDRMetadataFeedback);
-				}
-
-				g_ColorMgmt.pending.appHDRMetadata	 = app_hdr_metadata;
-				flush_root = true;
-			}
-		}
+		steamcompmgr_update_app_hdr_metadata( root_ctx, flush_root );
 
 		// Handles if we got a commit for the window we want to focus
 		// to switch to it for painting (outdatedInteractiveFocus)
@@ -11038,342 +11518,9 @@ steamcompmgr_main(int argc, char **argv)
 		{
 			global_focus_t *pPaintFocus = &iter.second;
 
-			const UpscaleSettings_t upscaleSettings = GetUpscaleSettings(
-				window_is_steam( pPaintFocus->focusWindow ),
-				g_wantedUpscaleFilter,
-				g_wantedUpscaleScaler,
-				g_upscaleFilterSharpness );
-			pPaintFocus->eUpscaleFilter = upscaleSettings.eFilter;
-			pPaintFocus->eUpscaleScaler = upscaleSettings.eScaler;
-			pPaintFocus->nUpscaleSharpness = upscaleSettings.nSharpness;
-
-			if ( vblank )
-			{
-				if ( pPaintFocus->cursor )
-					pPaintFocus->cursor->UpdatePosition();
-			}
-
-			if ( pPaintFocus->GetNestedHints() && !g_bForceRelativeMouse )
-			{
-				const bool bImageEmpty =
-					( pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty() ) &&
-					( !window_is_steam( pPaintFocus->inputFocusWindow ) );
-
-				const bool bHasPointerConstraint = pPaintFocus->cursor && pPaintFocus->cursor->IsConstrained();
-
-				uint32_t uAppId = pPaintFocus->inputFocusWindow
-					? pPaintFocus->inputFocusWindow->appID
-					: 0;
-
-				const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
-
-				const bool bRelativeMouseMode = bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
-
-				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
-			}
-
-			// HACK: Disable tearing if we have an overlay to avoid stutters right now
-			// TODO: Fix properly.
-			const bool bHasOverlay = ( pPaintFocus->overlayWindow && pPaintFocus->overlayWindow->opacity ) ||
-									( pPaintFocus->externalOverlayWindow && pPaintFocus->externalOverlayWindow->opacity ) ||
-									( pPaintFocus->overrideWindow  && pPaintFocus->focusWindow && !pPaintFocus->focusWindow->isSteamStreamingClient && pPaintFocus->overrideWindow->opacity );
-
-			// If we are running behind, allow tearing.
-
-			// Only the first focus painted on a vblank takes a forced sync flip;
-			// the request stays pending until that live paint retires it.
-			const bool bForcedPaint = std::exchange( bForceRepaint, false );
-			const bool bForceSyncFlip = bForcedPaint || is_fading_out( pPaintFocus );
-
-			// If we are compositing, always force sync flips because we currently wait
-			// for composition to finish before submitting.
-			// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
-			const bool bSurfaceWantsAsync = (pPaintFocus->HeldCommits[HELD_COMMIT_BASE] != nullptr && pPaintFocus->HeldCommits[HELD_COMMIT_BASE]->async);
-			// Generated frames must land on vblanks; tearing real frames around
-			// them would misplace both. Framegen and tearing are exclusive.
-			const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync
-				&& !vulkan_framegen_is_enabled();
-
-			enum class FlipType
-			{
-				Normal,
-				Async,
-				VRR,
-			};
-
-			FlipType eFlipType = FlipType::Normal;
-
-			if ( bForceSyncFlip )
-				eFlipType = FlipType::Normal;
-			else if ( bVRR )
-				eFlipType = FlipType::VRR;
-			else if ( bTearing )
-			{
-				eFlipType = FlipType::Async;
-
-				if ( nIgnoredOverlayRepaints )
-					eFlipType = FlipType::Normal;
-				if ( bHasOverlay ) // Don't tear if the Steam or perf overlay is up atm.
-					eFlipType = FlipType::Normal;
-				if ( GetVBlankTimer().WasCompositing() )
-					eFlipType = FlipType::Normal;
-			}
-			else
-				eFlipType = FlipType::Normal;
-
-			bool bShouldPaint = false;
-
-			// Framegen: true when this pass paints because a GENERATED frame is
-			// being committed, rather than because real content changed. Only the
-			// framegen arbiter below can set it, so with framegen disabled (or with
-			// nothing pending) it stays false and this pass behaves exactly as before.
-			bool bFramegenGeneratedPaint = false;
-
-			//if ( GetBackend()->IsVisible() )
-			if ( true )
-			{
-				switch ( eFlipType )
-				{
-					case FlipType::Normal:
-					{
-						bShouldPaint = vblank && ( hasRepaint || bOverlayRepaint || bForceSyncFlip );
-						break;
-					}
-
-					case FlipType::Async:
-					{
-						bShouldPaint = hasRepaint;
-
-						if ( vblank && !bShouldPaint && bOverlayRepaint )
-							nIgnoredOverlayRepaints++;
-
-						break;
-					}
-
-					case FlipType::VRR:
-					{
-						bShouldPaint = hasRepaint && bVRRCanFlip;
-
-						if ( bIsVBlankFromTimer )
-						{
-							if ( bOverlayRepaint )
-							{
-								if ( vulkan_framegen_has_pending_generated_frame()
-									|| nIgnoredOverlayRepaints >= cv_adaptive_sync_overlay_cycles
-									|| repaintPlan.exhausted )
-								{
-									// Pending generation uses the shared age guard below;
-									// the overlay-repaint throttle must not add another waiting period.
-									bShouldPaint = true;
-								}
-								else if ( !bShouldPaint )
-								{
-									// If we hit vblank (ie. fastest refresh cycle since last commit),
-									// and we aren't painting and we have a pending overlay, then:
-									// defer it until the next game update or next true vblank.
-									if ( !cv_adaptive_sync_ignore_overlay )
-										nIgnoredOverlayRepaints++;
-								}
-							}
-						}
-
-						// If we have a pending page flip and doing VRR, lets not do another...
-						if ( GetBackend()->GetCurrentConnector() &&
-							 GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0 )
-							bShouldPaint = false;
-
-						break;
-					}
-				}
-			}
-			else
-			{
-				bShouldPaint = false;
-			}
-
-			// State processed above can invalidate or replace the queue after the
-			// loop-entry cleanup check, so arbitrate only on a fresh deadline.
-			ulFixedCommitDeadlineNs = !bVrrHybridActive
-				? vulkan_framegen_fixed_refresh_commit_deadline_ns() : 0u;
-			if ( vulkan_framegen_has_pending_generated_frame() )
-			{
-				// Real frames always take priority over generated ones: the
-				// backends present a pending generated frame ahead of anything
-				// else, so if new real content has been latched — a game frame
-				// or an overlay/notification update — drop the stale prediction
-				// rather than letting it displace that content and add a vblank
-				// of latency. Generated frames only fill vblanks the game left
-				// empty.
-				// A nonzero native fixed-refresh deadline gets its own arbiter.
-				// A zero deadline takes the vblank arbiter in the else branch
-				// without evaluating any fixed-refresh timer, in-flight or retry
-				// condition.
-				if ( ulFixedCommitDeadlineNs != 0u )
-				{
-					if ( hasRepaint )
-					{
-						// Test this before all generated-commit state: queued real
-						// work has absolute priority and reaches the normal paint path.
-						g_bFramegenCommitDeadline = false;
-						vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
-					}
-					else
-					{
-						// Drop a stale carry-over fire. The genuinely armed timer
-						// will re-set the flag at its current target.
-						if ( g_ulFramegenCommitDeadlineNs != ulFixedCommitDeadlineNs )
-							g_bFramegenCommitDeadline = false;
-						else if ( g_bFramegenCommitDeadline
-							&& get_time_in_nanos() < ulFixedCommitDeadlineNs )
-							g_bFramegenCommitDeadline = false;
-						// A generated commit must not overtake the preceding real
-						// present. Its flip-completion nudge re-enters this arbiter.
-						const bool bPresentInFlight =
-							GetBackend()->GetCurrentConnector()
-							&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
-						if ( gamescope::framegen::can_start_early_generated_commit(
-								g_bFramegenCommitDeadline, false,
-								bPresentInFlight )
-							&& vulkan_framegen_generated_frame_due()
-							// Real-arrival cutoff: if the learned cadence puts
-							// the next real client frame inside the commit-lead
-							// window, don't reserve KMS state ahead of it — the
-							// normal vblank path presents it without the extra
-							// vblank of latency.
-							&& !vulkan_framegen_real_arrival_blocks_early_commit() )
-						{
-							g_bFramegenCommitDeadline = false;
-							const bool bReady = vulkan_framegen_generated_frame_ready();
-							if ( bReady && repaintPlan.generatedMayTakeSlot )
-							{
-								bShouldPaint = true;
-								bFramegenGeneratedPaint = true;
-								g_bFramegenEarlyGeneratedInFlight = true;
-							}
-							else
-								vulkan_framegen_discard_generated_frame( bReady ? "superseded_by_repaint" : "generation_too_slow" );
-						}
-					}
-				}
-				else
-				{
-					// VRR/vblank timing stays independent of the fixed-refresh
-					// deadline. Both paths share the repaint guard below.
-					const bool bHybridInFlight = bVrrHybridActive
-						&& GetBackend()->GetCurrentConnector()
-						&& GetBackend()->GetCurrentConnector()->PresentationFeedback().CurrentPresentsInFlight() != 0;
-					if ( bVrrHybridActive && g_bFramegenCommitDeadline && get_time_in_nanos() < g_ulFramegenCommitDeadlineNs )
-						g_bFramegenCommitDeadline = false;
-					if ( hasRepaint )
-					{
-						if ( !bBidirActive )
-							vulkan_framegen_discard_generated_frame( "superseded_by_real_frame" );
-						if ( bVrrHybridActive )
-						{
-							g_bFramegenCommitDeadline = false;
-							g_FramegenCommitTimer.DisarmTimer();
-							vulkan_framegen_cancel_vrr_hybrid_slot(
-								"superseded_by_real_frame" );
-						}
-					}
-					else if ( ( bVrrHybridActive ? g_bFramegenCommitDeadline : vblank )
-						&& !bHybridInFlight
-						&& vulkan_framegen_generated_frame_due() )
-					{
-						if ( bVrrHybridActive )
-							g_bFramegenCommitDeadline = false;
-						const bool bReady = vulkan_framegen_generated_frame_ready();
-						if ( bReady && repaintPlan.generatedMayTakeSlot )
-						{
-							bShouldPaint = true;
-							bFramegenGeneratedPaint = true;
-						}
-						else
-							vulkan_framegen_discard_generated_frame( bReady ? "superseded_by_repaint" : "generation_too_slow" );
-					}
-				}
-			}
-			else
-			{
-				// Nothing pending (discarded or invalidated since the timer was
-				// armed) — a stale mid-interval deadline has nothing to show.
-				g_bFramegenCommitDeadline = false;
-			}
-
-			// A paint that the arbiter did not select must not consume a causal
-			// prediction outside its slot. Apply this to fixed-refresh, vblank
-			// and VRR paths alike; bidir owns a separate ordered timeline.
-			if ( bShouldPaint && !hasRepaint && !bFramegenGeneratedPaint
-				&& vulkan_framegen_has_pending_generated_frame() )
-			{
-				switch ( repaintIteration.take_unselected_paint( repaintPlan ) )
-				{
-					case gamescope::framegen::UnselectedPaint_t::Yield:
-						bShouldPaint = false;
-						break;
-					case gamescope::framegen::UnselectedPaint_t::DiscardPrediction:
-						vulkan_framegen_discard_generated_frame( "superseded_by_repaint" );
-						break;
-					case gamescope::framegen::UnselectedPaint_t::Paint:
-						break;
-				}
-			}
-
-			static uint64_t s_uFramegenVblankDebugLogCounter = 0;
-			if ( vblank && vulkan_framegen_is_enabled() && FramegenDebugShouldLog( s_uFramegenVblankDebugLogCounter ) )
-			{
-				// Classify what this vblank slot will show: a real frame, a
-				// generated frame, or (nothing presented) a hardware repeat of
-				// the previous scanout buffer.
-				const char *pszSlotType = !bShouldPaint
-					? "repeat"
-					: ( vulkan_framegen_has_pending_generated_frame() ? "generated" : "real" );
-				// Attribute a repeat taken while the queue still held content:
-				// which arbiter condition declined it, and whether the front's
-				// own display target was still in the future at this vblank.
-				double flFrontTargetDeltaMs = 0.0;
-				const size_t uPending = vulkan_framegen_pending_queue_debug( &flFrontTargetDeltaMs );
-				xwm_log.infof( "framegen: vblank slot=%s pending=%zu due=%d ready=%d hasRepaint=%d overlayOnly=%d front_target_delta_ms=%.3f",
-					pszSlotType, uPending, (int)vulkan_framegen_generated_frame_due(),
-					(int)vulkan_framegen_generated_frame_ready(), (int)hasRepaint,
-					(int)hasRepaintNonBasePlane, flFrontTargetDeltaMs );
-			}
-
-			// Absolute-deadline causal pacing: this vblank is going to a
-			// hardware repeat while framegen is active — no real content and
-			// nothing pending (a stall, a too-slow discard, or a mispredicted
-			// keep-up). Ask the causal planner for the earliest slot that can still be
-			// prepared. A GPU overrun or the bounded forward-prediction cap may
-			// still require more than one honest repeat. The planner does nothing
-			// outside fixed-refresh causal pacing (VRR hybrid and bidir pace
-			// themselves).
-			if ( vblank && !bShouldPaint && vulkan_framegen_is_enabled() )
-				vulkan_framegen_causal_tick();
-
-			if ( bShouldPaint )
-			{
-				// Framegen cursor freshness: a generated-frame commit is triggered
-				// by the commit-deadline timer (fixed-refresh) or the mid-interval
-				// hybrid timer, not by the vblank, so the cursor position latched
-				// by the vblank-gated UpdatePosition() above can be up to a whole
-				// refresh interval old by the time this layer stack is assembled.
-				// Re-sample it here so the stack paint_all builds — which the
-				// backend late-composites onto the generated frame in base-layer
-				// mode — carries the cursor where it actually is at commit time.
-				// This only re-reads wlserver's latest pointer position; it does
-				// not paint, wake, or re-time anything, so pacing and the
-				// scheduler's decisions are untouched.
-				if ( bFramegenGeneratedPaint && pPaintFocus->cursor )
-					pPaintFocus->cursor->UpdatePosition();
-
-				// Sample the base-layer latch before painting: it can change inside
-				// the paint. Under bidir the flip substitution reports what it showed.
-				const bool bBaseLayer = vulkan_framegen_base_layer_active();
-				const auto eOutcome = paint_all( pPaintFocus, eFlipType == FlipType::Async );
-				const gamescope::framegen::PaintReport_t report = vulkan_framegen_bidir_take_paint_report();
-				repaintIteration.add_paint( gamescope::framegen::classify_paint_output( bFramegenGeneratedPaint,
-					bBaseLayer, bBidirActive, report.verdict ), eOutcome, bForcedPaint, report );
-			}
+			steamcompmgr_paint_virtual_connector( pPaintFocus, vblank, bVRR, bVRRCanFlip, bIsVBlankFromTimer,
+				bVrrHybridActive, ulFixedCommitDeadlineNs, bBidirActive, repaintPlan, repaintIteration,
+				bOverlayRepaint, bForceRepaint, nIgnoredOverlayRepaints );
 		}
 
 		if ( vblank && g_bUpdateForwardedVROverlays )
@@ -11406,70 +11553,7 @@ steamcompmgr_main(int argc, char **argv)
 		relay_mangoapp_control();
 		vulkan_framegen_train_idle();
 
-		// The VRR timer path is independent of the fixed-refresh deadline: a
-		// zero fixed deadline never reaches clock sampling, timer arming or the
-		// passed-deadline retry below.
-		if ( bVrrHybridActive )
-		{
-			uint64_t ulWakeDeadlineNs =
-				vulkan_framegen_vrr_hybrid_wake_deadline_ns();
-			if ( ulWakeDeadlineNs != 0u && !g_bFramegenCommitDeadline
-				&& get_time_in_nanos() >= ulWakeDeadlineNs )
-			{
-				vulkan_framegen_cancel_vrr_hybrid_slot(
-					"late_wake_arm" );
-				ulWakeDeadlineNs = 0u;
-			}
-			if ( ulWakeDeadlineNs != 0u
-				&& ulWakeDeadlineNs != g_ulFramegenCommitDeadlineNs )
-			{
-				g_bFramegenCommitDeadline = false;
-				g_ulFramegenCommitDeadlineNs = ulWakeDeadlineNs;
-				g_FramegenCommitTimer.ArmTimer( ulWakeDeadlineNs );
-			}
-			else if ( ulWakeDeadlineNs == 0u )
-				framegen_drop_commit_deadline();
-		}
-		else
-		{
-			// Work above may consume, replace, or create the native causal slot.
-			// Re-read it only after real work has had absolute priority.
-			ulFixedCommitDeadlineNs =
-				vulkan_framegen_fixed_refresh_commit_deadline_ns();
-			if ( ulFixedCommitDeadlineNs != 0u )
-			{
-				const uint64_t ulCommitArmNowNs = get_time_in_nanos();
-				if ( ulCommitArmNowNs >= ulFixedCommitDeadlineNs )
-				{
-					// A fixed-grid slot can be created only after the preceding
-					// real commit returns. Re-enter once after that real work; if
-					// its flip is still in flight, flip completion is the only
-					// subsequent retry wake.
-					if ( g_ulFramegenCommitDeadlineNs != ulFixedCommitDeadlineNs )
-						g_bFramegenCommitDeadline = false;
-					if ( !g_bFramegenCommitDeadline )
-					{
-						g_ulFramegenCommitDeadlineNs = ulFixedCommitDeadlineNs;
-						g_FramegenCommitTimer.DisarmTimer();
-						g_bFramegenCommitDeadline = true;
-						g_SteamCompMgrWaiter.Nudge();
-					}
-				}
-				else if ( ulFixedCommitDeadlineNs != g_ulFramegenCommitDeadlineNs )
-				{
-					g_bFramegenCommitDeadline = false;
-					g_ulFramegenCommitDeadlineNs = ulFixedCommitDeadlineNs;
-					g_FramegenCommitTimer.ArmTimer( ulFixedCommitDeadlineNs );
-				}
-			}
-			else if ( g_ulFramegenCommitDeadlineNs != 0u )
-			{
-				// A deadline owned earlier in this iteration was superseded by
-				// real work. Cancel it after the real commit, never before it.
-				g_bFramegenCommitDeadline = false;
-				framegen_drop_commit_deadline();
-			}
-		}
+		steamcompmgr_update_framegen_commit_timer( bVrrHybridActive, ulFixedCommitDeadlineNs );
 
 		if ( bIsVBlankFromTimer )
 		{
