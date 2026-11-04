@@ -92,6 +92,7 @@ struct PresentedSwapchain {
   VkFence fence;
 };
 std::vector<PresentedSwapchain> presented;
+std::vector<std::vector<VkPresentModeKHR>> driverPresentModes;
 uint32_t failPresent = 0;
 uint32_t presentCalls = 0;
 
@@ -102,9 +103,12 @@ VkResult VKAPI_CALL present(VkQueue, const VkPresentInfoKHR *info) {
   if (auto *boundary = vkroots::FindInChain<VkFrameBoundaryEXT>(info))
     refused.boundaries.push_back(boundary->flags);
   auto *ids = vkroots::FindInChain<VkPresentId2KHR>(info);
+  auto *ids1 = vkroots::FindInChain<VkPresentIdKHR>(info);
   auto *timings = vkroots::FindInChain<VkPresentTimingsInfoEXT>(info);
   auto *fences = vkroots::FindInChain<VkSwapchainPresentFenceInfoEXT>(info);
+  driverPresentModes.emplace_back();
   if (auto *modes = vkroots::FindInChain<VkSwapchainPresentModeInfoEXT>(info)) {
+    driverPresentModes.back().assign(modes->pPresentModes, modes->pPresentModes + modes->swapchainCount);
     REQUIRE(modes->swapchainCount == info->swapchainCount);
     REQUIRE(modes->swapchainCount > 0);
     for (uint32_t i = 0; i < modes->swapchainCount; i++)
@@ -114,7 +118,7 @@ VkResult VKAPI_CALL present(VkQueue, const VkPresentInfoKHR *info) {
     refused.waits.push_back(info->pWaitSemaphores[i]);
   for (uint32_t i = 0; i < info->swapchainCount; i++) {
     const auto *timing = timings && timings->pTimingInfos ? &timings->pTimingInfos[i] : nullptr;
-    presented.push_back({info->pSwapchains[i], info->pImageIndices[i], ids ? ids->pPresentIds[i] : 0,
+    presented.push_back({info->pSwapchains[i], info->pImageIndices[i], ids ? ids->pPresentIds[i] : ids1 ? ids1->pPresentIds[i] : 0,
       timing ? timing->targetTime : 0, timing ? timing->presentStageQueries : 0,
       fences ? fences->pFences[i] : VK_NULL_HANDLE});
     if (info->pResults)
@@ -1304,6 +1308,7 @@ struct PresentBatch {
   explicit PresentBatch(bool foreign = false) {
     refused = {};
     presented.clear();
+    driverPresentModes.clear();
     presentCalls = failPresent = 0;
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     display = wl_display_connect_to_fd(sockets[0]);
@@ -1342,6 +1347,32 @@ struct PresentBatch {
     wl_event_queue_destroy(globalsQueue);
     wl_display_disconnect(display);
     close(sockets[1]);
+  }
+
+  // Observe the requests on the existing fake compositor socket, without a server thread.
+  std::vector<uint32_t> wire;
+  std::vector<std::vector<uint32_t>> requests(size_t index, uint32_t opcode) {
+    REQUIRE(wl_display_flush(display) >= 0);
+    std::array<uint32_t, 1024> buffer;
+    ssize_t bytes;
+    while ((bytes = recv(sockets[1], buffer.data(), sizeof(buffer), MSG_DONTWAIT)) > 0) {
+      REQUIRE(bytes % sizeof(uint32_t) == 0);
+      wire.insert(wire.end(), buffer.begin(), buffer.begin() + bytes / sizeof(uint32_t));
+    }
+    REQUIRE(bytes == -1);
+    REQUIRE(errno == EAGAIN);
+    std::vector<std::vector<uint32_t>> found;
+    for (size_t offset = 0; offset < wire.size();) {
+      REQUIRE(offset + 2 <= wire.size());
+      const size_t words = (wire[offset + 1] >> 16) / sizeof(uint32_t);
+      REQUIRE(words >= 2);
+      REQUIRE(offset + words <= wire.size());
+      if (wire[offset] == wl_proxy_get_id(reinterpret_cast<wl_proxy *>(states[index]->object)) &&
+          (wire[offset + 1] & 0xffff) == opcode)
+        found.emplace_back(wire.begin() + offset + 2, wire.begin() + offset + words);
+      offset += words;
+    }
+    return found;
   }
 
   VkResult run() { return GamescopeWSILayer::VkDeviceOverrides::QueuePresentKHR(queue, VK_NULL_HANDLE, &info); }
@@ -1483,6 +1514,227 @@ TEST_CASE("Healthy hooked batches keep the single driver present", "[present_tim
   CHECK(refused.submits == 0);
   CHECK(refused.idles == 0);
   CHECK(presented.size() == 2);
+}
+
+TEST_CASE("Driver present failures preserve errors before limiter updates", "[present_timing_layer][present_batch]") {
+  const bool limiterMismatch = GENERATE(false, true);
+  PresentBatch batch;
+  failPresent = 1;
+  batch.results = {VK_ERROR_OUT_OF_DATE_KHR, limiterMismatch ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR};
+  if (limiterMismatch) {
+    GamescopeWSILayer::gamescopeSurfaces.find(batch.surfaces[0])->flags = GamescopeLayerClient::Flag::FrameLimiterAware;
+    for (auto *state : batch.states)
+      state->forceFifo = true;
+  }
+  REQUIRE(batch.run() == VK_ERROR_OUT_OF_HOST_MEMORY);
+  REQUIRE(batch.results == std::array<VkResult, 2>{VK_ERROR_OUT_OF_DATE_KHR,
+    limiterMismatch ? VK_ERROR_OUT_OF_DATE_KHR : VK_ERROR_SURFACE_LOST_KHR});
+  REQUIRE(presentCalls == 1);
+  REQUIRE(presented.empty());
+  REQUIRE(refused.submits == 0);
+  REQUIRE(refused.idles == 0);
+  REQUIRE(refused.released.empty());
+  REQUIRE(refused.waits.empty());
+  REQUIRE(refused.fences.empty());
+  REQUIRE(refused.boundaries.empty());
+  for (size_t i = 0; i < batch.states.size(); i++) {
+    REQUIRE(batch.states[i]->timingQueue.hasSlot());
+    TimingRecord record;
+    REQUIRE(record.query(*batch.states[i]) == VK_SUCCESS);
+    const bool completed = !limiterMismatch || i == 0;
+    REQUIRE(record.properties.presentationTimingCount == (completed ? 1u : 0u));
+    REQUIRE(record.timing.presentId == (completed ? batch.ids[i] : 0));
+    REQUIRE(record.timing.targetTime == (completed ? batch.timings[i].targetTime : 0));
+    REQUIRE(record.timing.presentStageCount == 1);
+    REQUIRE(record.timing.reportComplete == (completed ? VK_TRUE : VK_FALSE));
+  }
+}
+
+TEST_CASE("A limiter mismatch only invalidates the affected swapchain", "[present_timing_layer][present_batch]") {
+  PresentBatch batch;
+  for (auto surface : batch.surfaces)
+    GamescopeWSILayer::gamescopeSurfaces.find(surface)->flags = GamescopeLayerClient::Flag::FrameLimiterAware;
+  batch.states[1]->forceFifo = true;
+  REQUIRE(batch.run() == VK_ERROR_OUT_OF_DATE_KHR);
+  REQUIRE(batch.results == std::array<VkResult, 2>{VK_SUCCESS, VK_ERROR_OUT_OF_DATE_KHR});
+  REQUIRE(presentCalls == 1);
+  REQUIRE(presented.size() == 2);
+  REQUIRE(refused.submits == 0);
+  REQUIRE(refused.idles == 0);
+  REQUIRE(refused.released.empty());
+  REQUIRE(refused.waits == std::vector<VkSemaphore>{batch.semaphore});
+  REQUIRE(refused.fences.empty());
+  REQUIRE(refused.boundaries.empty());
+  for (size_t i = 0; i < batch.states.size(); i++) {
+    REQUIRE(presented[i].swapchain == batch.swapchains[i]);
+    REQUIRE(presented[i].image == batch.images[i]);
+    REQUIRE(presented[i].id == batch.ids[i]);
+    REQUIRE(presented[i].target == 0);
+    REQUIRE(presented[i].stages == 0);
+    REQUIRE(presented[i].fence == batch.fences[i]);
+    REQUIRE(batch.states[i]->timingQueue.hasSlot());
+    TimingRecord record;
+    REQUIRE(record.query(*batch.states[i]) == VK_SUCCESS);
+    REQUIRE(record.properties.presentationTimingCount == 0);
+    REQUIRE(record.timing.reportComplete == VK_FALSE);
+  }
+}
+
+TEST_CASE("Gaining bypass reports suboptimal after completing the unbypassed timing", "[present_timing_layer][present_batch]") {
+  PresentBatch batch;
+  batch.states[1]->isBypassingXWayland = false;
+  REQUIRE(batch.run() == VK_SUBOPTIMAL_KHR);
+  REQUIRE(batch.results == std::array<VkResult, 2>{VK_SUCCESS, VK_SUBOPTIMAL_KHR});
+  REQUIRE(presentCalls == 1);
+  REQUIRE(presented.size() == 2);
+  REQUIRE(refused.submits == 0);
+  REQUIRE(refused.idles == 0);
+  REQUIRE(refused.released.empty());
+  REQUIRE(refused.waits == std::vector<VkSemaphore>{batch.semaphore});
+  REQUIRE(refused.fences.empty());
+  REQUIRE(refused.boundaries.empty());
+  for (size_t i = 0; i < batch.states.size(); i++) {
+    REQUIRE(presented[i].swapchain == batch.swapchains[i]);
+    REQUIRE(presented[i].image == batch.images[i]);
+    REQUIRE(presented[i].id == batch.ids[i]);
+    REQUIRE(presented[i].target == 0);
+    REQUIRE(presented[i].stages == 0);
+    REQUIRE(presented[i].fence == batch.fences[i]);
+    REQUIRE(batch.states[i]->timingQueue.hasSlot());
+    TimingRecord record;
+    REQUIRE(record.query(*batch.states[i]) == VK_SUCCESS);
+    REQUIRE(record.properties.presentationTimingCount == i);
+    REQUIRE(record.timing.presentId == (i == 1 ? batch.ids[i] : 0));
+    REQUIRE(record.timing.targetTime == (i == 1 ? batch.timings[i].targetTime : 0));
+    REQUIRE(record.timing.presentStageCount == 1);
+    REQUIRE(record.timing.reportComplete == (i == 1 ? VK_TRUE : VK_FALSE));
+  }
+}
+
+TEST_CASE("Hooked presents accept absent results and legacy timing chains", "[present_timing_layer][present_batch]") {
+  PresentBatch batch;
+  VkPresentIdKHR id1{VK_STRUCTURE_TYPE_PRESENT_ID_KHR, &batch.timingInfo, 2, batch.ids.data()};
+  std::array<VkPresentTimeGOOGLE, 2> times{{{11, 123456789012ull}, {12, 987654321098ull}}};
+  VkPresentTimesInfoGOOGLE google{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, nullptr, 2, times.data()};
+  bool legacyId = false, googleTimes = false, relative = false;
+  SECTION("no caller results") {
+    batch.info.pResults = nullptr;
+  }
+  SECTION("GOOGLE times with EXT timing disabled") {
+    for (auto *state : batch.states)
+      state->presentTimingEnabled = false;
+    batch.timingInfo.pNext = &google;
+    googleTimes = true;
+  }
+  SECTION("present ID v1") {
+    batch.fenceInfo.pNext = &id1;
+    legacyId = true;
+  }
+  SECTION("no timing chain") {
+    batch.idInfo.pNext = nullptr;
+  }
+  SECTION("relative target without stage queries") {
+    relative = true;
+    batch.timings[0].flags = VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT;
+    batch.timings[0].presentStageQueries = 0;
+  }
+  // Exercise both halves of the 64-bit target on the wire. Keep zero for the
+  // relative case: the flag alone must arm a request, even without stage queries.
+  if (legacyId)
+    batch.timings[1].targetTime = 0x123456789abcdef0ull;
+  auto *callerResults = batch.info.pResults;
+  REQUIRE(batch.run() == VK_SUCCESS);
+  REQUIRE(batch.info.pResults == callerResults);
+  for (size_t i = 0; i < batch.states.size(); i++) {
+    const auto googleRequests = batch.requests(i, GAMESCOPE_SWAPCHAIN_SET_PRESENT_TIME);
+    if (googleTimes)
+      REQUIRE(googleRequests == std::vector<std::vector<uint32_t>>{{times[i].presentID,
+        uint32_t(times[i].desiredPresentTime >> 32), uint32_t(times[i].desiredPresentTime)}});
+    else
+      REQUIRE(googleRequests.empty());
+    const auto timingRequests = batch.requests(i, GAMESCOPE_SWAPCHAIN_SET_PRESENT_TIMING);
+    if (relative || legacyId) {
+      REQUIRE(timingRequests == std::vector<std::vector<uint32_t>>{{0, 1,
+        uint32_t(batch.timings[i].targetTime >> 32), uint32_t(batch.timings[i].targetTime), batch.timings[i].flags}});
+      if (legacyId) {
+        batch.states[i]->timingQueue.complete(1, 10, 20, 30);
+        TimingRecord record;
+        REQUIRE(record.query(*batch.states[i]) == VK_SUCCESS);
+        REQUIRE(record.properties.presentationTimingCount == 1);
+        REQUIRE(record.timing.presentId == batch.ids[i]);
+        REQUIRE(record.timing.targetTime == batch.timings[i].targetTime);
+      }
+    } else if (googleTimes) {
+      REQUIRE(timingRequests.empty());
+    }
+  }
+  REQUIRE(batch.results == std::array<VkResult, 2>{VK_SUCCESS, VK_SUCCESS});
+  REQUIRE(presentCalls == 1);
+  REQUIRE(presented.size() == 2);
+  for (size_t i = 0; i < batch.states.size(); i++) {
+    REQUIRE(presented[i].id == batch.ids[i]);
+    REQUIRE(presented[i].target == 0);
+    REQUIRE(presented[i].stages == 0);
+    TimingRecord record;
+    REQUIRE(record.query(*batch.states[i]) == VK_SUCCESS);
+    REQUIRE(record.properties.presentationTimingCount == 0);
+  }
+}
+
+TEST_CASE("Present modes preserve the caller chain with and without maintenance", "[present_timing_layer][present_batch]") {
+  const bool maintenance = GENERATE(false, true);
+  const bool explicitModes = GENERATE(false, true);
+  PresentBatch batch;
+  for (auto *state : batch.states)
+    state->hasSwapchainMaintenance1 = maintenance;
+  std::array<VkPresentModeKHR, 2> modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
+  VkSwapchainPresentModeInfoEXT modeInfo{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT, nullptr, 2, modes.data()};
+  if (explicitModes)
+    batch.timingInfo.pNext = &modeInfo;
+  REQUIRE(batch.run() == VK_SUCCESS);
+  REQUIRE(batch.results == std::array<VkResult, 2>{VK_SUCCESS, VK_SUCCESS});
+  REQUIRE(batch.info.pNext == &batch.fenceInfo);
+  REQUIRE(batch.fenceInfo.pNext == &batch.idInfo);
+  REQUIRE(batch.idInfo.pNext == &batch.timingInfo);
+  REQUIRE(batch.timingInfo.pNext == (explicitModes ? &modeInfo : nullptr));
+  REQUIRE(modeInfo.pNext == nullptr);
+  REQUIRE(modeInfo.pPresentModes == modes.data());
+  REQUIRE(modes == std::array<VkPresentModeKHR, 2>{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR});
+  REQUIRE(driverPresentModes == std::vector<std::vector<VkPresentModeKHR>>{
+    maintenance ? std::vector<VkPresentModeKHR>{VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_MAILBOX_KHR}
+                : std::vector<VkPresentModeKHR>{}});
+  for (size_t i = 0; i < batch.states.size(); i++)
+    REQUIRE(batch.requests(i, GAMESCOPE_SWAPCHAIN_SET_PRESENT_MODE) ==
+      std::vector<std::vector<uint32_t>>{{uint32_t(explicitModes ? modes[i] : VK_PRESENT_MODE_FIFO_KHR)}});
+}
+
+TEST_CASE("A single full timing queue refuses before presenting", "[present_timing_layer][present_batch]") {
+  PresentBatch batch;
+  batch.info.swapchainCount = 1;
+  batch.fenceInfo.swapchainCount = 1;
+  batch.idInfo.swapchainCount = 1;
+  batch.timingInfo.swapchainCount = 1;
+  REQUIRE(batch.states[0]->timingQueue.setSize(0) == VK_SUCCESS);
+  REQUIRE(batch.run() == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT);
+  REQUIRE(batch.results == std::array<VkResult, 2>{VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT, VK_SUCCESS});
+  REQUIRE(presentCalls == 0);
+  REQUIRE(presented.empty());
+  REQUIRE(refused.submits == 1);
+  REQUIRE(refused.idles == 0);
+  REQUIRE(refused.released.empty());
+  REQUIRE(refused.waits == std::vector<VkSemaphore>{batch.semaphore});
+  REQUIRE(refused.fences == std::vector<VkFence>{batch.fences[0]});
+  REQUIRE(refused.boundaries.empty());
+  for (size_t i = 0; i < batch.states.size(); i++) {
+    REQUIRE(batch.states[i]->timingQueue.hasSlot() == (i != 0));
+    TimingRecord record;
+    REQUIRE(record.query(*batch.states[i]) == VK_SUCCESS);
+    REQUIRE(record.properties.presentationTimingCount == 0);
+    REQUIRE(record.timing.presentId == 0);
+    REQUIRE(record.timing.targetTime == 0);
+    REQUIRE(record.timing.presentStageCount == 1);
+    REQUIRE(record.timing.reportComplete == VK_FALSE);
+  }
 }
 
 TEST_CASE("A failed extra fence submit cannot return OOM after the first succeeds", "[present_timing_layer][present_batch]") {
