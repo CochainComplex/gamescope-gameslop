@@ -904,7 +904,6 @@ ReshadeEffectPipeline::~ReshadeEffectPipeline()
 
     for (uint32_t i = 0; i < GAMESCOPE_RESHADE_DESCRIPTOR_SET_COUNT; i++)
     {
-        m_device->vk.FreeDescriptorSets(m_device->device(), m_descriptorPool, 1, &m_descriptorSets[i]);
         m_device->vk.DestroyDescriptorSetLayout(m_device->device(), m_descriptorSetLayouts[i], nullptr);
     }
 
@@ -952,7 +951,7 @@ static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey 
         }
 
         if (const auto source = std::ranges::find_if(tex.annotations , std::bind_front(std::equal_to{}, "source"), &reshadefx::annotation::name);
-            source != tex.annotations.end())
+            texture && source != tex.annotations.end())
         {
             std::string filePath = local_reshade_path + "/Textures/" + source->value.string_data;
 
@@ -967,6 +966,14 @@ static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey 
 
             if (data)
             {
+                VkBuffer scratchBuffer = VK_NULL_HANDLE;
+                VkDeviceMemory scratchMemory = VK_NULL_HANDLE;
+                auto releaseScratch = [&]() {
+                    free(data);
+                    device->vk.DestroyBuffer(device->device(), scratchBuffer, nullptr);
+                    device->vk.FreeMemory(device->device(), scratchMemory, nullptr);
+                };
+
                 uint8_t *pixels = data;
 
                 std::vector<uint8_t> resized_data;
@@ -988,11 +995,13 @@ static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey 
                     .size  = size,
                     .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 };
-                VkBuffer scratchBuffer = VK_NULL_HANDLE;
                 VkResult result = device->vk.CreateBuffer(device->device(), &bufferCreateInfo, nullptr, &scratchBuffer);
                 if (result != VK_SUCCESS)
                 {
                     reshade_log.errorf("Failed to create scratch buffer");
+                    // A failed create leaves the handle undefined.
+                    scratchBuffer = VK_NULL_HANDLE;
+                    releaseScratch();
                     return false;
                 }
 
@@ -1007,17 +1016,19 @@ static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey 
                     .allocationSize  = memRequirements.size,
                     .memoryTypeIndex = memTypeIndex,
                 };
-                VkDeviceMemory scratchMemory = VK_NULL_HANDLE;
                 result = device->vk.AllocateMemory(device->device(), &allocInfo, nullptr, &scratchMemory);
                 if (result != VK_SUCCESS)
                 {
                     reshade_log.errorf("vkAllocateMemory failed");
+                    scratchMemory = VK_NULL_HANDLE;
+                    releaseScratch();
                     return false;
                 }
-                device->vk.BindBufferMemory(device->device(), scratchBuffer, scratchMemory, 0);
+                result = device->vk.BindBufferMemory(device->device(), scratchBuffer, scratchMemory, 0);
                 if (result != VK_SUCCESS)
                 {
                     reshade_log.errorf("vkBindBufferMemory failed");
+                    releaseScratch();
                     return false;
                 }
 
@@ -1026,6 +1037,7 @@ static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey 
                 if (result != VK_SUCCESS)
                 {
                     reshade_log.errorf("vkMapMemory failed");
+                    releaseScratch();
                     return false;
                 }
 
@@ -1037,9 +1049,7 @@ static bool createReshadeTextures(CVulkanDevice *device, const ReshadeEffectKey 
                 device->submitInternal(&*cmdBuffer);
                 device->waitIdle(false);
 
-                free(data);
-                device->vk.DestroyBuffer(device->device(), scratchBuffer, nullptr);
-                device->vk.FreeMemory(device->device(), scratchMemory, nullptr);
+                releaseScratch();
             }
         }
         else if (texture)
@@ -1624,7 +1634,7 @@ bool ReshadeEffectPipeline::init(CVulkanDevice *device, const ReshadeEffectKey &
             reshade_log.errorf("vkAllocateMemory failed");
             return false;
         }
-        device->vk.BindBufferMemory(device->device(), m_buffer, m_bufferMemory, 0);
+        result = device->vk.BindBufferMemory(device->device(), m_buffer, m_bufferMemory, 0);
         if (result != VK_SUCCESS)
         {
             reshade_log.errorf("vkBindBufferMemory failed");
