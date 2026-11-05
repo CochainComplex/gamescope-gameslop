@@ -208,6 +208,35 @@ inline void fold_adaptation_ema( float &ema, float sample )
 	ema = ema < 0.0f ? sample : ema + ( sample - ema ) / 8.0f;
 }
 
+inline void update_unpinned_tolerance( AdaptationState &state, float baseTolerance )
+{
+	const bool hasRelaxationEvidence = state.residualEma >= 0.0f
+		&& state.fbP75Ema > baseTolerance;
+	if ( state.fbRelaxationActive )
+	{
+		state.fbRelaxationActive = hasRelaxationEvidence
+			&& state.residualEma < k_flAdaptationResidualRelaxExit;
+	}
+	else
+	{
+		state.fbRelaxationActive = hasRelaxationEvidence
+			&& state.residualEma <= k_flAdaptationResidualRelaxEnter;
+	}
+
+	const float targetTolerance = state.fbRelaxationActive
+		? std::min( state.fbP75Ema * 1.5f, 2.5f )
+		: baseTolerance;
+	const float currentTolerance = state.fbTolerance >= 0.0f
+		? state.fbTolerance : baseTolerance;
+	const float delta = std::clamp( targetTolerance - currentTolerance,
+		-k_flAdaptationToleranceFallPerFrame,
+		k_flAdaptationToleranceRisePerFrame );
+	const float nextTolerance = currentTolerance + delta;
+	state.fbTolerance = !state.fbRelaxationActive
+		&& std::abs( nextTolerance - baseTolerance ) <= 1e-6f
+		? -1.0f : nextTolerance;
+}
+
 // Fold one valid measurement and derive the thresholds recorded by the next
 // batch. This is pure CPU policy: completion, scene lifetime, and application
 // of these values to Vulkan push constants remain renderer responsibilities.
@@ -226,31 +255,7 @@ inline void update_adaptation_state( AdaptationState &state,
 	}
 	else
 	{
-		const bool hasRelaxationEvidence = state.residualEma >= 0.0f
-			&& state.fbP75Ema > baseTolerance;
-		if ( state.fbRelaxationActive )
-		{
-			state.fbRelaxationActive = hasRelaxationEvidence
-				&& state.residualEma < k_flAdaptationResidualRelaxExit;
-		}
-		else
-		{
-			state.fbRelaxationActive = hasRelaxationEvidence
-				&& state.residualEma <= k_flAdaptationResidualRelaxEnter;
-		}
-
-		const float targetTolerance = state.fbRelaxationActive
-			? std::min( state.fbP75Ema * 1.5f, 2.5f )
-			: baseTolerance;
-		const float currentTolerance = state.fbTolerance >= 0.0f
-			? state.fbTolerance : baseTolerance;
-		const float delta = std::clamp( targetTolerance - currentTolerance,
-			-k_flAdaptationToleranceFallPerFrame,
-			k_flAdaptationToleranceRisePerFrame );
-		const float nextTolerance = currentTolerance + delta;
-		state.fbTolerance = !state.fbRelaxationActive
-			&& std::abs( nextTolerance - baseTolerance ) <= 1e-6f
-			? -1.0f : nextTolerance;
+		update_unpinned_tolerance( state, baseTolerance );
 	}
 
 	state.agreementOffset = state.noiseEma > 0.0f

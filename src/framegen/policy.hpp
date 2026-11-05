@@ -113,21 +113,11 @@ inline constexpr uint32_t k_uMotionMaxCoarseLevels = motion_coarse_levels( k_uMo
 	return nMotionRungs + nMultiplierRungs;
 }
 
-// Resolve one rung without touching global state. Keeping this constexpr makes
-// the renderer call site zero-cost while allowing exhaustive CPU-only tests.
-[[nodiscard]] constexpr EffectiveConfig effective_config( GamescopeFramegenMode mode,
-	GamescopeFramegenPipeline pipeline, int multiplier, uint32_t nDegradeSteps )
+constexpr void shed_motion_rungs( EffectiveConfig &config, uint32_t &n )
 {
-	EffectiveConfig config = {
-		mode,
-		static_cast<uint32_t>( std::max( 2, multiplier ) ),
-		pipeline,
-	};
-	uint32_t n = nDegradeSteps;
-
 	// Opt-in spatial reconstruction sheds directly to Learned. The established
 	// Guided/Predict ladder and enum values remain unchanged.
-	if ( n > 0 && mode == GamescopeFramegenMode::Motion
+	if ( n > 0 && config.mode == GamescopeFramegenMode::Motion
 		&& config.pipeline == GamescopeFramegenPipeline::Spatial )
 	{
 		config.pipeline = GamescopeFramegenPipeline::Learned;
@@ -146,6 +136,21 @@ inline constexpr uint32_t k_uMotionMaxCoarseLevels = motion_coarse_levels( k_uMo
 		config.mode = GamescopeFramegenMode::Extrapolate;
 		n--;
 	}
+}
+
+// Resolve one rung without touching global state. Keeping this constexpr makes
+// the renderer call site zero-cost while allowing exhaustive CPU-only tests.
+[[nodiscard]] constexpr EffectiveConfig effective_config( GamescopeFramegenMode mode,
+	GamescopeFramegenPipeline pipeline, int multiplier, uint32_t nDegradeSteps )
+{
+	EffectiveConfig config = {
+		mode,
+		static_cast<uint32_t>( std::max( 2, multiplier ) ),
+		pipeline,
+	};
+	uint32_t n = nDegradeSteps;
+
+	shed_motion_rungs( config, n );
 	while ( n > 0 && config.multiplier > 2u )
 	{
 		config.multiplier--;

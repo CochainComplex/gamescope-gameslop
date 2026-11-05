@@ -3,6 +3,7 @@
 #include "backend_contract.h"
 
 #include <stdexcept>
+#include <tuple>
 
 namespace gamescope::framegen::compute
 {
@@ -17,14 +18,22 @@ struct BackendRequirements
 		contract.semantics, contract.state, contract.transport, contract.features };
 }
 
+[[nodiscard]] constexpr bool backend_requirements_satisfied( const BackendRequirements &available,
+	const BackendRequirements &required )
+{
+	return std::tie( required.operation, required.payload, required.execution,
+		required.model_version, required.semantics, required.state )
+		== std::tie( available.operation, available.payload, available.execution,
+			available.model_version, available.semantics, available.state )
+		&& ( available.transport & required.transport ) == required.transport
+		&& ( available.features & required.features ) == required.features;
+}
+
 // This negotiation belongs at session creation, never in a submit/poll loop.
 inline void require_backend_contract( const gsc_backend_contract &contract, const BackendRequirements &required )
 {
-	if ( !gsc_backend_contract_valid( &contract ) || required.operation != contract.operation
-		|| required.payload != contract.payload || required.execution != contract.execution
-		|| required.model_version != contract.model_version || required.semantics != contract.semantics
-		|| required.state != contract.state || ( contract.transport & required.transport ) != required.transport
-		|| ( contract.features & required.features ) != required.features )
+	if ( !gsc_backend_contract_valid( &contract )
+		|| !backend_requirements_satisfied( requirements_for( contract ), required ) )
 		throw std::invalid_argument( "accelerator contract does not satisfy the typed operation" );
 }
 } // namespace gamescope::framegen::compute

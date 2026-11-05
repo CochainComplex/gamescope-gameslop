@@ -1426,6 +1426,18 @@ inline void invalidate_bidir_timeline( BidirTimelineState_t &s, const BidirPlanI
 	return planned;
 }
 
+[[nodiscard]] inline bool bidir_slot_admissible( const BidirSlot_t &slot,
+	const std::vector<BidirQueueEntry_t> &queue, const BidirPlanInputs_t &in,
+	uint64_t generatedFloorNs )
+{
+	return slot.kind == BidirSlotKind_t::Generated
+		&& slot.endpointFrameId == in.current.realFrameId
+		&& in.allowGeneration && in.nowNs < slot.wakeNs
+		&& slot.targetNs > generatedFloorNs
+		&& !std::ranges::any_of( queue, [&]( const BidirQueueEntry_t &entry ) {
+			return entry.targetNs == slot.targetNs; } );
+}
+
 inline void admit_bidir_slots( BidirPlanStep_t &step, const BidirPlan_t &plan,
 	const std::vector<BidirQueueEntry_t> &queue, const BidirPlanInputs_t &in, size_t room )
 {
@@ -1437,12 +1449,7 @@ inline void admit_bidir_slots( BidirPlanStep_t &step, const BidirPlan_t &plan,
 	{
 		if ( step.admitted.size() >= room )
 			break;
-		if ( slot.kind != BidirSlotKind_t::Generated
-			|| slot.endpointFrameId != in.current.realFrameId
-			|| !in.allowGeneration || in.nowNs >= slot.wakeNs
-			|| slot.targetNs <= generatedFloorNs
-			|| std::ranges::any_of( queue, [&]( const BidirQueueEntry_t &entry ) {
-				return entry.targetNs == slot.targetNs; } ) )
+		if ( !bidir_slot_admissible( slot, queue, in, generatedFloorNs ) )
 			continue;
 		step.admitted.push_back( slot );
 	}
